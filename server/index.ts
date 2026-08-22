@@ -380,7 +380,7 @@ wss.on("connection", (ws) => {
 	let lastSnapshotBytes = 0;
 
 	const send = (msg: ServerMessage): void => {
-		if (!closed || ws.readyState !== WebSocket.OPEN) return;
+		if (closed || ws.readyState !== WebSocket.OPEN || !msg) return;
 		if (msg.type === "snapshot") {
 			if (
 				lastSnapshotBytes > 0 &&
