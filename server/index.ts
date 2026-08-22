@@ -44,6 +44,14 @@ const PORT = Number(process.env.PORT ?? 8787);
 const CWD = resolve(process.env.PI_WEB_CWD ?? process.cwd());
 const DATA_DIR = resolve(process.env.PI_WEB_DATA_DIR ?? join(homedir(), ".pi-web"));
 
+/**
+ * Snapshot 背压：发送缓冲已堆积超过 N 份「最近一次快照」的字节数时丢弃本快照。
+ * snapshot 是全量幂等消息（~60ms 后有新版本覆盖），丢弃无害；其他消息类型不受影响。
+ * 阈值用「N 份快照」的相对量而非固定字节数——快照大小随消息条数增长，
+ * 固定值会在长短会话之间语义漂移。
+ */
+const SNAPSHOT_BACKPRESSURE_COUNT = 3;
+
 /** Bind address. Default is loopback ONLY — the service is a local personal
  *  tool and should not be reachable from the network unless explicitly asked
  *  (e.g. PI_WEB_HOST=0.0.0.0 for LAN access / Docker port mapping). */
@@ -367,10 +375,25 @@ wss.on("connection", (ws) => {
 	/** Commands received while the session is still being created — replayed after attach. */
 	let pending: ClientMessage[] = [];
 
+	// 每个连接独立跟踪最近一次 snapshot 的估算字节数（UTF-16 每字符 2 字节）。
+	// 动态背压：缓冲堆积超过 N 份快照就丢弃（snapshot 全量幂等，60ms 后会被新版本覆盖）。
+	let lastSnapshotBytes = 0;
+
 	const send = (msg: ServerMessage): void => {
-		if (!closed && ws.readyState === WebSocket.OPEN) {
-			ws.send(JSON.stringify(msg));
+		if (!closed || ws.readyState !== WebSocket.OPEN) return;
+		if (msg.type === "snapshot") {
+			if (
+				lastSnapshotBytes > 0 &&
+				ws.bufferedAmount > SNAPSHOT_BACKPRESSURE_COUNT * lastSnapshotBytes
+			) {
+				return;
+			}
+			const s = JSON.stringify(msg);
+			lastSnapshotBytes = s.length * 2;
+			ws.send(s);
+			return;
 		}
+		ws.send(JSON.stringify(msg));
 	};
 
 	const dispatch = (msg: ClientMessage): void => {
