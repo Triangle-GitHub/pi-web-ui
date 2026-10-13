@@ -368,6 +368,25 @@ export class AgentService {
 		return undefined;
 	}
 
+	/** B20：按 convId 找当前持有它的 ClientSession + **当前 id**（过户后子代理整体
+	 *  可能搬去别的会话；过户撞 id 会把对话改名 c1→c2 —— 旧 id 要经别名表解析，
+	 *  否则模型手里建时的 runId/parentId（含过户后新 spawn 的孩子记的父 id）全
+	 *  认不出。扫一遍即可，低频调用不维护全局索引，与 findConversationHome 同思路）。 */
+	findSubagentOwner(convId: string): { session: ClientSession; convId: string } | undefined {
+		const cur = this.subagentConvAliases.get(convId) ?? convId;
+		for (const cs of this.clients.values()) {
+			try {
+				if (cs.hasConversation(cur)) return { session: cs, convId: cur };
+			} catch {
+				// 单客户端坏了不影响解析
+			}
+		}
+		return undefined;
+	}
+
+	/** B20：过户搬入时撞 id 改名的旧 id → 新 id 别名表（insert 时按同序 payload 核算）。 */
+	private readonly subagentConvAliases = new Map<string, string>();
+
 	/** issue #145：别处所有正在跑的对话（左栏 elsewhere 只读感知 + 手动过户用）。
 	 *  owner/convId 标识过户目标（手动过户入口）；DSH 引擎不填（不可过户）。 */
 	listExternalRunning(excludeClientId: string): ElsewhereRunning[] {
@@ -846,6 +865,9 @@ export class AgentService {
 		cs.listProjectRunners = (cwd) => this.listProjectRunners(cwd, clientId);
 		cs.getClaimStore = () => this.claimStore;
 		cs.findConversationHome = (sdkSession) => this.findConversationHome(sdkSession);
+		// B20：过户后 subagent 工具族的跨会话解析（旧 host 闭包搬不动，按 id 现查持有方）。
+		cs.findSubagentOwner = (convId) => this.findSubagentOwner(convId);
+		cs.allSubagentSessions = () => [...this.clients.values()];
 		cs.listExternalRunning = () => this.listExternalRunning(clientId);
 		cs.notifyExternalClients = (msg) => this.notifyClientsExcept(clientId, msg);
 		cs.onRunningChanged = () => this.pokeExternalRunning(clientId);
@@ -941,7 +963,14 @@ export class AgentService {
 			let newMainId: string;
 			try {
 				if (process.env.PI_WEB_TEST_TAKEOVER_FAIL_INSERT === "1") throw new Error("injected takeover insert failure");
+				const beforeIds = detached.payload.convs.map((c) => c.id);
 				newMainId = target.insertTakeoverConvs(detached.payload);
+				// B20：insert 会把撞 id 的对话就地改名（payload 对象同序遍历）——记录
+				// 旧 id → 新 id 别名，让模型手里建时的 runId/parentId 过户后仍可解析。
+				const afterIds = detached.payload.convs.map((c) => c.id);
+				for (let i = 0; i < beforeIds.length; i++) {
+					if (beforeIds[i] !== afterIds[i]) this.subagentConvAliases.set(beforeIds[i], afterIds[i]);
+				}
 				await target.switchConversation(newMainId);
 				await target.bindSession();
 			} catch (err) {

@@ -122,8 +122,11 @@ export interface SubagentToolHost {
 	): Promise<string>;
 	/** 取单个子代理快照（按 convId）。 */
 	getSubagent(convId: string): SubagentSnapshot | undefined;
-	/** 列出现有的子代理与派生的受控对话（按创建顺序）。scope: all（默认）/ subagent / persistent。 */
-	listSubagents(scope?: "all" | "subagent" | "persistent"): SubagentSnapshot[];
+	/** 列出现有的子代理与派生的受控对话（按创建顺序）。scope: all（默认）/ subagent / persistent。
+	 *  `forSelfId`（可选，B20）：调用者自身对话 id。传了才把「祖先链能走到它」的
+	 *  会话外子代理一并列出（过户把整族搬去别的 ClientSession 后，wait_all/list
+	 *  仍能看到它们）；不传 = 只列本会话自己的（保持原语义与 list 的展示口径）。 */
+	listSubagents(scope?: "all" | "subagent" | "persistent", forSelfId?: string): SubagentSnapshot[];
 	/** 向运行中的子代理注入消息（未在运行的内容直接排队为下一次回合）。 */
 	steerSubagent(convId: string, message: string): Promise<void>;
 	/** 中止运行中的子代理。 */
@@ -195,7 +198,15 @@ export type SubagentAction = (typeof SUBAGENT_ACTIONS)[number];
  * 自己等自己、永远到超时（self-wait deadlock）。主会话调用时传它自己的
  * 普通对话 id 即可（不在子代理列表里，delete 是 no-op）。
  */
-export function makeSubagentTool(host: SubagentToolHost, lang?: () => ServerLang, selfConvId?: string): ToolDefinition {
+export function makeSubagentTool(
+	host: SubagentToolHost,
+	lang?: () => ServerLang,
+	selfConvId?: string | (() => string | undefined),
+): ToolDefinition {
+	// B20：过户会把对话改名（撞 id 时 remap），自省 id 必须在调用时刻解析
+	// （按 runtime 身份查当前持有方），不能死用建时的旧 id —— 否则 wait_all
+	// 排除自省/展开后代时拿错锚点。传函数形式由建时点按 findConversationHome 解析。
+	const selfIdOf = (): string | undefined => (typeof selfConvId === "function" ? selfConvId() : selfConvId);
 	const getLang: () => ServerLang = lang ?? host.lang ?? (() => "en");
 	const text = (t: string, details: unknown = {}): { content: { type: "text"; text: string }[]; details: unknown } => ({
 		content: [{ type: "text", text: t }],
@@ -483,7 +494,7 @@ export function makeSubagentTool(host: SubagentToolHost, lang?: () => ServerLang
 				}
 
 				case "list": {
-					const list = host.listSubagents(p.kind as "all" | "subagent" | "persistent" | undefined);
+					const list = host.listSubagents(p.kind as "all" | "subagent" | "persistent" | undefined, selfIdOf());
 					if (list.length === 0)
 						return text(
 							pick(
@@ -547,6 +558,7 @@ export function makeSubagentTool(host: SubagentToolHost, lang?: () => ServerLang
 				}
 
 				case "wait_all": {
+					const selfId = selfIdOf();
 					const ancestorIdsOf = (selfId: string): Set<string> => {
 						const out = new Set<string>();
 						const seen = new Set<string>([selfId]);
@@ -561,7 +573,9 @@ export function makeSubagentTool(host: SubagentToolHost, lang?: () => ServerLang
 					const expandDescendants = (roots: Set<string> | string[]): string[] => {
 						if (roots instanceof Set ? roots.size === 0 : (roots as string[]).length === 0) return [];
 						const rootSet = roots instanceof Set ? roots : new Set(roots);
-						const all = host.listSubagents();
+						// B20：带 forSelfId（本会话的族）展开 —— 过户把整族搬到别的会话后，
+						// 只列本会话自己的列表会展不开后代，wait_all 会误报「没有需要等待的子代理」。
+						const all = host.listSubagents(undefined, selfId);
 						const out: string[] = [];
 						for (const s of all) {
 							if (rootSet.has(s.convId)) continue;
@@ -582,24 +596,24 @@ export function makeSubagentTool(host: SubagentToolHost, lang?: () => ServerLang
 
 					const explicit = p.runIds && p.runIds.length > 0;
 					const wanted = new Set<string>();
-					const selfAncestorIds = selfConvId ? ancestorIdsOf(selfConvId) : new Set<string>();
+					const selfAncestorIds = selfId ? ancestorIdsOf(selfId) : new Set<string>();
 
 					if (explicit) {
 						const seedRoots: string[] = [];
 						for (const id of p.runIds!) {
-							if (selfConvId && id === selfConvId) continue;
+							if (selfId && id === selfId) continue;
 							if (selfAncestorIds.has(id)) continue;
 							wanted.add(id);
 							seedRoots.push(id);
 						}
 						for (const descId of expandDescendants(seedRoots)) {
-							if (selfConvId && descId === selfConvId) continue;
+							if (selfId && descId === selfId) continue;
 							if (selfAncestorIds.has(descId)) continue;
 							wanted.add(descId);
 						}
-					} else if (selfConvId) {
-						for (const descId of expandDescendants(new Set([selfConvId]))) {
-							if (descId === selfConvId) continue;
+					} else if (selfId) {
+						for (const descId of expandDescendants(new Set([selfId]))) {
+							if (descId === selfId) continue;
 							if (selfAncestorIds.has(descId)) continue;
 							wanted.add(descId);
 						}
@@ -608,7 +622,7 @@ export function makeSubagentTool(host: SubagentToolHost, lang?: () => ServerLang
 							wanted.add(r.convId);
 						}
 					}
-					if (selfConvId) wanted.delete(selfConvId);
+					if (selfId) wanted.delete(selfId);
 					for (const ancId of selfAncestorIds) wanted.delete(ancId);
 
 					if (wanted.size === 0) {
@@ -628,7 +642,7 @@ export function makeSubagentTool(host: SubagentToolHost, lang?: () => ServerLang
 
 					while (!signal?.aborted && Date.now() - startedAt < timeoutMs) {
 						for (const descId of expandDescendants(wanted)) {
-							if (selfConvId && descId === selfConvId) continue;
+							if (selfId && descId === selfId) continue;
 							if (selfAncestorIds.has(descId)) continue;
 							wanted.add(descId);
 						}
@@ -748,7 +762,7 @@ export function makeSubagentTool(host: SubagentToolHost, lang?: () => ServerLang
 				}
 
 				case "handoff": {
-					const fromId = p.fromRunId || selfConvId || "unknown";
+					const fromId = p.fromRunId || selfIdOf() || "unknown";
 					if (!p.toRunId || typeof p.toRunId !== "string" || !p.toRunId.trim()) {
 						return text(
 							pick(
@@ -837,7 +851,7 @@ export function makeSubagentTool(host: SubagentToolHost, lang?: () => ServerLang
 export function makeSubagentTools(
 	host: SubagentToolHost,
 	lang?: () => ServerLang,
-	selfConvId?: string,
+	selfConvId?: string | (() => string | undefined),
 ): ToolDefinition[] {
 	return [makeSubagentTool(host, lang, selfConvId)];
 }

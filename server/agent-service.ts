@@ -1260,10 +1260,100 @@ export class ClientSession {
 		return conv?.session ? toSubagentSnapshot(conv) : undefined;
 	}
 
-	private listSubagentSnapshots(scope?: "all" | "subagent" | "persistent"): SubagentSnapshot[] {
-		return listSubagentSnapshots(this.convs.values(), scope);
+	/** B20：跨会话解析 —— 本会话没有就去「当前持有方」取（过户把子代理整体搬走后，
+	 *  旧 host 闭包仍指向源会话，按 id 全局查才能看到还在跑的子代理，而不是误判
+	 *  「已移出/不存在」）。findSubagentOwner 按别名表把旧 id 解析成改名后的当前 id。 */
+	private subagentSnapshotAnywhere(convId: string): SubagentSnapshot | undefined {
+		if (this.convs.has(convId)) return this.getSubagentSnapshot(convId);
+		const found = this.findSubagentOwner?.(convId);
+		return found && found.session !== this ? found.session.getSubagentSnapshot(found.convId) : undefined;
 	}
 
+	/** B20：convId 当前由哪个 ClientSession 持有（本会话优先；查不到兜底本会话）。 */
+	private subagentOwnerOf(convId: string | undefined): ClientSession {
+		if (!convId) return this;
+		if (this.convs.has(convId)) return this;
+		return this.findSubagentOwner?.(convId)?.session ?? this;
+	}
+
+	/** B20：解析到当前（可能被过户改名）的对话 id；查不到原样返回。 */
+	private subagentCurrentId(convId: string): string {
+		if (this.convs.has(convId)) return convId;
+		return this.findSubagentOwner?.(convId)?.convId ?? convId;
+	}
+
+	private listSubagentSnapshots(scope?: "all" | "subagent" | "persistent", forSelfId?: string): SubagentSnapshot[] {
+		const own = listSubagentSnapshots(this.convs.values(), scope);
+		// B20：带 forSelfId 才并入会话外本族（祖先链能走到 forSelfId 的子代理，
+		// 过户搬走后 wait_all 的「无参展开」与 list 仍能看到它们）；不传 = 只列本会话。
+		if (!forSelfId || !this.allSubagentSessions) return own;
+		const seen = new Set(own.map((s) => s.convId));
+		const out = [...own];
+		for (const other of this.allSubagentSessions()) {
+			if (other === this) continue;
+			for (const s of other.listSubagentSnapshots(scope)) {
+				if (seen.has(s.convId)) continue;
+				if (!this.subagentInFamilyOf(s, forSelfId)) continue;
+				seen.add(s.convId);
+				out.push(s);
+			}
+		}
+		return out;
+	}
+
+	/** B20：parentId 链向上能否走到 selfId（防环，最多 64 跳）。链上每一跳都按
+	 *  当前持有方 + 别名解析：过户撞 id 改名后，自省 id 与孩子们记录的 parentId
+	 *  都可能还是建时旧 id（c1→c2），不比显式相等，比的是「解析后的当前 id」。 */
+	private subagentInFamilyOf(s: SubagentSnapshot, selfId: string): boolean {
+		let curId = s.parentId;
+		const seen = new Set<string>();
+		let n = 0;
+		while (curId && n++ < 64 && !seen.has(curId)) {
+			seen.add(curId);
+			if (curId === selfId) return true;
+			const found = this.findSubagentOwner?.(curId);
+			if (!found) return false;
+			if (found.convId === selfId) return true;
+			const snap =
+				found.session === this
+					? this.getSubagentSnapshot(found.convId)
+					: found.session.getSubagentSnapshot(found.convId);
+			if (!snap) return false;
+			curId = snap.parentId;
+		}
+		return false;
+	}
+
+	/** B20：subagentHost.spawnSubagent 的委托入口（在**当前**会话上执行模板校验与真正
+	 *  spawn）—— 过户后由 host 按 parentId 的持有方调用，保证新子代理注册进持有方
+	 *  的 convs（左栏「不见/错位」、cwd 跟错项目才不再发生）。 */
+	async spawnSubagentViaHost(
+		prompt: string,
+		type: string,
+		cwd: string,
+		templateName: string | undefined,
+		model: string | null | undefined,
+		parentId: string | undefined,
+		persist: boolean | undefined,
+	): Promise<string> {
+		// 模板：存在且启用时应用；传了名字但不可用 → 抛错让工具转给 AI。
+		const tpl = templateName ? this.subagentTemplates.get(templateName) : undefined;
+		if (templateName && (!tpl || !tpl.enabled)) {
+			throw new Error(
+				pick(
+					this.getLang(),
+					`子代理模板不可用：${templateName}（不存在或已停用）`,
+					`Subagent template unavailable: ${templateName} (missing or disabled)`,
+					"agent.subagent.template.unavailable",
+					{ templateName: templateName },
+				),
+			);
+		}
+		// B20：parentId 是建时旧 id 时先解析成当前 id（过户撞 id 改名后，新子代理
+		// 的 parentId 必须指向改名后的主对话，否则族展开/lists 都认不出它）。
+		const canonParent = parentId ? (this.findSubagentOwner?.(parentId)?.convId ?? parentId) : parentId;
+		return this.spawnSubagentConversation(prompt, type, cwd, tpl, model, canonParent, persist);
+	}
 	private subagentRunOutcome(conv: Conversation) {
 		return subagentRunOutcome(conv);
 	}
@@ -1930,6 +2020,13 @@ export class ClientSession {
 		if (fromRunId === toRunId) {
 			throw new Error("Cannot hand off to oneself");
 		}
+		// B20：toRunId 可能已随过户搬去另一会话（主机 host 闭包仍指向旧会话）——
+		// 委托给持有它的会话执行，否则「Target subagent not found」。
+		const owner = this.subagentOwnerOf(toRunId);
+		if (owner !== this) {
+			await owner.handoffSubagent(fromRunId, toRunId, payload);
+			return;
+		}
 		const toConv = this.convs.get(toRunId);
 		if (!toConv) {
 			throw new Error(`Target subagent ${toRunId} not found`);
@@ -2001,40 +2098,41 @@ export class ClientSession {
 
 	private subagentHost: SubagentToolHost = {
 		spawnSubagent: (prompt, type, cwd, templateName, model, parentId, persist) => {
-			// 模板：存在且启用时应用；传了名字但不可用 → 抛错让工具转给 AI。
-			const tpl = templateName ? this.subagentTemplates.get(templateName) : undefined;
-			if (templateName && (!tpl || !tpl.enabled)) {
-				throw new Error(
-					pick(
-						this.getLang(),
-						`子代理模板不可用：${templateName}（不存在或已停用）`,
-						`Subagent template unavailable: ${templateName} (missing or disabled)`,
-						"agent.subagent.template.unavailable",
-						{ templateName: templateName },
-					),
-				);
-			}
-			// 模型优先级：显式 model 参数 > 模板自带模型 > 设置面板默认模型；都不给 = 跟随主对话。
-			return this.spawnSubagentConversation(prompt, type, cwd, tpl, model, parentId, persist);
+			// B20：过户后 parentId 的主对话可能已搬去另一个 ClientSession ——
+			// 委托给真正持有父对话的会话 spawn（模板/上限/注册/左栏全随它），
+			// 否则新子代理注册进旧会话、目标页左栏「不见/错位」。
+			const owner = parentId ? this.subagentOwnerOf(parentId) : this;
+			return owner.spawnSubagentViaHost(prompt, type, cwd, templateName, model, parentId, persist);
 		},
-		getSubagent: (convId) => this.getSubagentSnapshot(convId),
-		listSubagents: (scope) => this.listSubagentSnapshots(scope),
+		getSubagent: (convId) => {
+			// B20：本会话查不到就去「当前持有方」查 —— 过户把子代理整体搬走后，
+			// 旧 host 仍指向源会话（搬不动闭包），不跨会话解析 wait_all/get_result
+			// 会以为子代理「已移出/不存在」而其实还在跑。
+			if (this.convs.has(convId)) return this.getSubagentSnapshot(convId);
+			const found = this.findSubagentOwner?.(convId);
+			return found && found.session !== this ? found.session.getSubagentSnapshot(found.convId) : undefined;
+		},
+		listSubagents: (scope, forSelfId) => this.listSubagentSnapshots(scope, forSelfId),
 		handoffSubagent: async (fromRunId, toRunId, payload) => {
 			await this.handoffSubagent(fromRunId, toRunId, payload);
 		},
 		steerSubagent: async (convId, message) => {
-			const conv = this.convs.get(convId);
+			const owner = this.subagentOwnerOf(convId);
+			const curId = owner.convs.has(convId) ? convId : this.subagentCurrentId(convId);
+			const conv = owner.convs.get(curId);
 			if (!conv?.session) return;
 			await conv.session.sendUserMessage(message, conv.session.isStreaming ? { deliverAs: "steer" } : undefined);
 		},
 		stopSubagent: async (convId) => {
-			const conv = this.convs.get(convId);
+			const owner = this.subagentOwnerOf(convId);
+			const curId = owner.convs.has(convId) ? convId : this.subagentCurrentId(convId);
+			const conv = owner.convs.get(curId);
 			if (conv) {
 				conv.promptInFlight = false;
 				if (conv.session.isStreaming || !conv.session.isIdle) {
-					await this.interruptRun(
+					await owner.interruptRun(
 						conv,
-						pick(this.getLang(), "用户停止子代理", "User stopped the subagent", "agent.subagent.stop.user"),
+						pick(owner.getLang(), "用户停止子代理", "User stopped the subagent", "agent.subagent.stop.user"),
 					);
 				}
 			}
@@ -3182,7 +3280,16 @@ export class ClientSession {
 					// spawn 的 parentId（子代理记到真正的派发会话名下）+ wait_all 的
 					// selfConvId（调用者自身永不计入等待，防 self-wait deadlock）。
 					...(ownerId
-						? makeSubagentTools(withSubagentOwner(this.subagentHost, ownerId), undefined, ownerId)
+						? makeSubagentTools(
+								withSubagentOwner(this.subagentHost, ownerId),
+								undefined,
+								// B20：selfId 必须调用时刻解析，不能死用建时旧 id —— 过户撞 id
+								// 改名后 wait_all 的「排除自身/展开后代」要按 runtime 的当前归属查。
+								() =>
+									bridgeAnchor.session
+										? (this.findConversationHome?.(bridgeAnchor.session)?.convId ?? ownerId)
+										: ownerId,
+							)
 						: makeSubagentTools(this.subagentHost)),
 					// 结构化派单（六段式 + 服务端校验；执行体复用子代理 spawn 通道）。
 					// owner 包装与上面同理：子代理记到真正的派发会话名下。
@@ -5975,6 +6082,13 @@ export class ClientSession {
 	 *  实例，而 `runtime.session` 与本工厂的 `created.session` 是同一个对象。） */
 	findConversationHome:
 		((sdkSession: AgentSession) => { session: ClientSession; convId: string } | undefined) | undefined = undefined;
+	/** B20 跨会话子代理归属（attach 时由 AgentService 接线，见 findConversationHome 同款）：
+	 *  - findSubagentOwner：按 convId 找当前持有它的 ClientSession —— 过户把对话（含子代理
+	 *    后代）整体搬去另一会话后，旧 host 闭包仍指向源会话，subagent 工具族靠它现查持有方；
+	 *  - allSubagentSessions：全部客户端会话（wait_all/list 的「本族跨会话展开」用）。 */
+	findSubagentOwner: ((convId: string) => { session: ClientSession; convId: string } | undefined) | undefined =
+		undefined;
+	allSubagentSessions: (() => ClientSession[]) | undefined = undefined;
 	/** issue #145 跨客户端同会话感知 —— attach 时由 AgentService 接线：
 	 *  - findSessionOwner：别处是否已持有同一 session 文件（查重建第二个 writer 用）；
 	 *  - listProjectRunners：别处在同一 cwd 下正在跑的对话（同项目并行感知用）；
@@ -10031,6 +10145,11 @@ export class ClientSession {
 			if (c.session === sdkSession) return c.id;
 		}
 		return undefined;
+	}
+
+	/** B20：本会话是否持有该对话（AgentService/daemon 按 convId 跨客户端找持有方用）。 */
+	hasConversation(convId: string): boolean {
+		return this.convs.has(convId);
 	}
 
 	/** 过户用的对话摘要（AgentService 拼移动集合 + 容量检查用）。 */
