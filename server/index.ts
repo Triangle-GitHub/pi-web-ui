@@ -17,6 +17,7 @@
  *   PI_CODING_AGENT_DIR  pi config dir (auth/models/skills) — passed to the SDK
  */
 import { botExecutionMessageAllowed } from "./device-center/bot-execution.js";
+import { ALL_AGENT_TOOL_ENTRIES, effectiveDisabledAgentTools, isToolSupportedOnPlatform } from "./tool-manager.js";
 // MUST be imported before the SDK is loaded so on-disk patches apply cleanly.
 import "./patch-remote-catalog.js";
 import "./patch-turn-end-boundary.js";
@@ -1138,6 +1139,12 @@ const deviceCenter = await installLocalDeviceCenter({
 		},
 		projects: () => sharedStateStore.getRecentProjects(""),
 		defaultModel: () => sharedStateStore.getDefaultModel("pi"),
+		defaultTools: () => {
+			const disabled = new Set(effectiveDisabledAgentTools(sharedStateStore.getSettingsSnapshot("")));
+			return ALL_AGENT_TOOL_ENTRIES.filter(
+				(tool) => !disabled.has(tool.name) && isToolSupportedOnPlatform(tool.name),
+			).map((tool) => tool.name);
+		},
 		peekMcpBridge: (cwd) => mcpProjects.peekBridge(cwd),
 	},
 	async connect(config, syncBots) {
@@ -1524,7 +1531,13 @@ export interface DispatchSession {
 	/** 返回值语义见 SlashHost.newChat：布尔值 = 是否落在一个可接收首条的空白
 	 *  新对话（/new <prompt> 用）。此处只管转发，返回值被丢弃，故允许 void。
 	 *  preset = DSH Agent 预设（pi 引擎忽略）。 */
-	newChat(preset?: string, ephemeral?: boolean, onReady?: (id: string) => void): Promise<boolean | void>;
+	newChat(
+		preset?: string,
+		ephemeral?: boolean,
+		onReady?: (id: string) => void,
+		independent?: boolean,
+	): Promise<boolean | void>;
+	deleteMessage?(messageId: string, conversationId?: string): Promise<void>;
 	editMessage(messageId: string, text: string, attachments?: PromptAttachment[]): Promise<void>;
 	forkSession?(messageId: string, position?: "before" | "at", targetConvId?: string): Promise<void>;
 	flushSnapshot(forceFull?: boolean): void;
@@ -1567,7 +1580,7 @@ export interface DispatchSession {
 	deletePlanStep?(stepId: string, conversationId?: string): void;
 	addPlanStep?(step: import("./protocol.js").PlanStep, afterStepId?: string, conversationId?: string): void;
 	planCleanHandoff?(steps: import("./protocol.js").PlanStep[], promptText: string): Promise<void>;
-	switchSession(path: string, sessionId?: string): Promise<void>;
+	switchSession(path: string, sessionId?: string, independent?: boolean): Promise<void>;
 	switchConversation(id: string): Promise<void>;
 	listFiles(path?: string): Promise<void>;
 	searchFiles(query: string, reqId: number): Promise<void>;
@@ -1796,7 +1809,11 @@ export interface DispatchSession {
 
 /** 引擎无关的服务接口（index.ts attach 流程 + 插件扩展点所需）。 */
 export interface EngineService {
-	attach(clientId: string, send: (msg: ServerMessage) => void): Promise<DispatchSession>;
+	attach(
+		clientId: string,
+		send: (msg: ServerMessage) => void,
+		sendShared?: (msg: ServerMessage) => void,
+	): Promise<DispatchSession>;
 	detach(clientId: string, send: (msg: ServerMessage) => void): void;
 	get(clientId: string): DispatchSession | undefined;
 	disposeAll(): Promise<void>;
@@ -1834,6 +1851,29 @@ export interface EngineService {
 	/** Browser UI locale report (hello.locale / set_locale) — persist per
 	 *  client and refresh lang-aware prompts (streaming-safe). */
 	setLocale(clientId: string, locale: string): Promise<void>;
+	/** Shared conversations retain their execution owner while browsers view them. */
+	openSharedConversation?(
+		viewerId: string,
+		ownerId: string,
+		convId: string,
+		send: (msg: ServerMessage) => void,
+	): boolean;
+	closeSharedConversation?(viewerId: string): void;
+	sharedConversationTarget?(
+		viewerId: string,
+	): { conversationId: string; owner: DispatchSession; ownerClientId: string } | undefined;
+	dispatchSharedConversationMessage?(viewerId: string, msg: ClientMessage): boolean;
+	resolveSharedQuestion?(
+		viewerId: string,
+		id: string,
+		answers: { id: string; selected: string[]; custom?: string }[],
+		cancelled?: boolean,
+		cancelReason?: string,
+	): boolean;
+	resolveSharedToolApproval?(
+		viewerId: string,
+		...args: Parameters<NonNullable<DispatchSession["resolveToolApproval"]>>
+	): boolean;
 	/** 手动过户（pi 引擎实现；DSH 未实现 → dispatch 回落提示）。 */
 	takeOverConversation?(targetId: string, ownerId: string, convId: string): Promise<void>;
 	/** 跨页作答预告 + 答案转交（pi 引擎实现；DSH 未实现 → dispatch 回落提示）。 */
@@ -1982,8 +2022,8 @@ function ensureEngine(engine: EngineId): EngineService {
 ensureEngine(currentDefaultEngine);
 
 const service: EngineService = {
-	attach(clientId, send) {
-		return ensureEngine(resolveClientEngine(clientId)).attach(clientId, send);
+	attach(clientId, send, sendShared) {
+		return ensureEngine(resolveClientEngine(clientId)).attach(clientId, send, sendShared);
 	},
 	detach(clientId, send) {
 		const eng = clientEngines.get(clientId);
@@ -2074,6 +2114,34 @@ const service: EngineService = {
 	},
 	setLocale(clientId, locale) {
 		return ensureEngine(resolveClientEngine(clientId)).setLocale(clientId, locale);
+	},
+	openSharedConversation(viewerId, ownerId, convId, send) {
+		return (
+			ensureEngine(resolveClientEngine(viewerId)).openSharedConversation?.(viewerId, ownerId, convId, send) ?? false
+		);
+	},
+	closeSharedConversation(viewerId) {
+		ensureEngine(resolveClientEngine(viewerId)).closeSharedConversation?.(viewerId);
+	},
+	sharedConversationTarget(viewerId) {
+		return ensureEngine(resolveClientEngine(viewerId)).sharedConversationTarget?.(viewerId);
+	},
+	dispatchSharedConversationMessage(viewerId, msg) {
+		return ensureEngine(resolveClientEngine(viewerId)).dispatchSharedConversationMessage?.(viewerId, msg) ?? false;
+	},
+	resolveSharedQuestion(viewerId, id, answers, cancelled, cancelReason) {
+		return (
+			ensureEngine(resolveClientEngine(viewerId)).resolveSharedQuestion?.(
+				viewerId,
+				id,
+				answers,
+				cancelled,
+				cancelReason,
+			) ?? false
+		);
+	},
+	resolveSharedToolApproval(viewerId, ...args) {
+		return ensureEngine(resolveClientEngine(viewerId)).resolveSharedToolApproval?.(viewerId, ...args) ?? false;
 	},
 	takeOverConversation(targetId, ownerId, convId) {
 		const targetSvc = ensureEngine(resolveClientEngine(targetId));
@@ -2854,7 +2922,9 @@ wss.on("connection", (ws) => {
 			if (!snapshotRetryTimer) {
 				snapshotRetryTimer = setTimeout(() => {
 					snapshotRetryTimer = null;
-					service.get(clientId ?? "")?.flushSnapshot(wasFull);
+					if (!service.dispatchSharedConversationMessage?.(clientId ?? "", { type: "get_state" })) {
+						service.get(clientId ?? "")?.flushSnapshot(wasFull);
+					}
 				}, SNAPSHOT_RETRY_MS);
 			}
 			return;
@@ -2868,7 +2938,29 @@ wss.on("connection", (ws) => {
 	 *  `send` 必须包在 `sendRaw` **外面**：窗口先裁消息，再算背压字节数——否则
 	 *  背压阈值还在按未裁剪的 10MB 量级估。 */
 	const windowTap = new MessageWindowTap(sendRaw, readMessageWindowConfig(process.env));
-	const send = (msg: ServerMessage): void => windowTap.accept(msg);
+	const sendShared = (msg: ServerMessage): void => {
+		const shared = clientId ? service.sharedConversationTarget?.(clientId) : undefined;
+		windowTap.setScope(
+			shared ? `shared:${JSON.stringify([shared.ownerClientId, shared.conversationId])}` : `local:${clientId}`,
+		);
+		windowTap.accept(msg);
+	};
+	const send = (msg: ServerMessage): void => {
+		if (
+			clientId &&
+			service.sharedConversationTarget?.(clientId) &&
+			(msg.type === "snapshot" ||
+				msg.type === "snapshot_delta" ||
+				msg.type === "tool_delta" ||
+				msg.type === "message_delta" ||
+				msg.type === "terminal_output" ||
+				msg.type === "terminal_list" ||
+				msg.type === "terminal_exit")
+		)
+			return;
+		if (msg.type === "snapshot" || msg.type === "snapshot_delta") windowTap.setScope(`local:${clientId}`);
+		windowTap.accept(msg);
+	};
 
 	// Plugins broadcast to every open socket; unregister on close below.
 	// Plugins broadcast to every open socket; unregister on close below. The
@@ -2962,7 +3054,7 @@ wss.on("connection", (ws) => {
 		const nextSvc = ensureEngine(targetEngine);
 		const switchGen = ++attachGen;
 		nextSvc
-			.attach(cid, send)
+			.attach(cid, send, sendShared)
 			.then((newCs) => {
 				if (closed) {
 					nextSvc.detach(cid, send);
@@ -3025,7 +3117,7 @@ wss.on("connection", (ws) => {
 				setClientEngine(cid, prevEngine);
 				const rollbackGen = ++attachGen;
 				ensureEngine(prevEngine)
-					.attach(cid, send)
+					.attach(cid, send, sendShared)
 					.then((rollbackCs) => {
 						if (closed || rollbackGen !== attachGen) {
 							ensureEngine(prevEngine).detach(cid, send);
@@ -3166,6 +3258,13 @@ wss.on("connection", (ws) => {
 		// 历史窗口按需加载：连接级窗口化直接服务（四个引擎通吃，不依赖引擎实现）。
 		// 放在引擎分发之前：它不是引擎能力，窗口化关闭时静默无回执（前端保持现状）。
 		if (msg.type === "load_earlier_messages") {
+			const sharedTarget = service.sharedConversationTarget?.(clientId);
+			if (sharedTarget && msg.conversationId && msg.conversationId !== sharedTarget.conversationId) return;
+			windowTap.setScope(
+				sharedTarget
+					? `shared:${JSON.stringify([sharedTarget.ownerClientId, sharedTarget.conversationId])}`
+					: `local:${clientId}`,
+			);
 			let handled = windowTap.loadEarlier({
 				count: msg.count,
 				all: msg.all,
@@ -3175,9 +3274,14 @@ wss.on("connection", (ws) => {
 				historyGeneration: msg.historyGeneration,
 			});
 			if (!handled && cs) {
-				const activeId = typeof cs.activeConversationId === "function" ? cs.activeConversationId() : undefined;
+				const shared = service.sharedConversationTarget?.(clientId);
+				const historyOwner = shared?.owner ?? cs;
+				const activeId =
+					shared?.conversationId ??
+					(typeof cs.activeConversationId === "function" ? cs.activeConversationId() : undefined);
 				const convId = msg.conversationId || activeId;
-				const full = convId ? cs.getMessagesOfConversation?.(convId) : undefined;
+				if (shared && convId !== shared.conversationId) return;
+				const full = convId ? historyOwner.getMessagesOfConversation?.(convId) : undefined;
 				if (convId && full && full.length > 0) {
 					windowTap.rehydrate(convId, full, msg.before);
 					handled = windowTap.loadEarlier({
@@ -3190,7 +3294,7 @@ wss.on("connection", (ws) => {
 					});
 				}
 				if (!handled && (!msg.conversationId || msg.conversationId === activeId)) {
-					cs.flushSnapshot(true);
+					if (!service.dispatchSharedConversationMessage?.(clientId, { type: "get_state" })) cs.flushSnapshot(true);
 				}
 			}
 			return;
@@ -3205,6 +3309,8 @@ wss.on("connection", (ws) => {
 			return;
 		}
 		try {
+			if (service.dispatchSharedConversationMessage?.(clientId, msg)) return;
+			if (handleInteractiveResponseMessage(msg, cs, service, clientId, send)) return;
 			if (handleFileMessage(msg, cs)) return;
 			if (handleScmMessage(msg, cs, send)) return;
 			if (handleBgServerMessage(msg, cs)) return;
@@ -3217,7 +3323,6 @@ wss.on("connection", (ws) => {
 			if (handleRemoteSshMessage(msg, remoteSshService, send)) return;
 			if (handleSettingsMessage(msg, cs, send)) return;
 			if (handleCanvasMessage(msg, DATA_DIR, canvasOrchestrator, send, { runBase: cs.cwd })) return;
-			if (handleInteractiveResponseMessage(msg, cs, service, clientId, send)) return;
 			if (
 				handlePluginMessage(msg, {
 					pluginMgr,
@@ -3315,6 +3420,16 @@ wss.on("connection", (ws) => {
 						send({ type: "tool_prompt", name: msg.name, found: false, unsupported: true });
 					}
 					break;
+				case "open_shared_conversation":
+					if (!service.openSharedConversation?.(clientId, msg.owner, msg.id, sendShared)) {
+						send({
+							type: "notice",
+							level: "error",
+							text: "共享对话不可用",
+							textEn: "Shared conversation is unavailable.",
+						});
+					}
+					return;
 				case "take_over_conversation":
 					if (typeof service.takeOverConversation === "function") {
 						void service.takeOverConversation(clientId, msg.owner, msg.id);
@@ -3524,7 +3639,7 @@ wss.on("connection", (ws) => {
 			const helloSvc = ensureEngine(resolveClientEngine(cid));
 			const helloGen = ++attachGen;
 			helloSvc
-				.attach(cid, send)
+				.attach(cid, send, sendShared)
 				.then((cs) => {
 					clearTimeout(slowTimer);
 					if (closed) {

@@ -67,13 +67,14 @@ describe("Bot execution capabilities", () => {
 		}
 	});
 
-	it("keeps a configured model fixed and blocks unconstrained execution tools", () => {
+	it("keeps a configured model fixed and authorizes tools solely by the whitelist", () => {
 		const binding = registerBotExecution({ ...bot(), model: { provider: "p", modelId: "fixed" } });
 		try {
 			expect(binding.capability.captureModel("other/default")).toEqual({ provider: "p", modelId: "fixed" });
 			expect(binding.capability.allowsTool("device_collab")).toBe(true);
 			for (const name of ["conversation", "delegate_task", "codemode", "worktree"])
-				expect(binding.capability.allowsTool(name)).toBe(false);
+				expect(binding.capability.allowsTool(name)).toBe(true);
+			expect(binding.capability.allowsTool("mcp_manage")).toBe(false);
 		} finally {
 			binding.release();
 		}

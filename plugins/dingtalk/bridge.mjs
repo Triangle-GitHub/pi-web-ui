@@ -2,7 +2,8 @@ import { createHash, randomUUID } from "node:crypto";
 import { stat } from "node:fs/promises";
 import { isAbsolute } from "node:path";
 import { chunkMarkdownText } from "./markdown-chunks.mjs";
-import { dingJson, receiveMedia } from "./media.mjs";
+import { dingJson, receiveMedia, sendRobotMessage } from "./media.mjs";
+import { SessionRoutes, sessionKey } from "./session-routes.mjs";
 
 const hash = (value) => `dt_${createHash("sha256").update(value).digest("hex").slice(0, 32)}`;
 const strip = (text) =>
@@ -18,12 +19,15 @@ export class DingtalkBotBridge {
 		this.getConfig = getConfig;
 		this.log = log || (() => {});
 		this.running = false;
+		this.stopped = false;
 		this.generation = 0;
 		this.seenMessageIds = new Set();
 		this.sessions = new Map();
 		this.pendingRuns = new Map(); // stable runId only
 		this.earlyRuns = new Map();
 		this.dispatching = 0;
+		this.routes = new SessionRoutes(this);
+		this.ended = new Set();
 		this.status = {
 			enabled: false,
 			connected: false,
@@ -38,18 +42,26 @@ export class DingtalkBotBridge {
 	}
 	async start() {
 		if (this.running) return;
+		await this.routes.ready();
 		this.running = true;
+		this.stopped = false;
 		Object.assign(this.status, { enabled: true, connected: true, state: "connected" });
 		this.offRunEvent = this.host.onRunEvent?.((event) => this.handleRunEvent(event));
 	}
 	async stop() {
 		this.running = false;
+		this.stopped = true;
 		this.generation++;
 		this.offRunEvent?.();
 		this.offRunEvent = null;
 		this.pendingRuns.clear();
 		this.earlyRuns.clear();
-		this.sessions.clear();
+		await this.routes.tail;
+		for (const session of this.sessions.values()) {
+			delete session.runId;
+			delete session.pendingKey;
+			session.dispatching = false;
+		}
 		Object.assign(this.status, { enabled: false, connected: false, state: "idle" });
 	}
 	error(error) {
@@ -77,12 +89,14 @@ export class DingtalkBotBridge {
 		return JSON.stringify([
 			event.chatbotCorpId || event.corpId || "",
 			event.conversationId || event.openConversationId || "direct",
+			event.conversationType || event.channelId || "",
 			event.threadId || event.rootMessageId || event.thread?.id || "",
 			event.senderStaffId || event.senderId || "",
 		]);
 	}
 	async onInboundMessage(event) {
 		if (!event) return;
+		await this.routes.ready();
 		const sender = event.senderStaffId || event.senderId || "";
 		const scope = this.scope(event);
 		const cfg = this.getConfig() || {};
@@ -105,9 +119,17 @@ export class DingtalkBotBridge {
 			this.status.lastMessageAt = Date.now();
 			let session = this.sessions.get(scope);
 			if (!session) {
-				session = { accountId: hash(`${scope}:${randomUUID()}`), revision: 0 };
+				session = { accountId: hash(`${scope}:${randomUUID()}`), revision: 0, scope, peer: sender };
 				this.sessions.set(scope, session);
 			}
+			session.url = url;
+			session.destination =
+				String(event.conversationType) === "2" || event.openConversationId
+					? { openConversationId: event.openConversationId || event.conversationId }
+					: String(event.conversationType) === "1"
+						? { userId: sender }
+						: undefined;
+			await this.routes.save();
 			const originalText = String(event.text?.content || (typeof event.text === "string" ? event.text : "") || "");
 			const text = originalText.trimStart();
 			if (/^[/／]/.test(text)) {
@@ -121,7 +143,7 @@ export class DingtalkBotBridge {
 		}
 	}
 	async dispatch(text, event, { session, cfg, url }) {
-		if (session.dispatching || session.runId) {
+		if (session.dispatching || session.pendingKey || session.runId) {
 			await this.reply(url, "当前会话仍在运行，请等待完成或先发送 /stop。");
 			return;
 		}
@@ -157,11 +179,17 @@ export class DingtalkBotBridge {
 					}
 					return;
 				}
-				if (!receipt?.conversationId || !receipt?.runId)
-					throw new Error("宿主未返回真实 conversationId/runId，请升级宿主；无法安全关联回复");
+				if (!receipt?.conversationId || (!receipt.runId && !sessionKey(receipt)))
+					throw new Error("宿主未返回精确 runId 或会话身份，请升级宿主；无法安全关联回复");
 				session.conversationId = receipt.conversationId;
+				session.sessionId = receipt.sessionId;
+				session.clientId = receipt.clientId;
+				this.routes.bind(receipt, session);
+				await this.routes.save();
+				if (generation !== this.generation || revision !== session.revision) return;
 				if (session.stopRequested) {
-					const stopped = await this.host.abortRun?.(receipt.runId || receipt.conversationId);
+					if (!receipt.runId) throw new Error("网页任务没有精确 runId，请在网页中停止。");
+					const stopped = await this.host.abortRun?.(receipt.runId);
 					if (!stopped?.ok) {
 						session.runId = receipt.runId;
 						throw new Error(stopped?.error || "延迟中止失败，请重新 /stop");
@@ -170,8 +198,9 @@ export class DingtalkBotBridge {
 					return;
 				}
 				session.runId = receipt.runId;
-				const run = { session, url, text: "", bytes: 0, revision, generation };
-				this.pendingRuns.set(receipt.runId, run);
+				const run = { session, url, text: "", revision, generation, ...receipt };
+				session.pendingKey = receipt.runId ? `run:${receipt.runId}` : sessionKey(receipt);
+				this.pendingRuns.set(session.pendingKey, run);
 				const early = this.earlyRuns.get(receipt.runId) || [];
 				this.earlyRuns.delete(receipt.runId);
 				for (const ev of early) await this.handleRunEvent(ev);
@@ -186,17 +215,23 @@ export class DingtalkBotBridge {
 	async resetSession(scope, session, url, patch = {}) {
 		session.revision++;
 		session.stopRequested = true;
+		this.routes.revoke(scope);
+		for (const [key, run] of this.pendingRuns) if (run.session === session) this.pendingRuns.delete(key);
 		const next = {
 			accountId: hash(randomUUID()),
 			revision: session.revision,
+			scope,
+			destination: session.destination,
+			peer: session.peer,
+			url,
 			model: session.model,
 			thinkingLevel: session.thinkingLevel,
 			cwd: session.cwd,
 			...patch,
 		};
 		this.sessions.set(scope, next);
+		await this.routes.save();
 		if (session.runId) {
-			this.pendingRuns.delete(session.runId);
 			try {
 				const stopped = await this.host.abortRun?.(session.runId);
 				if (!stopped?.ok) throw new Error(stopped?.error || "旧会话任务中止失败");
@@ -232,13 +267,14 @@ export class DingtalkBotBridge {
 					break;
 				}
 				if (!session.runId) {
-					response = "当前没有运行中的任务。";
+					response = session.pendingKey ? "网页任务没有精确 runId，请在网页中停止。" : "当前没有运行中的任务。";
 					break;
 				}
 				if (!this.host.abortRun) throw new Error("宿主不支持 abortRun，请升级宿主");
 				const result = await this.host.abortRun(session.runId || session.conversationId);
 				if (!result?.ok) throw new Error(result?.error || "中止失败");
-				this.pendingRuns.delete(session.runId);
+				this.pendingRuns.delete(session.pendingKey);
+				session.pendingKey = undefined;
 				session.runId = undefined;
 				response = "已停止当前任务。";
 				break;
@@ -292,19 +328,52 @@ export class DingtalkBotBridge {
 		await this.reply(url, response);
 	}
 	async handleRunEvent(ev) {
-		const rid = String(ev?.runId || "");
-		if (!rid || !["message", "run_end"].includes(ev.type)) return;
-		const run = this.pendingRuns.get(rid);
+		if (!ev || !["run_start", "message", "run_end"].includes(ev.type)) return;
+		await this.routes.ready();
+		if (this.stopped) return;
+		const rid = String(ev.runId || "");
+		const identity = sessionKey(ev);
+		const key = rid ? `run:${rid}` : identity;
+		if (!key || (rid && this.ended.has(key))) return;
+		let run = this.pendingRuns.get(key);
+		if (!run && !rid && identity) {
+			// Exact identity also supports old hosts whose event omits a known runId.
+			run = [...this.pendingRuns.values()].find((value) => sessionKey(value) === identity);
+		}
+		if (!run && !rid && ev.type === "run_start") {
+			const route = this.routes.routes.get(identity);
+			if (!this.routes.valid(route)) return;
+			const session = this.sessions.get(route.scope);
+			if (session.pendingKey || session.dispatching) return;
+			run = {
+				session,
+				url: session.url,
+				text: "",
+				revision: session.revision,
+				generation: this.generation,
+				sessionId: ev.sessionId,
+				clientId: ev.clientId,
+				conversationId: ev.conversationId,
+			};
+			session.pendingKey = key;
+			this.pendingRuns.set(key, run);
+		}
 		if (!run) {
-			if (this.dispatching && this.earlyRuns.size < 64) {
+			if (rid && this.dispatching && this.earlyRuns.size < 64) {
 				const events = this.earlyRuns.get(rid) || [];
 				if (events.length < 64 && JSON.stringify(ev).length <= 64_000) events.push(ev);
 				this.earlyRuns.set(rid, events);
 			}
 			return;
 		}
-		if (run.generation !== this.generation || run.revision !== run.session.revision) return;
-		if (ev.conversationId) run.session.conversationId = ev.conversationId;
+		if (
+			run.generation !== this.generation ||
+			run.revision !== run.session.revision ||
+			this.sessions.get(run.session.scope) !== run.session ||
+			(ev.sessionId && run.sessionId && ev.sessionId !== run.sessionId)
+		)
+			return;
+		if (ev.type === "run_start") return;
 		if (ev.type === "message") {
 			if (ev.message?.role !== "assistant" && ev.message?.author !== "assistant") return;
 			const content = ev.message.content;
@@ -312,20 +381,45 @@ export class DingtalkBotBridge {
 				typeof content === "string"
 					? content
 					: Array.isArray(content)
-						? content.map((part) => (typeof part === "string" ? part : part.text || "")).join("\n")
+						? content
+								.map((part) =>
+									typeof part === "string" ? part : !part.type || part.type === "text" ? part.text || "" : "",
+								)
+								.join("\n")
 						: "";
-			run.text = (run.text + "\n" + value).slice(0, 100_000);
+			const toolOnly =
+				Array.isArray(content) &&
+				content.some((part) => ["toolCall", "tool_use", "function_call"].includes(part?.type));
+			run.text = toolOnly ? "" : value.slice(0, 100_000);
 			return;
 		}
-		this.pendingRuns.delete(rid);
-		if (run.session.runId === rid) run.session.runId = undefined;
+		const pendingKey = run.session.pendingKey;
+		this.pendingRuns.delete(pendingKey);
+		if (run.runId) {
+			this.ended.add(`run:${run.runId}`);
+			if (this.ended.size > 500) this.ended.delete(this.ended.values().next().value);
+		}
+		run.session.pendingKey = undefined;
+		run.session.runId = undefined;
 		const failure = ev.isError || ["error", "aborted"].includes(ev.stopReason);
 		const final =
 			[strip(run.text), failure ? `任务${ev.stopReason === "aborted" ? "已停止" : "执行失败"}。` : ""]
 				.filter(Boolean)
 				.join("\n") || "任务已完成（无文本输出）。";
 		try {
-			for (const chunk of chunkMarkdownText(final, 3500)) await this.reply(run.url, chunk, true);
+			for (const chunk of chunkMarkdownText(final, 3500)) {
+				if (run.generation !== this.generation || run.revision !== run.session.revision) return;
+				try {
+					await this.reply(run.url, chunk, true);
+				} catch (error) {
+					if (!run.session.destination || run.generation !== this.generation || run.revision !== run.session.revision)
+						throw error;
+					await sendRobotMessage(this.getConfig(), run.session.destination, "sampleMarkdown", {
+						title: "AI 回复",
+						text: chunk,
+					});
+				}
+			}
 			this.status.messagesReplied++;
 			this.status.lastReplyAt = Date.now();
 		} catch (error) {

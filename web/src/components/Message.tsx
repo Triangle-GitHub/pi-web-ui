@@ -341,6 +341,7 @@ export const Message = memo(function Message({
 	const [editAttachments, setEditAttachments] = useState<PromptAttachment[]>([]);
 	const [editDragOver, setEditDragOver] = useState(false);
 	const chatUploadMaxMb = useAppField("chatUploadMaxMb");
+	const engine = useAppField("engine");
 	const editReadId = useRef(0);
 	const [editReads, setEditReads] = useState<{ id: number; name: string; percent: number | null }[]>([]);
 	const finishEditRead = (id: number) => setEditReads((prev) => prev.filter((read) => read.id !== id));
@@ -420,6 +421,11 @@ export const Message = memo(function Message({
 	const isEmptyStreaming = streaming && isLast && message.role === "assistant" && message.content.length === 0;
 
 	const canEdit = !readOnly && message.role === "user" && !streaming && !isEmptyStreaming && !!onEdit;
+	const canDelete =
+		!readOnly && engine === "pi" && !streaming && !editing && (message.role === "user" || message.role === "assistant");
+	const deleteMessage = () => {
+		if (canDelete) appSend({ type: "delete_message", messageId: message.id });
+	};
 	/** Paste/drop handler inside the edit composer — same downscale pipeline
 	 *  as the main input bar so payloads stay under the server's cap. */
 	const addEditImageFiles = async (files: File[]) => {
@@ -726,6 +732,8 @@ export const Message = memo(function Message({
 					return canRollback ? entry : { ...entry, hidden: true };
 				case "host:msg-ctx-fork":
 					return !readOnly && !streaming && !editing ? entry : { ...entry, hidden: true };
+				case "host:msg-ctx-delete":
+					return canDelete ? entry : { ...entry, hidden: true };
 				case "host:msg-ctx-speak":
 					if (!canSpeak) return { ...entry, hidden: true };
 					return speakActive ? { ...entry, label: t("stopSpeakingMsg"), icon: "square" } : entry;
@@ -776,6 +784,9 @@ export const Message = memo(function Message({
 						return undefined;
 					case "host:msg-ctx-rollback":
 						rollbackEdit();
+						return undefined;
+					case "host:msg-ctx-delete":
+						deleteMessage();
 						return undefined;
 					case "host:msg-ctx-speak":
 						toggleSpeak();
@@ -918,6 +929,22 @@ export const Message = memo(function Message({
 			if (entry.id === "host:msg-speak") {
 				const node = speakNode(key);
 				if (node) nodes.push(node);
+				return;
+			}
+			if (entry.id === "host:msg-delete") {
+				if (!canDelete) return;
+				nodes.push(
+					<MessageActionButton
+						key={key}
+						type="button"
+						className="msg-action"
+						title={label}
+						aria-label={label}
+						onClick={deleteMessage}
+					>
+						{slotIcon(entry.icon)} <span className="msg-action-label">{label}</span>
+					</MessageActionButton>,
+				);
 				return;
 			}
 			if (entry.id === "host:msg-reask") {

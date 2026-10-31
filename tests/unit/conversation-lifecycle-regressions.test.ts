@@ -115,6 +115,21 @@ describe("editMessage ownership across abort/reload awaits", () => {
 		});
 		return { cs, a, b, abort, reload };
 	}
+	it("edits an explicit background conversation without resolving the active transcript", async () => {
+		const { cs, a, b, abort, reload } = fixture();
+		cs.activeId = b.id;
+		cs.resolveUserMessageEntryId = vi.fn(() => "question");
+		const editing = cs.editMessage("question", "revised", undefined, a);
+		expect(cs.resolveUserMessageEntryId).toHaveBeenCalledWith("question", a);
+		expect(a.session.clearQueue).toHaveBeenCalledTimes(1);
+		abort.resolve();
+		reload.resolve();
+		await editing;
+		expect(cs.prompt).toHaveBeenCalledExactlyOnceWith("revised", undefined, false, a);
+		expect(b.queueSteering).toEqual(["old steering"]);
+		expect(cs.activeId).toBe(b.id);
+	});
+
 	it("aborts safely and re-prompts A after active switches to B", async () => {
 		const { cs, a, b, abort, reload } = fixture();
 		const attachments = [{ path: "image.png", mimeType: "image/png" }];
@@ -161,6 +176,66 @@ describe("editMessage ownership across abort/reload awaits", () => {
 		await editing;
 		expect(cs.applySessionOverrides).not.toHaveBeenCalled();
 		expect(cs.prompt).not.toHaveBeenCalled();
+	});
+});
+
+describe("explicit retry, queue and draft targets", () => {
+	it("retries the background session and ignores a runtime replaced during the await", async () => {
+		const cs = client();
+		const a = conversation("A");
+		const b = conversation("B");
+		cs.convs.set(a.id, a);
+		cs.convs.set(b.id, b);
+		cs.quiesceBlocked = () => false;
+		cs.activeId = b.id;
+		a.session.agent.state.messages = [{ role: "assistant", stopReason: "error" }];
+		const sent = deferred<void>();
+		a.session.sendCustomMessage = vi.fn(() => sent.promise);
+		const retry = cs.retryLast(a);
+		expect(a.session.sendCustomMessage).toHaveBeenCalledTimes(1);
+		a.runtime = { ...a.runtime };
+		sent.resolve();
+		await retry;
+		expect(a.promptedSinceActive).toBeUndefined();
+		expect(b.pendingTask).toBeUndefined();
+	});
+
+	it("removes and requeues only the captured background session", async () => {
+		const cs = client();
+		const a = conversation("A");
+		const b = conversation("B");
+		cs.convs.set(a.id, a);
+		cs.convs.set(b.id, b);
+		cs.activeId = b.id;
+		a.queueSteering = ["drop", "keep", "later"];
+		a.queuedSteeringEntries = [];
+		a.queuedFollowUpEntries = [];
+		a.session.clearQueue = vi.fn(() => ({ steering: a.queueSteering, followUp: [] }));
+		const queued = deferred<void>();
+		a.session.steer = vi.fn(() => queued.promise);
+		const removing = cs.removeQueued("steer", "drop", 0, undefined, a);
+		expect(a.session.steer).toHaveBeenCalledWith("keep", undefined);
+		cs.activeId = a.id;
+		queued.resolve();
+		await removing;
+		expect(a.session.steer).toHaveBeenCalledTimes(2);
+		expect(b.queueSteering).toEqual(["old steering"]);
+	});
+
+	it("validates the explicit draft target and its SDK session", () => {
+		const cs = client();
+		const a = conversation("A");
+		a.session.sessionId = "sdk-A";
+		cs.convs.set(a.id, a);
+		cs.drafts = { save: vi.fn() };
+		cs.emitNotice = vi.fn();
+		cs.saveDraft("sdk-A", "draft", 1, a);
+		expect(cs.drafts.save).toHaveBeenCalledExactlyOnceWith("sdk-A", "draft", 1);
+		cs.saveDraft("sdk-B", "wrong", 2, a);
+		cs.convs.delete(a.id);
+		cs.saveDraft("sdk-A", "gone", 3, a);
+		expect(cs.drafts.save).toHaveBeenCalledTimes(1);
+		expect(cs.emitNotice).toHaveBeenCalledTimes(2);
 	});
 });
 

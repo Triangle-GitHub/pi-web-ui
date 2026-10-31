@@ -1550,6 +1550,8 @@ export const zh = {
 	localBotSelectAll: "全选",
 	localBotClear: "清空",
 	localBotUnavailable: "当前项目不可用；保留至手动移除",
+	localBotToolHighPrivilege: "可创建其他执行环境或修改宿主配置，请按需授权。",
+	localBotToolUnsupportedPlatform: "当前设备平台不支持此工具，授权后仍可能无法执行。",
 	localBotUnverified: "尚未验证；已保留选择",
 	localBotOptionsLoading: "正在加载项目目录…",
 	localBotNoOptions: "没有匹配选项",
@@ -4257,6 +4259,9 @@ export const en: Record<keyof typeof zh, string> = {
 	localBotSelectAll: "Select all",
 	localBotClear: "Clear",
 	localBotUnavailable: "Unavailable in this project; retained until removed",
+	localBotToolHighPrivilege: "Can create other execution contexts or modify host configuration. Authorize as needed.",
+	localBotToolUnsupportedPlatform:
+		"Unsupported on this device platform; execution may still be unavailable after authorization.",
 	localBotUnverified: "Not verified; selection retained",
 	localBotOptionsLoading: "Loading project catalogs…",
 	localBotNoOptions: "No matching options",

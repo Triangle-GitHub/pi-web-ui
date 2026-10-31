@@ -90,6 +90,7 @@ export class SlackBotBridge {
 		this.log = log || ((level, msg) => console.log(`[slack-bot:${level}] ${msg}`));
 
 		this.running = false;
+		this.generation = 0;
 		this.ws = null;
 		this.botUser = null;
 		this.offRunEvent = null;
@@ -150,7 +151,7 @@ export class SlackBotBridge {
 
 		if (this.host.onRunEvent) {
 			this.offRunEvent = this.host.onRunEvent((ev) => {
-				this.handleRunEvent(ev).catch((error) => this.log("warn", `Reply delivery failed: ${error.message}`));
+				return this.handleRunEvent(ev).catch((error) => this.log("warn", `Reply delivery failed: ${error.message}`));
 			});
 		}
 
@@ -164,7 +165,17 @@ export class SlackBotBridge {
 	}
 
 	async stop() {
+		this.generation++;
 		this.running = false;
+		this.dispatches?.clear();
+		this.ownedRuns?.clear();
+		this.webRuns?.clear();
+		for (const state of this.channelStates?.values() || []) {
+			state.downloadController?.abort();
+			state.downloadController = null;
+			state.busy = false;
+			state.runId = undefined;
+		}
 		this.status.enabled = false;
 		this.status.connected = false;
 		this.status.state = "idle";
@@ -309,6 +320,8 @@ export default async function activate(host) {
 		log: (lvl, msg) => host.log?.(lvl, msg),
 	});
 
+	await botBridge.restoreSessionRoutes();
+
 	if (localConfig.botEnabled && localConfig.botToken && localConfig.appToken) {
 		botBridge.start().catch((err) => {
 			host.log?.("warn", `Slack bot start note: ${err.message}`);
@@ -410,7 +423,10 @@ export default async function activate(host) {
 				case "save_config": {
 					const incoming = msg.config || {};
 					const secrets = (await host.secrets?.getAll?.()) || {};
+					const previousAccount = JSON.stringify([localConfig.botToken, localConfig.appToken]);
 					localConfig = mergeSavedSecrets(incoming, localConfig, secrets);
+					if (previousAccount !== JSON.stringify([localConfig.botToken, localConfig.appToken]))
+						await botBridge.clearSessionRoutes();
 
 					if (host.secrets) {
 						if (localConfig.botToken) {

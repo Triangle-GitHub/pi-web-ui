@@ -376,6 +376,7 @@ export default async function activate(host) {
 		reactMessage: (cfg, msgId, emoji) => reactMessage(cfg, msgId, emoji),
 		log: (lvl, msg) => host.log?.(lvl, msg),
 	});
+	await botBridge.restoreSessionRoutes();
 
 	if (localConfig.botEnabled && hasAppConfig(localConfig)) {
 		botBridge.start().catch((err) => {
@@ -1111,6 +1112,7 @@ export default async function activate(host) {
 					const incoming = msg.config || {};
 					const secrets = (await host.secrets?.getAll?.()) || {};
 					localConfig = mergeSavedSecrets(incoming, localConfig, secrets);
+					botBridge.syncRouteAccount();
 
 					if (host.secrets) {
 						if (localConfig.appSecret) {

@@ -1,6 +1,6 @@
 # WhatsApp 机器人与工作台
 
-基于 Meta WhatsApp Business Cloud API（Graph API v20.0），无第三方运行依赖。插件版本 **0.2.4**。
+基于 Meta WhatsApp Business Cloud API（Graph API v20.0），无第三方运行依赖。插件版本 **0.2.5**。
 
 ## 命令与会话
 
@@ -32,6 +32,7 @@
 - 模型切换、无头聊天和真实附件需要新版 pi 宿主支持；缺少 `conversationId/runId` 回执会拒绝不安全的关联。不能在旧版宿主靠 URL 文本降级图片。
 - 音视频没有内置转录、视频帧解码或合成服务。无法解码必须说明，不能编造媒体内容。
 - Meta 24 小时服务窗口、模板消息要求、收件号码资格、媒体编码支持及网络可达性由 Meta 管理；不承诺零封号或无限制发送。
-- 运行态会话映射与 webhook 去重仅在当前插件进程中保留；重启后不续接旧运行。
+- 同一来源持续复用会话；目的地、独立账号、稳定 sessionId 与 reset epoch 经宿主 storage 保存，插件重载后恢复。网页主动续聊的最终助手正文仍回原收件人；工具前言不拼入最终回复，重复结束事件只发送一次。旧宿主仅接受完整 clientId + conversationId，不按匿名 c1 认领。
+- `/new` 或业务账号/Token 变化撤销旧路由；旧事件不能恢复旧 epoch。网页运行没有 runId 时只能解除回传绑定，明确报告无法精准中止，不猜测 canonical conversationId。运行中文本与 webhook 去重仍只在内存中保留，重载不会重发已结束运行。Meta 服务窗口到期仍由原 Cloud API 发送并明确记录错误，不自动发送收费模板。
 
-验证：`npx vitest run tests/unit/whatsapp-features.test.ts tests/unit/whatsapp-behavior.test.ts`。
+验证：`npx vitest run tests/unit/whatsapp-features.test.ts tests/unit/whatsapp-behavior.test.ts tests/unit/whatsapp-session-routes.test.ts`。

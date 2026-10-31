@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { isAbsolute } from "node:path";
 import { chunkMarkdownText } from "./markdown-chunks.mjs";
 import { MEDIA_TYPES, receiveMedia } from "./media.mjs";
@@ -22,6 +22,7 @@ export class WhatsappBotBridge {
 		this.earlyRuns = new Map();
 		this.dispatching = 0;
 		this.sessions = new Map();
+		this.sessionRoutes = new Map();
 		this.queues = new Map();
 		this.inboundEpochs = new Map();
 		this.status = {
@@ -35,6 +36,96 @@ export class WhatsappBotBridge {
 			lastReplyAt: null,
 			lastError: null,
 		};
+	}
+	routeKey(identity) {
+		return identity.sessionId
+			? `session:${identity.sessionId}`
+			: identity.clientId && identity.conversationId
+				? `owner:${JSON.stringify([identity.clientId, identity.conversationId])}`
+				: "";
+	}
+	checkAccount() {
+		const cfg = this.getConfig();
+		const account = createHash("sha256")
+			.update(JSON.stringify([cfg.phoneNumberId || "", cfg.accessToken || ""]))
+			.digest("hex");
+		if (this.account && this.account !== account) {
+			for (const run of this.pendingRuns.values()) clearTimeout(run.timer);
+			this.pendingRuns.clear();
+			for (const key of this.sessions.keys()) this.inboundEpochs.set(key, (this.inboundEpochs.get(key) || 0) + 1);
+			this.queues.clear();
+			this.sessions.clear();
+			this.sessionRoutes.clear();
+			this.earlyRuns.clear();
+			this.generation++;
+		}
+		const changed = this.account && this.account !== account;
+		this.account = account;
+		if (changed) this.saveRoutes();
+	}
+	async restoreRoutes() {
+		this.checkAccount();
+		if (this.restored) return;
+		this.restored = true;
+		const saved = await this.host.storage?.get("sessionRoutes");
+		if (saved?.account !== this.account) {
+			this.saveRoutes();
+			await this.routeSave;
+			return;
+		}
+		for (const [key, session] of saved.sessions || []) {
+			if (typeof key === "string" && session?.accountId) this.sessions.set(key, session);
+		}
+		for (const [key, route] of saved.routes || []) {
+			if (
+				route.account === this.account &&
+				(route.ambiguous || (key === this.routeKey(route) && this.sessions.get(route.key)?.revision === route.revision))
+			)
+				this.sessionRoutes.set(key, route);
+		}
+	}
+	saveRoutes() {
+		const saved = JSON.parse(
+			JSON.stringify({
+				account: this.account,
+				sessions: [...this.sessions].map(([key, session]) => {
+					const { runId: _runId, ...rest } = session;
+					return [key, { ...rest, revision: session.revision || 0 }];
+				}),
+				routes: [...this.sessionRoutes],
+			}),
+		);
+		this.routeSave = (this.routeSave || Promise.resolve())
+			.catch(() => {})
+			.then(() => this.host.storage?.set("sessionRoutes", saved))
+			.catch((error) => {
+				this.status.lastError = `Route persistence failed: ${error.message}`;
+				this.log("error", this.status.lastError);
+			});
+	}
+	bindRoute(identity, key, sender, session) {
+		const id = this.routeKey(identity);
+		if (!id) return null;
+		const previous = this.sessionRoutes.get(id);
+		if (previous?.ambiguous || (previous && previous.key !== key)) {
+			this.sessionRoutes.set(id, { ambiguous: true, account: this.account });
+			this.status.lastError = "Ambiguous host session identity; web replies disabled";
+			this.saveRoutes();
+			return null;
+		}
+		session.revision ||= 0;
+		const route = {
+			sessionId: identity.sessionId,
+			clientId: identity.clientId,
+			conversationId: identity.conversationId,
+			key,
+			sender,
+			account: this.account,
+			revision: session.revision,
+		};
+		this.sessionRoutes.set(id, route);
+		this.saveRoutes();
+		return route;
 	}
 	getStatus() {
 		return { ...this.status };
@@ -53,6 +144,7 @@ export class WhatsappBotBridge {
 	}
 	async start() {
 		if (this.running) return;
+		await this.restoreRoutes();
 		const generation = ++this.generation;
 		this.running = true;
 		this.status.enabled = true;
@@ -72,6 +164,7 @@ export class WhatsappBotBridge {
 		}
 	}
 	async stop() {
+		this.checkAccount();
 		this.generation++;
 		this.running = false;
 		this.offRunEvent?.();
@@ -79,10 +172,12 @@ export class WhatsappBotBridge {
 		for (const run of this.pendingRuns.values()) clearTimeout(run.timer);
 		this.pendingRuns.clear();
 		this.earlyRuns.clear();
+		await this.routeSave;
 		Object.assign(this.status, { enabled: false, connected: false, state: "idle" });
 	}
 	async onInboundMessage(event) {
 		if (!event) return;
+		await this.restoreRoutes();
 		const key = sessionKey(event);
 		// Serialize a peer's configuration and dispatch; control commands must interrupt a pending dispatch.
 		const text = this.extractText(event).trim();
@@ -124,6 +219,7 @@ export class WhatsappBotBridge {
 			if (this.seenMessageIds.size > 500) this.seenMessageIds.delete(this.seenMessageIds.values().next().value);
 		}
 		const cfg = this.getConfig();
+		this.checkAccount();
 		if (cfg.allowedUsers?.length && !cfg.allowedUsers.map(String).includes(sender))
 			return this.reply(sender, "Access Restricted: contact the administrator.");
 		// Cloud API supports business-to-person delivery only; never leak a claimed group/thread reply into a DM.
@@ -209,7 +305,8 @@ export class WhatsappBotBridge {
 				}
 				session.conversationId = result.conversationId;
 				session.runId = result.runId;
-				const run = { session, revision, sender, accumulatedText: "", timer: null };
+				const route = this.bindRoute(result, key, sender, session);
+				const run = { session, revision, sender, route, accumulatedText: "", timer: null };
 				this.pendingRuns.set(result.runId, run);
 				run.timer = setTimeout(() => {
 					if (this.pendingRuns.delete(result.runId))
@@ -264,12 +361,21 @@ export class WhatsappBotBridge {
 			case "/abort": {
 				this.inboundEpochs.set(key, (this.inboundEpochs.get(key) || 0) + 1);
 				session.revision = (session.revision || 0) + 1;
+				for (const route of this.sessionRoutes.values()) if (route.key === key) route.revision = session.revision;
+				this.saveRoutes();
 				if (!session.conversationId) {
 					reply = "Stop requested. Any pending download or dispatch will be cancelled before model delivery.";
 					break;
 				}
+				const active = [...this.pendingRuns.values()].find((run) => run.session === session);
+				if (active?.web) {
+					this.forgetRuns(session);
+					this.saveRoutes();
+					throw new Error("Web reply detached; host cannot precisely abort this run without a runId");
+				}
 				const target = session.runId || session.conversationId;
 				this.forgetRuns(session);
+				this.saveRoutes();
 				delete session.runId;
 				const result = await this.host.abortRun?.(target);
 				if (!result?.ok) throw new Error(result?.error || "Host abort unavailable");
@@ -315,12 +421,16 @@ export class WhatsappBotBridge {
 	async resetSession(session, key) {
 		this.inboundEpochs.set(key, (this.inboundEpochs.get(key) || 0) + 1);
 		session.revision = (session.revision || 0) + 1;
-		const target = session.runId || session.conversationId;
+		const target = session.runId;
 		const active = [...this.pendingRuns.values()].some((r) => r.session === session);
+		const web = [...this.pendingRuns.values()].some((r) => r.session === session && r.web);
 		this.forgetRuns(session);
 		delete session.conversationId;
 		delete session.runId;
 		session.accountId = this.accountId(randomUUID());
+		for (const [id, route] of this.sessionRoutes) if (route.key === key) this.sessionRoutes.delete(id);
+		this.saveRoutes();
+		if (web) throw new Error("Old web run detached; host cannot precisely abort it without a runId");
 		if (target && active) {
 			const result = await this.host.abortRun?.(target);
 			if (!result?.ok) throw new Error(result?.error || "Host abort unavailable");
@@ -334,10 +444,21 @@ export class WhatsappBotBridge {
 			}
 	}
 	async handleRunEvent(ev) {
-		if (!ev?.runId) return;
-		const run = this.pendingRuns.get(ev.runId);
+		if (!ev) return;
+		this.checkAccount();
+		const identity = this.routeKey(ev);
+		const token = ev.runId || (identity ? `web:${identity}` : "");
+		if (!token) return;
+		let run = this.pendingRuns.get(token);
+		if (!run && !ev.runId && ev.type === "run_start") {
+			const route = this.sessionRoutes.get(identity);
+			const session = route && this.sessions.get(route.key);
+			if (!session || route.revision !== (session.revision || 0) || route.account !== this.account) return;
+			run = { session, revision: route.revision, sender: route.sender, route, web: true, accumulatedText: "" };
+			this.pendingRuns.set(token, run);
+		}
 		if (!run) {
-			if (this.dispatching && this.earlyRuns.size < 64) {
+			if (ev.runId && this.dispatching && this.earlyRuns.size < 64) {
 				const early = this.earlyRuns.get(ev.runId) || [];
 				if (early.length < 64) early.push(ev);
 				this.earlyRuns.set(ev.runId, early);
@@ -345,9 +466,19 @@ export class WhatsappBotBridge {
 			return;
 		}
 		if (run.revision !== (run.session.revision || 0)) return;
+		if (
+			run.route &&
+			(run.route.account !== this.account || this.sessionRoutes.get(this.routeKey(run.route)) !== run.route)
+		)
+			return;
+		if (ev.sessionId && run.route?.sessionId && ev.sessionId !== run.route.sessionId) return;
 		if (ev.conversationId) run.session.conversationId = ev.conversationId;
 		if (ev.type === "message" && ev.message?.role === "assistant") {
 			const content = ev.message.content;
+			const toolCall =
+				ev.message.stopReason === "toolUse" ||
+				ev.message.stopReason === "tool_calls" ||
+				(Array.isArray(content) && content.some((block) => ["toolCall", "tool_use", "tool_call"].includes(block.type)));
 			const text =
 				typeof content === "string"
 					? content
@@ -355,18 +486,23 @@ export class WhatsappBotBridge {
 							.filter((b) => b.type === "text")
 							.map((b) => b.text || "")
 							.join("\n");
-			run.accumulatedText = (run.accumulatedText + "\n" + text).slice(-100000);
+			run.accumulatedText = toolCall ? "" : text.slice(-100000);
 		}
 		if (ev.type === "run_end") {
 			clearTimeout(run.timer);
-			this.pendingRuns.delete(ev.runId);
+			this.pendingRuns.delete(token);
+			this.saveRoutes();
 			if (run.session.runId === ev.runId) delete run.session.runId;
+			const generation = this.generation;
+			const account = this.account;
 			const failure = ev.isError || ["error", "aborted"].includes(ev.stopReason);
 			const text = failure
 				? `Task ${ev.stopReason || "failed"}. ${this.stripMarkers(run.accumulatedText)}`
 				: this.stripMarkers(run.accumulatedText) || "Task completed (no text output).";
 			for (const chunk of chunkMarkdownText(text, 3800)) {
-				if (run.revision !== (run.session.revision || 0)) break;
+				this.checkAccount();
+				if (generation !== this.generation || account !== this.account || run.revision !== (run.session.revision || 0))
+					break;
 				await this.reply(run.sender, chunk);
 			}
 		}

@@ -574,7 +574,7 @@ export function createIlink({ base, cdnBase, version, getToken }) {
 
 export default {
 	activate(host) {
-		const VERSION = "0.5.4";
+		const VERSION = "0.5.5";
 		let cfg = {};
 		try {
 			cfg = host.getSettings?.() ?? {};
@@ -1095,6 +1095,52 @@ export default {
 		const inFlightClients = new Map();
 		/** conversationId → startedAt（仅当投递到指定绑定会话时）。 */
 		const inFlightConvs = new Map();
+		const routes = new Map();
+		const completedRuns = new Set();
+		let dispatches = 0;
+		function rememberCompleted(runId) {
+			completedRuns.add(runId);
+			while (completedRuns.size > 500) completedRuns.delete(completedRuns.values().next().value);
+		}
+		function finalAssistantText(message) {
+			return message?.stopReason === "toolUse" || message?.content?.some((part) => part.type === "toolCall")
+				? ""
+				: assistantTextOf(message);
+		}
+
+		function sessionKey(value) {
+			if (value.sessionId) return `session:${value.sessionId}`;
+			return value.clientId && value.conversationId
+				? `owner:${JSON.stringify([value.clientId, value.conversationId])}`
+				: "";
+		}
+		function validRoute(route) {
+			return (
+				route &&
+				route.epoch === (st.peerSessionSeq[route.to] || 0) &&
+				route.account === peerAccountId(route.to, route.epoch)
+			);
+		}
+		function saveRoutes() {
+			while (routes.size > 200) routes.delete(routes.keys().next().value);
+			store.set("sessionRoutes", [...routes].filter(([key]) => key.startsWith("session:")).slice(-200));
+		}
+		function bindRoute(identity, to, ctx) {
+			const key = sessionKey(identity);
+			if (!key) return null;
+			const previous = routes.get(key);
+			// A shared webpage session with multiple peers has no unambiguous recipient.
+			if (previous?.ambiguous || (validRoute(previous) && previous.to !== to)) {
+				routes.set(key, { ambiguous: true });
+				saveRoutes();
+				return null;
+			}
+			const epoch = st.peerSessionSeq[to] || 0;
+			const route = { to, ctx, epoch, account: peerAccountId(to, epoch) };
+			routes.set(key, route);
+			saveRoutes();
+			return route;
+		}
 
 		function makeRunKey(clientId, conversationId) {
 			const c = String(clientId ?? "").trim();
@@ -1113,17 +1159,34 @@ export default {
 			}
 		}
 
-		function trackRun({ conversationId, clientId, to, contextToken, startedAt = 0, runId = "" }) {
-			const key = makeRunKey(clientId, conversationId);
+		function trackRun({ conversationId, clientId, sessionId, to, contextToken, startedAt = 0, runId = "" }) {
+			bindRoute({ sessionId, clientId, conversationId }, to, contextToken);
+			const key = runId ? `run:${runId}` : makeRunKey(clientId, conversationId);
+			if (runId && completedRuns.has(runId)) return;
+			for (const [oldKey, old] of st.pendingRuns) {
+				if (oldKey === key || old.to !== to || sessionKey(old) !== sessionKey({ sessionId, clientId, conversationId }))
+					continue;
+				const text = st.runText.get(oldKey);
+				dropRun(oldKey);
+				if (old.runId) rememberCompleted(old.runId);
+				if (text) st.runText.set(key, text);
+			}
+			const existing = st.pendingRuns.get(key);
+			if (existing) {
+				if (existing.to !== to) {
+					existing.ambiguous = true;
+				} else existing.ctx = contextToken;
+				return;
+			}
 			while (st.pendingRuns.size >= PENDING_RUN_CAP) {
 				const oldest = st.pendingRuns.keys().next().value;
 				dropRun(oldest);
 			}
 
 			// issue #345：检查在 host.chat() 结果返回前是否已提前收到运行事件
-			// 优先精确 runKey 匹配，未命中时尝试 conversationId 匹配（兼容 ev 未带 clientId 的测试 mock）
+			// Only the receipt run token or exact owner tuple may consume quarantined events.
 			const earlyKey = runId ? `run:${runId}` : key;
-			const early = earlyRuns.get(earlyKey) ?? (!runId ? earlyRuns.get(conversationId) : undefined);
+			const early = earlyRuns.get(earlyKey);
 			if (early && (!startedAt || early.at >= startedAt - 500)) {
 				earlyRuns.delete(earlyKey);
 				earlyRuns.delete(key);
@@ -1132,6 +1195,7 @@ export default {
 					st.runText.set(key, early.text);
 				}
 				if (early.ended) {
+					if (runId) rememberCompleted(runId);
 					const clean = stripInternalMarkers(st.runText.get(key) ?? "");
 					const body = clean || "任务完成（无文本输出）。";
 					dropRun(key);
@@ -1165,6 +1229,8 @@ export default {
 				startedAt,
 				conversationId,
 				clientId,
+				sessionId,
+				epoch: st.peerSessionSeq[to] || 0,
 				...(runId ? { runId } : {}),
 			});
 			if (runId) st.runIdIndex.set(runId, key);
@@ -1209,6 +1275,10 @@ export default {
 			const epoch = (st.peerSessionSeq[peer] || 0) + 1;
 			st.peerSessionSeq[peer] = epoch;
 			st.peerDetached[peer] = true;
+			for (const [key, route] of routes) {
+				if (route.to === peer) routes.delete(key);
+			}
+			saveRoutes();
 			save();
 			let failed = false;
 			for (const [key, run] of [...st.pendingRuns.entries()]) {
@@ -1265,6 +1335,7 @@ export default {
 			if (bindCid) inFlightConvs.set(bindCid, startedAt);
 			inFlightClients.set(expectedPseudoClientId, startedAt);
 
+			dispatches++;
 			try {
 				const r = await host.chat(req);
 				if (!r?.conversationId) throw new Error(r?.error || "宿主未返回实际会话 ID，消息未确认执行");
@@ -1294,7 +1365,7 @@ export default {
 					// 上一轮若还在跑（steer 并入在途运行），它的已累积正文必须保留：
 					// 整轮只会在最后结算一次 run_end，清掉就只剩「任务完成（无文本输出）」。
 					resetStaleRunText(conversationId);
-					trackRun({ conversationId, clientId, to: peer, contextToken, startedAt, runId });
+					trackRun({ conversationId, clientId, sessionId: r.sessionId, to: peer, contextToken, startedAt, runId });
 				}
 			} catch (err) {
 				if (bindCid) inFlightConvs.delete(bindCid);
@@ -1303,118 +1374,91 @@ export default {
 					return;
 				host.log("host.chat failed:", err?.message ?? err);
 				sendText(peer, `执行失败：${err?.message ?? err}`, contextToken).catch(() => {});
+			} finally {
+				dispatches--;
+				if (!dispatches) earlyRuns.clear();
 			}
 		}
 
 		const offRun = host.onRunEvent((ev) => {
 			try {
-				const convId = ev.conversationId;
-				if (!convId) return;
-				const evClientId = ev.clientId;
-				const evRunId = typeof ev.runId === "string" ? ev.runId.trim() : "";
+				if (st.disposed) return;
+				const rid = typeof ev.runId === "string" ? ev.runId.trim() : "";
+				if (rid && completedRuns.has(rid)) return;
+				let key = rid ? st.runIdIndex.get(rid) : sessionKey(ev);
+				if (!rid && !st.pendingRuns.has(key) && ev.clientId) key = makeRunKey(ev.clientId, ev.conversationId);
+				let run = st.pendingRuns.get(key);
+				if (
+					run &&
+					((rid && run.runId && rid !== run.runId) || (ev.sessionId && run.sessionId && ev.sessionId !== run.sessionId))
+				)
+					run = null;
 
-				// 查找在 pendingRuns 中的匹配项（顺序即优先级）：
-				// 1. runId：宿主给的稳定令牌——身份证。过户（take_over_conversation）把对话搬到
-				//    浏览器会话时 clientId 变成对方的，目标会话已有同名 id（c1/c2 各会话独立编号）时
-				//    对话还会被就地改名，conversationId 也随之失效；只有它不变。
-				// 2. 精确 makeRunKey(clientId, conversationId)：旧宿主（无 runId）/ bindActive 路径。
-				// 3. 仅当 ev 不带 clientId 时按 conversationId 回退匹配（兼容单测或旧宿主）。
-				let matchedKey = null;
-				let matchedRun = null;
-				if (evRunId) {
-					const key = st.runIdIndex.get(evRunId);
-					if (key && st.pendingRuns.has(key)) {
-						matchedKey = key;
-						matchedRun = st.pendingRuns.get(key);
+				// Before a chat receipt arrives, quarantine by the exact run token (or owner tuple).
+				// No recipient is inferred from a local conversation id.
+				if (!run && dispatches && (rid || (ev.clientId && inFlightClients.has(ev.clientId)))) {
+					const id = rid ? `run:${rid}` : makeRunKey(ev.clientId, ev.conversationId);
+					trimEarlyRuns();
+					const rec = earlyRuns.get(id) ?? { text: "", ended: false, at: Date.now() };
+					if (ev.type === "message") {
+						rec.text = cut(finalAssistantText(ev.message), REPLY_CAP + 200);
 					}
+					if (ev.type === "run_end") rec.ended = true;
+					earlyRuns.set(id, rec);
+					return;
 				}
-				if (!matchedKey && evClientId) {
-					const key = makeRunKey(evClientId, convId);
-					const candidate = st.pendingRuns.get(key);
-					if (candidate && (!evRunId || !candidate.runId || candidate.runId === evRunId)) {
-						matchedKey = key;
-						matchedRun = candidate;
-					}
-				}
-				if (!matchedKey && !evClientId && !evRunId) {
-					if (st.pendingRuns.has(convId)) {
-						matchedKey = convId;
-						matchedRun = st.pendingRuns.get(convId);
-					} else {
-						for (const [k, p] of st.pendingRuns.entries()) {
-							if (p.conversationId === convId) {
-								matchedKey = k;
-								matchedRun = p;
+				if (!run) {
+					if (rid || ev.type !== "run_start") return;
+					const binding = sessionKey(ev);
+					if ([...st.pendingRuns.values()].some((pending) => sessionKey(pending) === binding)) return;
+					let route = routes.get(binding);
+					// Older installations can recover only from an exact plugin account owner.
+					if (!route && ev.clientId) {
+						const peers = new Set(st.allowedPeers);
+						for (const peer of peers) {
+							const account = peerAccountId(peer, st.peerSessionSeq[peer] || 0);
+							if (ev.clientId === `plugin:wechat-ilink:${account}` && st.peerCtx[peer]) {
+								route = bindRoute(ev, peer, st.peerCtx[peer]);
 								break;
 							}
 						}
 					}
+					if (!validRoute(route) || !binding) return;
+					key = rid ? `run:${rid}` : binding;
+					run = {
+						...route,
+						conversationId: ev.conversationId,
+						clientId: ev.clientId,
+						sessionId: ev.sessionId,
+						runId: rid,
+					};
+					if (st.pendingRuns.size >= PENDING_RUN_CAP) dropRun(st.pendingRuns.keys().next().value);
+					st.pendingRuns.set(key, run);
+					if (rid) st.runIdIndex.set(rid, key);
 				}
-
-				if (matchedKey && matchedRun) {
-					if (ev.type === "message" && ev.message) {
-						const t = assistantTextOf(ev.message);
-						if (t) {
-							const prev = st.runText.get(matchedKey) ?? "";
-							st.runText.set(matchedKey, cut(`${prev}\n${t}`.trim(), REPLY_CAP + 200));
-						}
-						return;
-					}
-					if (ev.type !== "run_end") return;
-					const raw = (st.runText.get(matchedKey) ?? "").trim();
-					const clean = stripInternalMarkers(raw);
-					const body = clean || "任务完成（无文本输出）。";
-					dropRun(matchedKey); // 先取值再清（dropRun 会删 runText）。
-					const out = body.length > REPLY_CAP ? `${body.slice(0, REPLY_CAP)}\n…（超长截断）` : body;
-					sendText(matchedRun.to, out, matchedRun.ctx).catch((err) => {
-						const errMsg = err?.message ?? String(err);
-						host.log("reply failed:", errMsg);
-						host.notify?.("warning", `回复微信失败：${errMsg}`, `Failed to reply to WeChat: ${errMsg}`);
-					});
+				if (run.epoch !== (st.peerSessionSeq[run.to] || 0) || run.ambiguous) {
+					dropRun(key);
 					return;
 				}
-
-				// issue #345：若 convId 暂未在 pendingRuns 登记（host.chat 的 Promise 还在微任务中）
-				// 关键安全守卫（彻底杜绝串台）：
-				// 若 evClientId 存在，必须命中正在执行的微信客户端 (inFlightClients) 或绑定的活跃会话 (inFlightConvs)；
-				// 绝不收录来自浏览器网页端（client-xxx）等其它客户端的无关事件！
-				const isRelevant = evClientId
-					? inFlightClients.has(evClientId) || inFlightConvs.has(convId)
-					: inFlightConvs.has(convId) || inFlightClients.size > 0;
-				if (!isRelevant) return;
-
-				const earlyKey = evRunId ? `run:${evRunId}` : evClientId ? makeRunKey(evClientId, convId) : convId;
-
-				if (ev.type === "message" && ev.message) {
-					const t = assistantTextOf(ev.message);
-					if (t) {
-						trimEarlyRuns();
-						let rec = earlyRuns.get(earlyKey);
-						if (!rec) {
-							rec = { text: "", ended: false, at: Date.now() };
-							earlyRuns.set(earlyKey, rec);
-						}
-						rec.text = cut(`${rec.text}\n${t}`.trim(), REPLY_CAP + 200);
-						rec.at = Date.now();
-					}
-					return;
+				if (ev.type === "message") {
+					st.runText.set(key, cut(finalAssistantText(ev.message), REPLY_CAP + 200));
 				}
-				if (ev.type === "run_end") {
-					trimEarlyRuns();
-					let rec = earlyRuns.get(earlyKey);
-					if (!rec) {
-						rec = { text: "", ended: true, at: Date.now() };
-						earlyRuns.set(earlyKey, rec);
-					} else {
-						rec.ended = true;
-						rec.at = Date.now();
-					}
+				if (ev.type !== "run_end") return;
+				const body = stripInternalMarkers(st.runText.get(key) ?? "") || "任务完成（无文本输出）。";
+				dropRun(key);
+				if (rid) {
+					rememberCompleted(rid);
 				}
+				const out =
+					body.length > REPLY_CAP
+						? `${body.slice(0, REPLY_CAP)}
+…（超长截断）`
+						: body;
+				sendText(run.to, out, run.ctx).catch((err) => host.log("reply failed:", err?.message ?? err));
 			} catch (err) {
 				host.log("run event failed:", err?.message ?? err);
 			}
 		});
-
 		// ---- 斜杠快捷指令 ----------------------------------------------------
 		const CORE_NUMBERED_COMMANDS = {
 			1: "cwd",
@@ -2151,6 +2195,16 @@ export default {
 
 		// ---- 启动 --------------------------------------------------------------
 		load();
+		const savedRoutes = store.get("sessionRoutes", []);
+		for (const entry of Array.isArray(savedRoutes) ? savedRoutes.slice(-200) : []) {
+			if (
+				Array.isArray(entry) &&
+				typeof entry[0] === "string" &&
+				entry[0].startsWith("session:") &&
+				(entry[1]?.ambiguous || validRoute(entry[1]))
+			)
+				routes.set(entry[0], entry[1]);
+		}
 		st.bgTask = host.registerBackgroundTask({
 			id: "wechat-poll",
 			label: "💬 微信通道",
@@ -2200,6 +2254,11 @@ export default {
 			}
 			for (const id of [...st.pendingRuns.keys()]) dropRun(id);
 			earlyRuns.clear();
+			st.runIdIndex.clear();
+			inFlightClients.clear();
+			inFlightConvs.clear();
+			routes.clear();
+			completedRuns.clear();
 			st.bgTask?.unregister();
 		};
 	},

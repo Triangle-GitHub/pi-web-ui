@@ -20,7 +20,13 @@ import { ClientStateStore } from "./client-state.js";
 import { ClaimStore } from "./claim-store.js";
 import { isBotExecutionRegistered } from "./device-center/bot-execution.js";
 import { toServiceInfo, launchOrigin } from "./launch-origin.js";
-import { isPseudoClientId, isOrphanAdoptionExcludedClientId, checkPluginCwd } from "./client-id-utils.js";
+import {
+	isPseudoClientId,
+	isDeviceTaskClientId,
+	isOrphanAdoptionExcludedClientId,
+	checkPluginCwd,
+} from "./client-id-utils.js";
+const isSharedExecutionClientId = (id: string) => isPseudoClientId(id) || isDeviceTaskClientId(id);
 import { pickAdoptableOrphan, type OrphanCandidate } from "./orphan-manager.js";
 import { findMostRecentSessionFileFast } from "./session-parser.js";
 import { isRemoteWorkspaceUri, resolveWorkspaceSessionDir } from "./remote-ssh-service.js";
@@ -31,6 +37,7 @@ import { normalizePluginChatAttachments } from "./plugin-chat-attachments.js";
 import type { ToolGuardHook } from "./tool-guards.js";
 import type {
 	ServerMessage,
+	ClientMessage,
 	UiServiceInfo,
 	QuestionAnswer,
 	ElsewhereRunning,
@@ -61,6 +68,356 @@ import {
 
 export class AgentService {
 	static isPseudoClientId = isPseudoClientId;
+	private sharedViewers = new Map<
+		string,
+		{
+			owner: ClientSession;
+			conversation: Conversation;
+			ownerClientId: string;
+			conversationId: string;
+			close: () => void;
+			send: (message: ServerMessage) => void;
+		}
+	>();
+
+	openSharedConversation(
+		viewerClientId: string,
+		ownerClientId: string,
+		convId: string,
+		send: (message: ServerMessage) => void,
+	): boolean {
+		const viewer = this.clients.get(viewerClientId);
+		const owner = this.clients.get(ownerClientId);
+		const conversation = owner?.getConversation(convId);
+		if (!viewer || !owner || !conversation || conversation.independent !== false || conversation.isSubagent)
+			return false;
+		this.closeSharedConversation(viewerClientId);
+		const binding = { owner, conversation, ownerClientId, conversationId: convId, close: () => {}, send };
+		this.sharedViewers.set(viewerClientId, binding);
+		this.subscribeSharedConversation(viewerClientId, binding);
+		return true;
+	}
+
+	private subscribeSharedConversation(
+		viewerClientId: string,
+		binding: NonNullable<ReturnType<AgentService["sharedConversationTarget"]>>,
+	): void {
+		const { owner, conversation, ownerClientId, conversationId: convId, send } = binding;
+		binding.close = owner.subscribeConversation(conversation, (message) => {
+			if (this.sharedConversationTarget(viewerClientId) !== binding) return;
+			if (message.type === "snapshot")
+				send({
+					...message,
+					state: {
+						...message.state,
+						clientId: viewerClientId,
+						sharedConversation: { owner: ownerClientId, conversationId: convId },
+					},
+				});
+			else if (message.type === "snapshot_delta")
+				send({
+					...message,
+					state: {
+						...message.state,
+						clientId: viewerClientId,
+						sharedConversation: { owner: ownerClientId, conversationId: convId },
+					},
+				});
+			else send(message);
+		});
+	}
+
+	private resumeSharedConversation(viewerClientId: string, send: (message: ServerMessage) => void): void {
+		const binding = this.sharedConversationTarget(viewerClientId);
+		if (!binding) return;
+		binding.close();
+		binding.send = send;
+		this.subscribeSharedConversation(viewerClientId, binding);
+	}
+
+	private releaseSharedClient(client: ClientSession): void {
+		for (const [viewerId, binding] of this.sharedViewers) {
+			if (binding.owner === client || this.clients.get(viewerId) === client) this.closeSharedConversation(viewerId);
+		}
+		const relay = this.sharedInteractionSinks.get(client);
+		if (relay) {
+			client.detachSink(relay);
+			this.sharedInteractionSinks.delete(client);
+			const interactions = this.globalInteractions(client);
+			for (const [id, viewer] of this.clients) {
+				if (viewer !== client && !isSharedExecutionClientId(id)) viewer.emitSharedInteraction(interactions);
+			}
+		}
+	}
+
+	closeSharedConversation(viewerClientId: string): void {
+		const binding = this.sharedViewers.get(viewerClientId);
+		this.sharedViewers.delete(viewerClientId);
+		binding?.close();
+	}
+
+	sharedConversationTarget(viewerClientId: string) {
+		const binding = this.sharedViewers.get(viewerClientId);
+		if (
+			binding &&
+			this.clients.get(binding.ownerClientId) === binding.owner &&
+			binding.owner.getConversation(binding.conversationId) === binding.conversation &&
+			binding.conversation.independent === false
+		)
+			return binding;
+		if (binding) this.closeSharedConversation(viewerClientId);
+		return undefined;
+	}
+
+	dispatchSharedConversationMessage(viewerClientId: string, message: ClientMessage): boolean {
+		const binding = this.sharedConversationTarget(viewerClientId);
+		if (!binding) return false;
+		if (["new_chat", "switch_session", "switch_conversation", "set_cwd", "resume_session"].includes(message.type)) {
+			this.closeSharedConversation(viewerClientId);
+			return false;
+		}
+		const { owner, conversation: conv, send } = binding;
+		const fail = (error: unknown) => {
+			try {
+				send({ type: "notice", level: "error", text: String(error), textEn: String(error) });
+			} catch {
+				/* disconnected viewer */
+			}
+		};
+		const run = (action: () => unknown): true => {
+			try {
+				void Promise.resolve(action()).catch(fail);
+			} catch (error) {
+				fail(error);
+			}
+			return true;
+		};
+		const reject = () =>
+			run(() => {
+				throw new Error(`Shared conversation operation unavailable: ${message.type}`);
+			});
+		// One workspace service per binding; close its watchers with the subscription.
+		const fileBinding = binding as typeof binding & { files?: ReturnType<ClientSession["createConversationFiles"]> };
+		const files = () => {
+			if (!fileBinding.files) {
+				const service = owner.createConversationFiles(conv, send);
+				const close = binding.close;
+				binding.close = () => {
+					service.unwatchDir();
+					service.unwatchGit();
+					close();
+				};
+				fileBinding.files = service;
+			}
+			return fileBinding.files;
+		};
+		switch (message.type) {
+			case "run_command":
+				if (message.conversationId && message.conversationId !== conv.id) return reject();
+				return run(() => {
+					const tm = owner.getTerminalManager(conv.id);
+					if (!tm) throw new Error("Conversation terminal unavailable");
+					return tm.runCommand(message.terminalId, message.command, message.cols, message.rows, conv.cwd);
+				});
+			case "file_open_default":
+				return run(() => files().openDefaultEntry(message.path));
+			case "make_dir":
+				if (message.setAsCwd) return reject();
+				return run(() => files().makeDir(message.path));
+			case "dsh_preset_select":
+			case "dsh_permission_set":
+			case "set_workspace_roots":
+			case "extensions_reload":
+			case "list_commands":
+			case "save_commands":
+			case "get_commands":
+			case "get_tool_info":
+			case "get_tool_prompt":
+				return reject();
+			case "list_files":
+				return run(() => files().listFiles(message.path));
+			case "read_file":
+				return run(() => files().readFile(message.path));
+			case "write_file":
+				return run(() => files().writeFile(message.path, message.text));
+			case "upload_file":
+				return run(() =>
+					owner
+						.createConversationFiles(conv, send)
+						.uploadFile(message.dirPath, message.name, message.data, message.uploadId),
+				);
+			case "search_files":
+				return run(() => owner.createConversationFiles(conv, send).searchFiles(message.query, message.reqId));
+			case "complete_path":
+				return run(() => files().completePath(message.path));
+			case "file_create":
+				return run(() => files().createEntry(message.dir, message.name, message.kind));
+			case "file_rename":
+				return run(() => files().renameEntry(message.path, message.newName));
+			case "file_delete":
+				return run(() => files().deleteEntry(message.path));
+			case "file_copy":
+				return run(() => files().copyEntry(message.src, message.destDir, message.move));
+			case "file_reveal":
+				return run(() => files().revealEntry(message.path));
+			case "scm_status":
+				return run(() => files().scmQuery("status", message.reqId));
+			case "scm_history":
+				return run(() => files().scmQuery("history", message.reqId));
+			case "scm_filediff":
+				return run(() => files().scmQuery("filediff", message.reqId, { path: message.path }));
+			case "scm_commit":
+				return run(() => files().scmQuery("commit", message.reqId, { hash: message.hash }));
+			case "scm_commitmsg":
+				return run(() => owner.scmGenCommitMessage(message.reqId, conv, send));
+			case "terminal_create":
+			case "terminal_attach":
+			case "terminal_input":
+			case "terminal_resize":
+			case "terminal_kill":
+			case "rename_terminal": {
+				if (message.conversationId && message.conversationId !== conv.id) return reject();
+				const tm = owner.getTerminalManager(conv.id);
+				if (
+					!tm ||
+					(message.type !== "terminal_create" && (message.ownerKind === "client" || !tm.has(message.terminalId)))
+				)
+					return reject();
+				return run(() => {
+					switch (message.type) {
+						case "terminal_create":
+							return tm.create(message.terminalId, message.cwd, message.cols, message.rows, conv.cwd, message.title, {
+								locale: message.locale,
+								agentBash: message.agentBash,
+							});
+						case "terminal_attach":
+							return tm.attach(message.terminalId, message.cols, message.rows);
+						case "terminal_input":
+							return tm.input(message.terminalId, message.data);
+						case "terminal_resize":
+							return tm.resize(message.terminalId, message.cols, message.rows);
+						case "terminal_kill":
+							return tm.kill(message.terminalId);
+						case "rename_terminal":
+							return tm.rename(message.terminalId, message.title);
+					}
+				});
+			}
+			case "set_goal":
+				return run(() =>
+					owner.setGoal(
+						message.goal,
+						{
+							reviewModel: message.reviewModel,
+							maxRounds: message.maxRounds,
+							locked: message.locked,
+							execModel: message.execModel,
+						},
+						conv,
+					),
+				);
+			case "clear_goal":
+				return run(() => owner.clearGoal(conv));
+			case "start_goal_wizard":
+				return run(() =>
+					owner.startGoalWizard(
+						message.text,
+						{ wizardModel: message.wizardModel, maxRounds: message.maxRounds, locked: message.locked },
+						conv,
+					),
+				);
+			case "set_goal_prefs":
+				return run(() => owner.setGoalPrefs(message, conv));
+			case "apply_preset":
+				return run(() => owner.applyPreset(message.name, conv));
+			case "persist_conversation":
+				return message.id === conv.id ? run(() => owner.persistConversation(conv.id)) : reject();
+			case "dismiss_conversation":
+				return message.id === conv.id
+					? run(() => owner.dismissConversation(conv.id, message.withFinishedSubagents, message.force))
+					: reject();
+			case "page_response":
+				return run(() => owner.resolvePageCall(message.id, message.ok, message.result, message.error, conv.id));
+			case "dialog_response":
+			case "tui_overlay_input":
+			case "tui_overlay_resize":
+			case "tui_overlay_cancel":
+				return reject();
+			case "set_approval_policy":
+				return !message.conversationId || message.conversationId === conv.id
+					? run(() => owner.setApprovalPolicy({ ...message, conversationId: conv.id }))
+					: reject();
+		}
+		if (message.type === "get_state") {
+			this.openSharedConversation(viewerClientId, binding.ownerClientId, conv.id, send);
+			return true;
+		}
+		if (message.type === "prompt") {
+			if (message.targetConversationId && message.targetConversationId !== conv.id) return reject();
+			return run(() => owner.prompt(message.text, message.attachments, message.queue, conv));
+		}
+		if (message.type === "abort") {
+			return run(() => owner.abortConversation(conv));
+		}
+		if (message.type === "set_model") {
+			return run(() => owner.setModel(message.modelId, conv));
+		}
+		if (message.type === "set_thinking") {
+			owner.setThinking(message.level, conv);
+			return true;
+		}
+		switch (message.type) {
+			case "abort_bash":
+				return run(() => owner.abortBash(conv.id));
+			case "rename_conversation":
+				return run(() => owner.renameConversation(conv.id, message.name));
+			case "pin_conversation":
+				return run(() => owner.setConversationPinned(conv.id, message.pinned));
+			case "get_compacted_messages":
+				return run(() => owner.getCompactedMessages(message.compactionMessageId, conv.id, send));
+			case "plan_update":
+				return run(() => owner.updatePlan(message.steps, message.activeStepId, conv.id));
+			case "plan_step_update":
+				return run(() => owner.updatePlanStep(message.stepId, message.patch, conv.id));
+			case "plan_step_delete":
+				return run(() => owner.deletePlanStep(message.stepId, conv.id));
+			case "plan_step_add":
+				return run(() => owner.addPlanStep(message.step, message.afterStepId, conv.id));
+			case "set_plan_mode":
+				return run(() => owner.setPlanMode(message.enabled, conv.id));
+			case "set_delegate_mode":
+				return run(() => owner.setDelegateMode(message.enabled, conv.id));
+			case "fork_session":
+				return run(() => owner.forkSession(message.messageId, message.position, conv.id));
+			case "rollback_session":
+				return run(() => owner.rollbackSession(message.messageId, conv.id, message.restoreWorkspace));
+			case "delete_message":
+				return run(() => owner.deleteMessage(message.messageId, conv.id));
+			case "edit_message":
+				return run(() => owner.editMessage(message.messageId, message.text, message.attachments, conv));
+			case "retry_last":
+				return run(() => owner.retryLast(conv));
+			case "queue_remove":
+				return run(() => owner.removeQueued(message.kind, message.text, message.index, message.id, conv));
+			case "draft_update":
+				return run(() => owner.saveDraft(message.sessionId, message.text, message.ts, conv));
+			case "dismiss_finished_subagents":
+				return !message.parentId || message.parentId === conv.id
+					? run(() => owner.dismissFinishedSubagents(conv.id))
+					: reject();
+			case "plan_clean_handoff":
+				send({
+					type: "notice",
+					level: "warning",
+					text: "该操作暂不支持在共享对话中执行",
+					textEn: "This operation is not yet supported in shared conversations.",
+				});
+				return true;
+			default:
+				return false;
+		}
+	}
+
 	/** 客户端 -> 最后一个浏览器断开的时刻（离线行宽限期起点；重连/认领即删）。 */
 	private offlineSince = new Map<string, number>();
 	/** 客户端 -> 离线行宽限期到期定时器（到期后让其他客户端重推，行消失）。 */
@@ -86,6 +443,20 @@ export class AgentService {
 	/** index.ts 注入：内置调度存储（attach 时拷贝到每个新会话，供 schedule_* 工具）。 */
 	schedulerStore: SchedulerStore | undefined = undefined;
 	private clients = new Map<string, ClientSession>();
+	private sharedInteractionSinks = new WeakMap<ClientSession, (msg: ServerMessage) => void>();
+
+	private globalInteractions(excludeOwner?: ClientSession): Extract<ServerMessage, { type: "global_interactions" }> {
+		const questions: Extract<ServerMessage, { type: "global_interactions" }>["questions"] = [];
+		const approvals: Extract<ServerMessage, { type: "global_interactions" }>["approvals"] = [];
+		for (const [ownerId, owner] of this.clients) {
+			if (owner === excludeOwner || !isSharedExecutionClientId(ownerId)) continue;
+			for (const pending of owner.sharedPendingMessages()) {
+				if (pending.type === "question_pending") questions.push({ ...pending, owner: ownerId, global: true });
+				if (pending.type === "tool_approval_pending") approvals.push({ ...pending, owner: ownerId, global: true });
+			}
+		}
+		return { type: "global_interactions", questions, approvals };
+	}
 	/** 全局认领表（跨浏览器标签页共享；<dataDir>/claims.json，best-effort 持久化）。 */
 	private claimStore: ClaimStore;
 	/** Quiesce (draining) state — the service refuses NEW work (prompts, forks,
@@ -297,6 +668,60 @@ export class AgentService {
 		return { ok: false, error: "目标对话不在运行中（已关闭或服务重启过）" };
 	}
 
+	resolveSharedQuestion(
+		viewerId: string,
+		id: string,
+		answers: QuestionAnswer[],
+		cancelled?: boolean,
+		cancelReason?: string,
+	): boolean {
+		if (!this.clients.has(viewerId) || isSharedExecutionClientId(viewerId)) return false;
+		const shared = this.sharedConversationTarget(viewerId);
+		if (
+			shared?.owner
+				.sharedPendingMessages()
+				.some(
+					(pending) =>
+						pending.type === "question_pending" &&
+						pending.id === id &&
+						pending.conversationId === shared.conversationId,
+				)
+		) {
+			return shared.owner.resolveQuestion(id, answers, cancelled, cancelReason);
+		}
+		for (const [ownerId, owner] of this.clients) {
+			if (isSharedExecutionClientId(ownerId) && owner.resolveQuestion(id, answers, cancelled, cancelReason))
+				return true;
+		}
+		return false;
+	}
+
+	resolveSharedToolApproval(viewerId: string, ...args: Parameters<ClientSession["resolveToolApproval"]>): boolean {
+		if (!this.clients.has(viewerId) || isSharedExecutionClientId(viewerId)) return false;
+		const shared = this.sharedConversationTarget(viewerId);
+		if (
+			shared?.owner
+				.sharedPendingMessages()
+				.some(
+					(pending) =>
+						pending.type === "tool_approval_pending" &&
+						pending.id === args[0] &&
+						pending.conversationId === shared.conversationId,
+				)
+		) {
+			shared.owner.resolveToolApproval(...args);
+			return true;
+		}
+		for (const [ownerId, owner] of this.clients) {
+			if (!isSharedExecutionClientId(ownerId)) continue;
+			if (!owner.sharedPendingMessages().some((msg) => msg.type === "tool_approval_pending" && msg.id === args[0]))
+				continue;
+			owner.resolveToolApproval(...args);
+			return true;
+		}
+		return false;
+	}
+
 	/** issue #231：同项目视口回退 —— 原绑定对话不在时，把唤醒投给该项目最近活跃
 	 *  的对话（用户当前正看着的面），而不是静默转无头。excludeIds 跳过已知忙对话；
 	 *  候选全部忙回 busy:true；无候选回 ok:false。成功带回实际投递方（调用方重绑定）。 */
@@ -415,7 +840,7 @@ export class AgentService {
 		for (const [clientId, cs] of this.clients) {
 			if (clientId === excludeClientId) continue;
 			// 伪客户端（scheduler:/plugin:）不走浏览器，sinkCount 永远为 0，保留。
-			const isPseudo = AgentService.isPseudoClientId(clientId);
+			const isPseudo = isSharedExecutionClientId(clientId);
 			// 无浏览器连接的残骸（sinkCount=0 = 断连留存）：宽限期内仍下发（标
 			// ownerOffline，可接管），过期或 TTL=0 时按 issue #291 不入列表。
 			const offline = !isPseudo && cs.sinkCount() === 0;
@@ -434,7 +859,7 @@ export class AgentService {
 				const normFile = rest.sessionFile ? resolve(rest.sessionFile) : undefined;
 				// 本机已持有该会话文件，或本机在同项目下已有同名可见对话：排除
 				if (normFile && localFiles.has(normFile)) continue;
-				if (localCwdTitles.has(`${rest.cwd}\0${rest.title}`)) continue;
+				if (rest.independent !== false && localCwdTitles.has(`${rest.cwd}\0${rest.title}`)) continue;
 
 				const entry: ElsewhereRunning = {
 					...rest,
@@ -444,7 +869,11 @@ export class AgentService {
 				};
 
 				// 跨客户端去重键：有文件按规范路径去重，无文件按 cwd + title 去重
-				const dedupKey = normFile ? `file:${normFile}` : `title:${rest.cwd}\0${rest.title}`;
+				const dedupKey = normFile
+					? `file:${normFile}`
+					: rest.independent === false
+						? `shared:${JSON.stringify([clientId, rest.convId])}`
+						: `title:${rest.cwd}\0${rest.title}`;
 				const existing = dedupMap.get(dedupKey);
 				if (existing) {
 					// 优先保留 streaming，其次保留 hasQuestion，最后才轮到离线行让位在线行
@@ -659,7 +1088,7 @@ export class AgentService {
 				void owner
 					.prompt(text, attachments, false, conv)
 					.catch((err) => console.error("[plugin chat] prompt failed", err));
-				return { conversationId: conv.id, clientId: ownerId, runId };
+				return { conversationId: conv.id, clientId: ownerId, sessionId: conv.session.sessionId, runId };
 			}
 		}
 		// 2. 工作空间：不传回落伪客户端当前目录；传了必须存在且非系统目录。
@@ -671,6 +1100,7 @@ export class AgentService {
 			cwdAbs = chk.abs ?? "";
 		}
 		const cs = await this.attach(clientId, () => {});
+		cs.setConversationIndependent(cs.readConversationForPlugins()!.conversationId, req.independent ?? false);
 		try {
 			if (cwdAbs && cs.cwd !== cwdAbs) await cs.setCwd(cwdAbs);
 		} catch (err) {
@@ -702,7 +1132,7 @@ export class AgentService {
 		const conversationId = stampedId || (cs.readConversationForPlugins()?.conversationId ?? "");
 		const conv = cs.getConversation(conversationId);
 		void cs.prompt(text, attachments, false, conv).catch((err) => console.error("[plugin chat] prompt failed", err));
-		return { conversationId, clientId, runId };
+		return { conversationId, clientId, sessionId: conv?.session.sessionId, runId };
 	}
 
 	/** Abort by the stable plugin run token, including after conversation takeover. */
@@ -913,6 +1343,27 @@ export class AgentService {
 	 * 误报 + prompt/switch 自拦）。尾部会再调一次，幂等。
 	 */
 	private wireClient(cs: ClientSession, clientId: string): void {
+		if (isSharedExecutionClientId(clientId) && !this.sharedInteractionSinks.has(cs)) {
+			const relay = (msg: ServerMessage): void => {
+				if (
+					msg.type !== "question_pending" &&
+					msg.type !== "question_queue" &&
+					msg.type !== "question_retracted" &&
+					msg.type !== "tool_approval_pending" &&
+					msg.type !== "tool_approval_resolved"
+				)
+					return;
+				const interactions = this.globalInteractions();
+				for (const [viewerId, viewer] of this.clients) {
+					if (!isSharedExecutionClientId(viewerId)) {
+						if (msg.type !== "question_queue") viewer.emitSharedInteraction({ ...msg, owner: clientId, global: true });
+						viewer.emitSharedInteraction(interactions);
+					}
+				}
+			};
+			this.sharedInteractionSinks.set(cs, relay);
+			cs.attachSink(relay);
+		}
 		cs.findSessionOwner = (targetPath) => this.findSessionOwner(targetPath, clientId);
 		cs.takeOverConversationElsewhere = (ownerId, convId) => this.takeOverConversation(clientId, ownerId, convId);
 		cs.hasStreamingElsewhere = () => this.hasStreamingElsewhere(clientId);
@@ -1183,7 +1634,11 @@ export class AgentService {
 	}
 
 	/** Get or create the session for a client, racing attach calls safely. */
-	async attach(clientId: string, send: (msg: ServerMessage) => void): Promise<ClientSession> {
+	async attach(
+		clientId: string,
+		send: (msg: ServerMessage) => void,
+		sendShared: (msg: ServerMessage) => void = send,
+	): Promise<ClientSession> {
 		let cs = this.clients.get(clientId);
 		if (!cs) {
 			const inflight = this.pending.get(clientId);
@@ -1300,10 +1755,13 @@ export class AgentService {
 			}
 		} else {
 			cs.attachSink(send);
+			this.resumeSharedConversation(clientId, sendShared);
+			if (!isSharedExecutionClientId(clientId)) send(this.globalInteractions());
 			// 又有浏览器连上：离线行状态作废（别的页面按在线行重推，去掉离线标记）。
 			this.clearOfflineRows(clientId);
 		}
 		// Forward hooks (set once by index.ts) to every session.
+		cs.onDisposed = () => this.releaseSharedClient(cs);
 		cs.onQuit = this.onQuit;
 		cs.onToolEvent = this.onToolEvent;
 		cs.toolGuard = this.toolGuard;
@@ -1379,6 +1837,11 @@ export class AgentService {
 
 	/** Remove a socket from a client's broadcast set (called on socket close). */
 	detach(clientId: string, send: (msg: ServerMessage) => void): void {
+		const binding = this.sharedViewers.get(clientId);
+		if (binding?.send === send) {
+			binding.close();
+			binding.close = () => {};
+		}
 		const cs = this.clients.get(clientId);
 		if (cs) {
 			cs.detachSink(send);

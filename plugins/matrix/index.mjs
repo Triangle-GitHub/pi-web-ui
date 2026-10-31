@@ -107,6 +107,11 @@ export class MatrixBotBridge {
 		this.userWorkspaces = new Map();
 		this.preferences = new Map();
 		this.epochs = new Map();
+		this.sessionRoutes = new Map();
+		this.routingLoaded = null;
+		this.routingWrites = Promise.resolve();
+		this.routingGeneration = 0;
+		this.completedRuns = new Set();
 		this.downloads = new Map();
 		this.dispatching = 0;
 		this.encryptedRooms = new Set();
@@ -132,7 +137,90 @@ export class MatrixBotBridge {
 		return String(this.userWorkspaces.get(sender) || cfg?.workspace || this.host?.cwd || "").trim();
 	}
 
+	accountIdentity() {
+		const cfg = this.getConfig();
+		return createHash("sha256")
+			.update(JSON.stringify([cfg.homeserverUrl || "", cfg.accessToken || ""]))
+			.digest("hex");
+	}
+
+	sessionKey(identity) {
+		if (identity.sessionId) return `session:${identity.sessionId}`;
+		return identity.clientId && identity.conversationId
+			? `owner:${JSON.stringify([identity.clientId, identity.conversationId])}`
+			: "";
+	}
+
+	async loadRouting() {
+		if (!this.routingLoaded)
+			this.routingLoaded = (async () => {
+				this.routingAccount = this.accountIdentity();
+				const saved = await this.host.storage?.get?.("sessionRoutes");
+				if (saved?.account !== this.routingAccount) {
+					await this.saveRouting();
+					return;
+				}
+				this.epochs = new Map(saved.epochs || []);
+				this.sessionRoutes = new Map((saved.routes || []).filter(([key]) => key.startsWith("session:")));
+			})();
+		await this.routingLoaded;
+		if (this.routingAccount !== this.accountIdentity()) await this.invalidateRouting();
+	}
+
+	async saveRouting() {
+		while (this.sessionRoutes.size > 200) this.sessionRoutes.delete(this.sessionRoutes.keys().next().value);
+		const value = {
+			account: this.routingAccount,
+			epochs: [...this.epochs],
+			routes: [...this.sessionRoutes].filter(([key]) => key.startsWith("session:")),
+		};
+		const write = this.routingWrites.then(() => this.host.storage?.set?.("sessionRoutes", value));
+		this.routingWrites = write.catch(() => {});
+		await write;
+	}
+
+	async invalidateRouting() {
+		this.routingGeneration++;
+		this.routingAccount = this.accountIdentity();
+		this.sessionRoutes.clear();
+		this.pendingRuns.clear();
+		this.earlyRuns.clear();
+		this.userConversations.clear();
+		this.epochs.clear();
+		await this.saveRouting();
+	}
+
+	validRoute(route) {
+		return (
+			route &&
+			!route.ambiguous &&
+			route.account === this.routingAccount &&
+			route.epoch === (this.epochs.get(route.key) || 0)
+		);
+	}
+
+	async bindRoute(identity, run) {
+		const key = this.sessionKey(identity);
+		if (!key) return;
+		const previous = this.sessionRoutes.get(key);
+		this.sessionRoutes.set(
+			key,
+			previous?.ambiguous || (this.validRoute(previous) && previous.key !== run.key)
+				? { ambiguous: true }
+				: {
+						key: run.key,
+						roomId: run.roomId,
+						threadId: run.threadId,
+						sender: run.sender,
+						epoch: run.epoch,
+						account: this.routingAccount,
+					},
+		);
+		await this.saveRouting();
+	}
+
 	async start() {
+		await this.loadRouting();
 		if (this.running) return;
 		this.running = true;
 		this.status.enabled = true;
@@ -176,6 +264,9 @@ export class MatrixBotBridge {
 	}
 
 	async stop() {
+		this.routingGeneration++;
+		this.pendingRuns.clear();
+		this.earlyRuns.clear();
 		this.running = false;
 		this.status.enabled = false;
 		this.status.connected = false;
@@ -273,6 +364,7 @@ export class MatrixBotBridge {
 	}
 
 	async onInboundMessage(roomId, event) {
+		await this.loadRouting();
 		if (!event || event.sender === this.botUserId || event.content?.msgtype === "m.notice") return;
 		const cfg = this.getConfig();
 		const sender = event.sender;
@@ -340,6 +432,8 @@ export class MatrixBotBridge {
 			const run = {
 				key,
 				epoch,
+				generation: this.routingGeneration,
+				account: this.routingAccount,
 				roomId,
 				threadId,
 				sender,
@@ -363,14 +457,30 @@ export class MatrixBotBridge {
 						}).filter(([, v]) => v),
 					),
 				});
-				if (epoch !== (this.epochs.get(key) || 0)) return;
+				if (
+					run.account !== this.accountIdentity() ||
+					run.generation !== this.routingGeneration ||
+					epoch !== (this.epochs.get(key) || 0)
+				)
+					return;
 				if (this.pendingRuns.get(conversationId) === run) this.pendingRuns.delete(conversationId);
 				run.conversationId = result?.conversationId || conversationId;
 				run.runId = result?.runId;
+				run.sessionId = result?.sessionId;
+				run.clientId = result?.clientId;
+				await this.bindRoute(run, run);
+				if (
+					run.account !== this.accountIdentity() ||
+					run.generation !== this.routingGeneration ||
+					epoch !== (this.epochs.get(key) || 0)
+				)
+					return;
 				this.userConversations.set(key, run.conversationId);
 				if (run.ended) return;
-				this.pendingRuns.set(run.runId || run.conversationId, run);
-				const earlyKey = run.runId || run.conversationId;
+				const pendingKey = run.runId ? `run:${run.runId}` : this.sessionKey(run);
+				if (!pendingKey) return;
+				this.pendingRuns.set(pendingKey, run);
+				const earlyKey = pendingKey;
 				const early = this.earlyRuns.get(earlyKey);
 				this.earlyRuns.delete(earlyKey);
 				if (early?.message) await this.handleRunEvent(early.message);
@@ -419,6 +529,12 @@ export class MatrixBotBridge {
 		await this.sendContent(roomId, { msgtype: "m.text", body: text }, threadId, isCurrent);
 	}
 
+	async resetScope(key) {
+		this.epochs.set(key, (this.epochs.get(key) || 0) + 1);
+		for (const [id, route] of this.sessionRoutes) if (route.key === key) this.sessionRoutes.delete(id);
+		await this.saveRouting();
+	}
+
 	async handleSlashCommand(cmdText, { roomId, sender, cfg, key = scopeKey(roomId, sender), threadId = "" }) {
 		cmdText = cmdText.trim().replace(/^／/, "/");
 		const [command] = cmdText.split(/\s+/);
@@ -456,7 +572,8 @@ export class MatrixBotBridge {
 					await reply(download ? "附件下载已取消。" : "当前没有运行中的任务。");
 					break;
 				}
-				const result = await this.host.abortRun?.(run.runId || run.conversationId);
+				if (!run.runId) throw new Error("宿主未提供运行 ID，无法安全停止此任务");
+				const result = await this.host.abortRun?.(run.runId);
 				if (!result?.ok) throw new Error(result?.error || "宿主不支持停止任务");
 				await reply("已请求停止当前任务。");
 				break;
@@ -467,7 +584,7 @@ export class MatrixBotBridge {
 				if ([...this.pendingRuns.values()].some((r) => r.key === key))
 					throw new Error("请先 /stop 并等待任务结束，再开启新会话。");
 				this.downloads.get(key)?.abort(new Error("已开启新会话"));
-				this.epochs.set(key, (this.epochs.get(key) || 0) + 1);
+				await this.resetScope(key);
 				this.userConversations.set(key, `mtx_${randomUUID()}`);
 				if (arg) return { prompt: arg, epoch: this.epochs.get(key) };
 				await reply("✨ 已开启全新会话（未删除历史）。");
@@ -484,7 +601,7 @@ export class MatrixBotBridge {
 					ensureIdle();
 					this.preferences.set(key, { ...prefs, model: arg === "default" ? "" : arg });
 					this.downloads.get(key)?.abort(new Error("模型已切换"));
-					this.epochs.set(key, (this.epochs.get(key) || 0) + 1);
+					await this.resetScope(key);
 					this.userConversations.delete(key);
 				}
 				await reply(`模型: ${this.preferences.get(key)?.model ?? cfg.model ?? "default"}`);
@@ -496,7 +613,7 @@ export class MatrixBotBridge {
 					ensureIdle();
 					this.preferences.set(key, { ...prefs, thinkingLevel: arg === "default" ? "" : arg });
 					this.downloads.get(key)?.abort(new Error("思考强度已切换"));
-					this.epochs.set(key, epoch + 1);
+					await this.resetScope(key);
 					this.userConversations.delete(key);
 				}
 				await reply(`思考: ${this.preferences.get(key)?.thinkingLevel ?? cfg.thinkingLevel ?? "default"}`);
@@ -509,7 +626,7 @@ export class MatrixBotBridge {
 					if (stat.type !== "dir") throw new Error("cwd 必须是目录");
 					ensureIdle();
 					this.downloads.get(key)?.abort(new Error("工作区已切换"));
-					this.epochs.set(key, (this.epochs.get(key) || 0) + 1);
+					await this.resetScope(key);
 					this.userWorkspaces.set(key, arg);
 					this.userConversations.delete(key);
 				}
@@ -522,51 +639,60 @@ export class MatrixBotBridge {
 	}
 
 	async handleRunEvent(ev) {
-		const id = ev.runId || ev.conversationId;
+		await this.loadRouting();
+		const identity = this.sessionKey(ev);
+		const id = ev.runId ? `run:${ev.runId}` : identity;
+		if (!id || this.completedRuns.has(id)) return;
 		let run = this.pendingRuns.get(id);
-		if (!run && !ev.runId)
-			run = [...this.pendingRuns.values()].find(
-				(r) => !r.runId && (r.conversationId === ev.conversationId || r.requestedId === ev.conversationId),
-			);
-		if (!run || (!run.runId && ev.runId)) {
-			if (
-				this.dispatching &&
-				id &&
-				(ev.type === "run_end" ||
-					(ev.type === "message" && (ev.message?.role === "assistant" || ev.message?.author === "assistant")))
-			) {
+		if (!run && !ev.runId && ev.type === "run_start") {
+			const route = this.sessionRoutes.get(identity);
+			if (this.validRoute(route)) {
+				run = {
+					...route,
+					sessionId: ev.sessionId,
+					clientId: ev.clientId,
+					conversationId: ev.conversationId,
+					generation: this.routingGeneration,
+					accumulatedText: "",
+					web: true,
+				};
+				this.pendingRuns.set(id, run);
+			}
+		}
+		if (!run) {
+			if (this.dispatching && (ev.type === "message" || ev.type === "run_end")) {
 				const early = this.earlyRuns.get(id) || {};
 				if (ev.type === "run_end") early.end = ev;
-				else {
-					const content = ev.message.content;
-					const text =
-						typeof content === "string"
-							? content
-							: (content || []).map((c) => (typeof c === "string" ? c : c.text || "")).join("\n");
-					const previous = early.message?.message.content || "";
-					early.message = {
-						...ev,
-						message: { role: "assistant", content: `${previous}${previous ? "\n" : ""}${text}` },
-					};
-				}
+				else if (ev.message?.role === "assistant" || ev.message?.author === "assistant") early.message = ev;
 				this.earlyRuns.set(id, early);
 			}
 			return;
 		}
-		if (run.epoch !== undefined && run.epoch !== (this.epochs.get(run.key) || 0)) {
-			for (const [pendingId, value] of this.pendingRuns) if (value === run) this.pendingRuns.delete(pendingId);
-			return;
-		}
+		const account = this.routingAccount;
+		const isCurrent = () =>
+			account === this.accountIdentity() &&
+			run.generation === this.routingGeneration &&
+			run.epoch === (this.epochs.get(run.key) || 0);
+		if (!isCurrent() || run.ended) return;
 		if (ev.type === "message" && (ev.message?.role === "assistant" || ev.message?.author === "assistant")) {
 			const content = ev.message.content;
-			const text =
-				typeof content === "string"
-					? content
-					: (content || []).map((c) => (typeof c === "string" ? c : c.text || "")).join("\n");
-			run.accumulatedText += (run.accumulatedText ? "\n" : "") + text;
+			run.accumulatedText =
+				ev.message.stopReason === "toolUse" ||
+				(Array.isArray(content) && content.some((part) => part.type === "toolCall"))
+					? ""
+					: typeof content === "string"
+						? content
+						: (content || [])
+								.filter((part) => typeof part === "string" || part.type === "text")
+								.map((part) => (typeof part === "string" ? part : part.text || ""))
+								.join("\n");
 		}
 		if (ev.type === "run_end") {
 			run.ended = true;
+			if (ev.runId) {
+				this.completedRuns.add(id);
+				while (this.completedRuns.size > 500) this.completedRuns.delete(this.completedRuns.values().next().value);
+			}
 			for (const [pendingId, value] of this.pendingRuns) if (value === run) this.pendingRuns.delete(pendingId);
 			const ending =
 				ev.stopReason === "aborted"
@@ -576,7 +702,6 @@ export class MatrixBotBridge {
 						: "";
 			const text =
 				[stripInternalMarkers(run.accumulatedText), ending].filter(Boolean).join("\n\n") || "任务结束（无文本输出）。";
-			const isCurrent = () => run.epoch === undefined || run.epoch === (this.epochs.get(run.key) || 0);
 			for (const chunk of chunkMarkdownText(text, 3800)) {
 				if (!isCurrent()) break;
 				await this.feedback(run.roomId, chunk, run.threadId, isCurrent);
@@ -715,7 +840,9 @@ export default async function activate(host) {
 				case "save_config": {
 					const incoming = msg.config || {};
 					const secrets = (await host.secrets?.getAll?.()) || {};
+					await botBridge.loadRouting();
 					localConfig = mergeSavedSecrets(incoming, localConfig, secrets);
+					if (botBridge.routingAccount !== botBridge.accountIdentity()) await botBridge.invalidateRouting();
 
 					if (host.secrets) {
 						if (localConfig.accessToken) {

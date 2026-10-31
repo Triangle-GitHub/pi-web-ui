@@ -57,7 +57,7 @@ for (const platform of ["discord", "slack"] as const) {
 			])
 				await send(text);
 			expect(host.chat).not.toHaveBeenCalled();
-			expect(host.abortRun).toHaveBeenCalledTimes(2);
+			expect(host.abortRun).not.toHaveBeenCalled();
 			expect(reply.mock.calls.at(-1)?.[1]).toContain("Unknown command");
 			await send("hello");
 			expect(host.chat.mock.calls[0][0]).toMatchObject({ model: "provider/model", thinkingLevel: "high" });
@@ -81,7 +81,7 @@ for (const platform of ["discord", "slack"] as const) {
 			expect(host.chat.mock.calls[1][0].conversationId).toBe("real");
 		});
 		it("stops by receipt stable runId after conversation ownership moves", async () => {
-			const { host, bridge, send } = setup();
+			const { host, bridge, send, reply } = setup();
 			host.chat.mockResolvedValueOnce({ conversationId: "receipt-conversation", runId: "pr-owned-run" });
 			await send("hello");
 			await bridge.handleRunEvent({
@@ -101,13 +101,18 @@ for (const platform of ["discord", "slack"] as const) {
 				stopReason: "aborted",
 			});
 			await send("/stop");
-			expect(host.abortRun).toHaveBeenLastCalledWith("receipt-conversation");
+			expect(host.abortRun).toHaveBeenCalledTimes(2);
+			expect(reply.mock.calls.at(-1)?.[1]).toContain("Stop failed");
 		});
 		it("changes daemon account epoch on reset, cwd and model switches", async () => {
 			const { host, bridge, send } = setup();
+			host.chat.mockImplementation(async () => ({
+				conversationId: `real-${host.chat.mock.calls.length}`,
+				runId: `run-${host.chat.mock.calls.length}`,
+			}));
 			await send("hello");
 			for (const command of ["/new", "/clear", `/cwd ${process.cwd()}`, "/model provider/new"]) {
-				await bridge.handleRunEvent({ type: "run_end", runId: "stable" });
+				await bridge.handleRunEvent({ type: "run_end", runId: `run-${host.chat.mock.calls.length}` });
 				await send(command);
 				await send("hello again");
 			}
@@ -144,23 +149,72 @@ for (const platform of ["discord", "slack"] as const) {
 			expect(host.chat).not.toHaveBeenCalled();
 			expect(reply.mock.calls.some((call) => call[1].includes("Download cancelled"))).toBe(true);
 		});
-		it("retains early terminal events beyond 512 events and reports truncation with failure", async () => {
+		it("retains the last early assistant candidate and terminal failure beyond 512 events", async () => {
 			const { bridge, host, send, reply } = setup();
 			host.chat.mockImplementationOnce(async () => {
 				for (let i = 0; i < 600; i++)
 					await bridge.handleRunEvent({
 						type: "message",
 						runId: "stable",
-						message: { role: "assistant", content: "x".repeat(1000) },
+						message: { role: "assistant", content: `${i}:${"x".repeat(1000)}` },
 					});
 				await bridge.handleRunEvent({ type: "run_end", runId: "stable", stopReason: "error" });
 				return { conversationId: "real", runId: "stable" };
 			});
 			await send("hello");
-			expect(reply.mock.calls.at(-1)?.[1]).toContain("Output truncated");
-			expect(reply.mock.calls.at(-1)?.[1]).toContain("Run failed");
+			expect(reply).toHaveBeenCalledTimes(1);
+			expect(reply.mock.calls[0][1]).toBe(`599:${"x".repeat(1000)}\n\nRun failed. Check host logs.`);
+			expect(reply.mock.calls[0][1]).not.toContain("Output truncated");
 			await send("again");
 			expect(host.chat).toHaveBeenCalledTimes(2);
+		});
+		it("truncates a single oversized early assistant candidate and preserves terminal failure", async () => {
+			const { bridge, host, send, reply } = setup();
+			host.chat.mockImplementationOnce(async () => {
+				await bridge.handleRunEvent({
+					type: "message",
+					runId: "stable",
+					message: { role: "assistant", content: "x".repeat(300 * 1024) },
+				});
+				await bridge.handleRunEvent({ type: "run_end", runId: "stable", stopReason: "error" });
+				return { conversationId: "real", runId: "stable" };
+			});
+			await send("hello");
+			expect(reply).toHaveBeenCalledTimes(1);
+			expect(reply.mock.calls[0][1]).toBe(
+				`${"x".repeat(256 * 1024)}\n\nOutput truncated; inspect host conversation for full result.\n\nRun failed. Check host logs.`,
+			);
+		});
+		it("never claims an unknown runId by matching the owned conversation", async () => {
+			const { bridge, send, reply, host } = setup();
+			await send("hello");
+			for (const event of [
+				{ type: "message", message: { role: "assistant", content: "foreign answer" } },
+				{ type: "run_end" },
+			])
+				await bridge.handleRunEvent({ ...event, conversationId: "real", runId: "foreign" });
+			expect(reply).not.toHaveBeenCalled();
+			await send("/stop");
+			expect(host.abortRun).toHaveBeenCalledExactlyOnceWith("stable");
+		});
+		it("routes a web run by exact session identity but refuses to guess an abort target", async () => {
+			const { bridge, send, reply, host } = setup();
+			host.chat.mockResolvedValueOnce({ conversationId: "real", runId: "stable", sessionId: "session-owned" } as any);
+			await send("hello");
+			await bridge.handleRunEvent({ type: "run_end", runId: "stable" });
+			reply.mockClear();
+			await bridge.handleRunEvent({ type: "run_start", conversationId: "real", sessionId: "session-owned" });
+			await send("/stop");
+			expect(host.abortRun).not.toHaveBeenCalled();
+			expect(reply.mock.calls.at(-1)?.[1]).toContain("Stop failed");
+			await bridge.handleRunEvent({
+				type: "message",
+				conversationId: "real",
+				sessionId: "session-owned",
+				message: { role: "assistant", content: "web answer" },
+			});
+			await bridge.handleRunEvent({ type: "run_end", conversationId: "real", sessionId: "session-owned" });
+			expect(reply.mock.calls.at(-1)?.[1]).toBe("web answer");
 		});
 		it("isolates same-user channels and threads, routes moved runs to original destination", async () => {
 			const { bridge, host, send, reply } = setup();

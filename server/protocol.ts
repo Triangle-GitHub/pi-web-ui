@@ -185,6 +185,7 @@ export interface EngineStatus {
 }
 
 export interface UiState {
+	sharedConversation?: { owner: string; conversationId: string } | null;
 	clientId: string;
 	cwd: string;
 	sessionId: string;
@@ -885,7 +886,10 @@ export type ClientMessage =
 	 *  Answered exactly once by an scm_data with kind "commitmsg" — text
 	 *  carries the generated single-line message; ok:false on any failure. */
 	| { type: "scm_commitmsg"; reqId: number }
-	| { type: "new_chat"; preset?: string; ephemeral?: boolean; requestId?: string }
+	| { type: "new_chat"; preset?: string; ephemeral?: boolean; requestId?: string; independent?: boolean }
+	| { type: "open_shared_conversation"; owner: string; id: string }
+	/** Omit one message and its related attachments/tool results from the current branch. */
+	| { type: "delete_message"; messageId: string; conversationId?: string }
 	/** Replace a past user question and re-ask in the same session, discarding later turns. */
 	| {
 			type: "edit_message";
@@ -926,7 +930,7 @@ export type ClientMessage =
 	 *  应答 `tool_prompt`。 */
 	| { type: "get_tool_prompt"; name: string }
 	| { type: "list_sessions" }
-	| { type: "switch_session"; path: string; sessionId?: string }
+	| { type: "switch_session"; path: string; sessionId?: string; independent?: boolean }
 	| { type: "switch_conversation"; id: string }
 	/** 手动过户：把另一处（elsewhere 行，owner/convId 标识）的对话整体搬到本页
 	 *  （含等答复的问卷/页调用），搬完自动切过去. */
@@ -1518,6 +1522,7 @@ export type ClientMessage =
 	 *  owner = 跨页作答：转给持有方会话（elsewhere_question 预告的那张问卷）。 */
 	| {
 			type: "question_answer";
+			global?: boolean;
 			id: string;
 			answers: QuestionAnswer[];
 			cancelled?: boolean;
@@ -1530,6 +1535,8 @@ export type ClientMessage =
 	 *  "all" = 本对话后续全部允许审批（同类/全部记忆都是内存态，重启即失效）。 */
 	| {
 			type: "tool_approval_response";
+			owner?: string;
+			global?: boolean;
 			id: string;
 			decision: "approve" | "deny" | "edit";
 			editedParams?: Record<string, unknown> | unknown;
@@ -1960,6 +1967,9 @@ export interface QuestionAnswer {
  *  UiState.pendingQuestion 上，让重连/刷新/第二个标签页的客户端从快照里把
  *  对话框恢复出来（否则问卷只在「当时在线的那条连接」上可见）。 */
 export interface UiPendingQuestion {
+	owner?: string;
+	global?: boolean;
+	createdAt?: number;
 	/** 提问 id，question_answer 回传时原样带回。 */
 	id: string;
 	questions: UiQuestion[];
@@ -2036,6 +2046,8 @@ export interface UiApprovalHit {
 
 /** 待用户审批的高危工具调用（Edit & Run 人机协同）。 */
 export interface UiToolApproval {
+	owner?: string;
+	global?: boolean;
 	id: string;
 	createdAt?: number;
 	toolCallId: string;
@@ -3055,6 +3067,7 @@ export interface ProviderKeyInfo {
  *  (issue #140: the chat you are looking at must not be missing from the list;
  *  a blank new chat stays out). cwd lets the client group by project. */
 export interface ConversationSummary {
+	independent?: boolean;
 	id: string;
 	/** Display title: first user prompt (truncated) or the default. */
 	title: string;
@@ -3114,6 +3127,7 @@ export interface ConversationSummary {
  *  the takeover target (take_over_conversation); absent = legacy sender
  *  (e.g. DSH engine) that cannot be taken over. */
 export interface ElsewhereRunning {
+	independent?: boolean;
 	/** Display title of the remote conversation. */
 	title: string;
 	/** Workspace it runs in (lets the client group by project). */
@@ -4400,6 +4414,9 @@ export type ServerMessage =
 	 *  when switched to. */
 	| {
 			type: "question_pending";
+			owner?: string;
+			global?: boolean;
+			createdAt?: number;
 			id: string;
 			/** 服务端超时时间戳（epoch ms，P0-6）；前端显示倒计时，归零自动取消。 */
 			deadline?: number;
@@ -4412,6 +4429,9 @@ export type ServerMessage =
 	/** 高危工具拦截触发待审批（Human-in-the-Loop）：弹窗/内联卡片等待用户批准、拒绝或就地修改参数（Edit & Run）。 */
 	| {
 			type: "tool_approval_pending";
+			owner?: string;
+			global?: boolean;
+			createdAt?: number;
 			id: string;
 			toolCallId: string;
 			toolName: string;
@@ -4428,7 +4448,9 @@ export type ServerMessage =
 			conversationTitle?: string;
 	  }
 	/** 审批已完成或被取消/撤回（前端关闭审批弹窗）。 */
-	| { type: "tool_approval_resolved"; id: string }
+	| { type: "tool_approval_resolved"; id: string; owner?: string; global?: boolean }
+	/** Authoritative daemon interactions, independent of the viewed conversation. */
+	| { type: "global_interactions"; questions: UiPendingQuestion[]; approvals: UiToolApproval[] }
 	/** 任务计划更新推送（增量或全量广播）。 */
 	| {
 			type: "plan_updated";
@@ -4438,7 +4460,7 @@ export type ServerMessage =
 	/** 待答问卷被搬走/取消：前端若正展示该 id 的对话框立即收起（不过户/不恢复）。
 	 *  手动过户把问卷搬到另一会话时，源页面靠它收起旧对话框（快照为 null 只能收
 	 *  snapshot 来源的面板，即时通道弹出的收不到 —— 见 pending-question.ts）。 */
-	| { type: "question_retracted"; id: string }
+	| { type: "question_retracted"; id: string; owner?: string; global?: boolean }
 	| { type: "question_queue"; questions: UiQueuedQuestion[] }
 	/** 跨页作答预告（peek_elsewhere_question 的回包）：另一处问卷的原文，
 	 *  本页弹框展示、经 question_answer（带 owner）回去作答。 */

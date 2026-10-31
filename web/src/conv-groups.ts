@@ -32,8 +32,39 @@ export function groupConversations(
 	activeConversationId: string,
 ): ConvGroup[] {
 	const byId = new Map(list.map((c) => [c.id, c]));
-	/** 分组归属：子对话（即使自己 cwd 不同）跟着父对话的项目走。 */
-	const groupCwdOf = (c: ConversationSummary): string => (c.parentId ? (byId.get(c.parentId)?.cwd ?? c.cwd) : c.cwd);
+	/** Resolve the whole ancestry before splitting the list into project groups. */
+	const resolvedCwds = new Map<string, string>();
+	const groupCwdOf = (c: ConversationSummary): string => {
+		const path: ConversationSummary[] = [];
+		const positions = new Map<string, number>();
+		let current = c;
+		let groupCwd: string;
+		for (;;) {
+			const cached = resolvedCwds.get(current.id);
+			if (cached !== undefined) {
+				groupCwd = cached;
+				break;
+			}
+			const cycleStart = positions.get(current.id);
+			if (cycleStart !== undefined) {
+				// Malformed cycles still share one deterministic group, regardless of list order.
+				const cycle = path.slice(cycleStart);
+				const anchor = cycle.reduce((a, b) => (a.id < b.id ? a : b));
+				groupCwd = anchor.cwd;
+				break;
+			}
+			positions.set(current.id, path.length);
+			path.push(current);
+			const parent = current.parentId ? byId.get(current.parentId) : undefined;
+			if (!parent) {
+				groupCwd = current.cwd;
+				break;
+			}
+			current = parent;
+		}
+		for (const ancestor of path) resolvedCwds.set(ancestor.id, groupCwd);
+		return groupCwd;
+	};
 	const activeConv = list.find((c) => c.id === activeConversationId);
 	const effectiveCwd = activeConv ? groupCwdOf(activeConv) : currentCwd;
 

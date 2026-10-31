@@ -94,6 +94,8 @@ export default async function activate(host) {
 		log: (lvl, msg) => host.log?.(lvl, msg),
 	});
 
+	await botBridge.restoreRoutes();
+
 	if (localConfig.botEnabled) {
 		botBridge.start().catch((err) => {
 			host.log?.("warn", `iMessage bot start note: ${err.message}`);
@@ -173,7 +175,11 @@ export default async function activate(host) {
 					const incoming = msg.config || {};
 					const nextConfig = mergeSavedSecrets(incoming, localConfig);
 					await host.storage.set("config", stripSecretsFromConfig(nextConfig));
+					const previousAccount = botBridge.accountIdentity();
 					localConfig = nextConfig;
+					if (previousAccount !== botBridge.accountIdentity()) {
+						await botBridge.invalidateAccount();
+					}
 
 					if (localConfig.botEnabled) {
 						await botBridge.start();

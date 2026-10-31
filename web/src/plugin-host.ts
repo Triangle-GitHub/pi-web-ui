@@ -165,6 +165,9 @@ export interface PluginHostSessionInfo {
 	 *  "elsewhere" = 另一处客户端/插件通道运行中的会话（可自动过户接入）。 */
 	kind: "running" | "history" | "elsewhere";
 	owner?: string;
+	conversationId?: string;
+	/** Only false denotes a shared conversation that opens without ownership transfer. */
+	independent?: boolean;
 	/** 是否正在跑（运行中的对话才有意义）。 */
 	isStreaming?: boolean;
 }
@@ -493,6 +496,7 @@ interface PluginHostDeps {
 	listSessions: () => PluginHostSessionInfo[];
 	/** 当前活动对话 id（还没快照时为 null）。 */
 	getConversationId: () => string | null;
+	getConversationOwner?: () => string | null;
 	/** 当前对话是否还是空白（没有消息 = 它就是「新对话」，new_chat 不会换 id）。 */
 	isConversationBlank: () => boolean;
 	/** 轮询间隔 / 单步超时（测试可调小）。 */
@@ -789,14 +793,26 @@ export function createPluginHostApi(deps: PluginHostDeps): PluginHostApi {
 				}
 				const before = deps.getConversationId();
 				if (info.kind === "elsewhere" && info.owner) {
-					deps.send({ type: "take_over_conversation", owner: info.owner, id: info.id });
-					const switched = await waitFor(() => deps.getConversationId() === info.id);
+					deps.send({
+						type: info.independent === false ? "open_shared_conversation" : "take_over_conversation",
+						owner: info.owner,
+						id: info.conversationId ?? info.id,
+					});
+					const switched = await waitFor(
+						() =>
+							deps.getConversationId() === (info.conversationId ?? info.id) &&
+							(info.independent !== false || deps.getConversationOwner?.() === info.owner),
+					);
 					if (!switched) return { ok: false, error: `打开并接入会话超时：${info.title}` };
 					return { ok: true, sessionId: deps.getConversationId() ?? undefined };
 				}
 				if (info.kind === "running") deps.send({ type: "switch_conversation", id: info.id });
 				else deps.send({ type: "switch_session", path: info.id });
-				const switched = await waitFor(() => deps.getConversationId() !== before);
+				const switched = await waitFor(() =>
+					info.kind === "running"
+						? deps.getConversationId() === info.id && !deps.getConversationOwner?.()
+						: deps.getConversationId() !== before,
+				);
 				if (!switched) return { ok: false, error: `切换会话超时：${info.title}` };
 				return { ok: true, sessionId: deps.getConversationId() ?? undefined };
 			},

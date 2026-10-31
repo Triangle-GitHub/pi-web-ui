@@ -26,7 +26,7 @@ import { formatSessionHash, parseSessionHash } from "./session-url";
 import { SideDock } from "./components/SideDock";
 import { Dialog } from "./components/Dialog";
 import { QuestionQueue } from "./components/QuestionQueue";
-import { resolveQuestionQueue } from "./question-queue";
+import { resolveQuestionQueue, mergeOwnedPending } from "./question-queue";
 import { presetText } from "./components/DshPresetBar";
 // 终端视图懒加载：xterm.js 体积大且只在切到终端时才需要，拆出主包
 const TerminalPanel = lazy(() => import("./components/TerminalPanel").then((m) => ({ default: m.TerminalPanel })));
@@ -747,11 +747,13 @@ export function App() {
 						...(c.elsewhere ?? [])
 							.filter((w) => Boolean(w.convId && w.owner))
 							.map((w) => ({
-								id: w.convId!,
+								id: JSON.stringify([w.owner, w.convId]),
+								conversationId: w.convId!,
 								title: w.title,
 								cwd: w.cwd || cwd,
 								kind: "elsewhere" as const,
 								owner: w.owner,
+								independent: w.independent,
 								isStreaming: w.isStreaming,
 							})),
 						...c.sessions.map((s) => ({
@@ -763,6 +765,7 @@ export function App() {
 					];
 				},
 				getConversationId: () => chatRefForPlugins.current.state?.conversationId ?? null,
+				getConversationOwner: () => chatRefForPlugins.current.state?.sharedConversation?.owner ?? null,
 				isConversationBlank: () => (chatRefForPlugins.current.state?.messages.length ?? 0) === 0,
 				// issue #188：浏览器插件的模型目录 + 当前模型（startChat/openSession 的 model 选项用）。
 				listModels: () =>
@@ -2359,6 +2362,7 @@ export function App() {
 								projects={chat.projects}
 								pathCompletions={chat.pathCompletions}
 								activeConversationId={activeGroupId ? "" : chat.activeConversationId}
+								sharedConversationOwner={chat.state?.sharedConversation?.owner}
 								activeGroupId={activeGroupId}
 								/* 宿主 UI 扩展点（contextmenu.session）：条目由 buildUiSlots 算好，左栏只管开菜单 +
 								   分派它自己的两条内置项（host:conv-dismiss-subagents / host:conv-force-dismiss）。 */
@@ -2784,12 +2788,22 @@ export function App() {
 										</div>
 									)}
 									<QuestionQueue
-										questions={resolveQuestionQueue(chat.questionQueue, chat.question, chat.remoteQuestion)}
+										questions={resolveQuestionQueue(
+											chat.questionQueue,
+											chat.question,
+											chat.remoteQuestion,
+											chat.globalQuestions,
+											chat.state?.sharedConversation?.owner,
+										)}
 										activeConversationId={activeConvId}
 										mode={chat.settings?.questionPresentation ?? "queue"}
 									/>
 									<ToolApprovalDialog
-										approvals={chat.approvals}
+										approvals={mergeOwnedPending(
+											chat.approvals,
+											chat.globalApprovals,
+											chat.state?.sharedConversation?.owner,
+										)}
 										activeConversationId={activeConvId}
 										mode={chat.settings?.toolApprovalPresentation ?? "all"}
 									/>

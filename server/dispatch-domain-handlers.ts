@@ -462,11 +462,21 @@ export function handleSessionLifecycleMessage(
 				});
 			};
 			void cs
-				.newChat(msg.preset, msg.ephemeral, acknowledge)
+				.newChat(msg.preset, msg.ephemeral, acknowledge, msg.independent)
 				.then(() => acknowledge())
 				.catch(() => acknowledge());
 			return true;
 		}
+		case "delete_message":
+			if (cs.deleteMessage) void cs.deleteMessage(msg.messageId, msg.conversationId);
+			else
+				send?.({
+					type: "notice",
+					level: "error",
+					text: "当前引擎不支持删除消息",
+					textEn: "This engine does not support message deletion",
+				});
+			return true;
 		case "edit_message":
 			void cs.editMessage(msg.messageId, msg.text, msg.attachments);
 			return true;
@@ -510,7 +520,7 @@ export function handleSessionLifecycleMessage(
 			void cs.dismissFinishedSubagents(msg.parentId);
 			return true;
 		case "switch_session":
-			void cs.switchSession(msg.path, msg.sessionId);
+			void cs.switchSession(msg.path, msg.sessionId, msg.independent);
 			return true;
 		case "switch_conversation":
 			void cs.switchConversation(msg.id);
@@ -795,6 +805,17 @@ export function handleInteractiveResponseMessage(
 	msg: ClientMessage,
 	cs: DispatchSession,
 	service: {
+		resolveSharedQuestion?: (
+			viewerId: string,
+			id: string,
+			answers: { id: string; selected: string[]; custom?: string }[],
+			cancelled?: boolean,
+			cancelReason?: string,
+		) => boolean;
+		resolveSharedToolApproval?: (
+			viewerId: string,
+			...args: Parameters<NonNullable<DispatchSession["resolveToolApproval"]>>
+		) => boolean;
 		answerElsewhereQuestion?: (
 			clientId: string,
 			owner: string,
@@ -821,6 +842,8 @@ export function handleInteractiveResponseMessage(
 			cs.handleTuiOverlayCancel?.(msg.id);
 			return true;
 		case "question_answer":
+			if (clientId && service.resolveSharedQuestion?.(clientId, msg.id, msg.answers, msg.cancelled, msg.cancelReason))
+				return true;
 			if (msg.owner) {
 				// 跨页作答：答案转交持有方会话（本页不持有该问卷）。
 				if (typeof service.answerElsewhereQuestion === "function" && clientId) {
@@ -845,6 +868,11 @@ export function handleInteractiveResponseMessage(
 			}
 			return true;
 		case "tool_approval_response":
+			if (
+				clientId &&
+				service.resolveSharedToolApproval?.(clientId, msg.id, msg.decision, msg.editedParams, msg.reason, msg.scope)
+			)
+				return true;
 			cs.resolveToolApproval?.(msg.id, msg.decision, msg.editedParams, msg.reason, msg.scope);
 			return true;
 		case "set_approval_policy":

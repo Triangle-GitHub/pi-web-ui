@@ -13,8 +13,8 @@ export interface BotExecutionCapability {
 	revoke(): void;
 }
 const bindings = new Map<string, BotExecutionCapability>();
-// These tools can create unconstrained execution contexts or mutate host policy.
-const barred = new Set([
+// Advisory only: these tools can create execution contexts or mutate host policy.
+const highPrivilegeTools = new Set([
 	"conversation",
 	"subagent",
 	"worktree",
@@ -32,9 +32,9 @@ const barred = new Set([
 	"tool_search",
 ]);
 
-/** Shared by execution authorization and the selectable capability catalog. */
-export function isBotToolAllowed(name: string): boolean {
-	return !barred.has(name) && !name.startsWith("subagent_") && !name.startsWith("team_");
+/** Catalog warning; authorization is determined solely by the configured whitelist. */
+export function isBotToolHighPrivilege(name: string): boolean {
+	return highPrivilegeTools.has(name) || name.startsWith("subagent_") || name.startsWith("team_");
 }
 
 export function registerBotExecution(
@@ -68,7 +68,7 @@ export function registerBotExecution(
 			if (!active) throw new Error("Bot execution capability has been revoked");
 		},
 		allowsTool(name) {
-			return active && tools.has(name) && isBotToolAllowed(name);
+			return active && tools.has(name);
 		},
 		filterSkills(items) {
 			this.assertActive();

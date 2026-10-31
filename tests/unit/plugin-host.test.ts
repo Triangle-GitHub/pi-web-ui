@@ -212,6 +212,49 @@ describe("createPluginHostApi", () => {
 	});
 });
 
+describe("shared conversation identity", () => {
+	it("waits for leaving shared owner when opening the local conversation with the same id", async () => {
+		let owner: string | null = "bot-a";
+		const h = harness({
+			getConversationId: () => "c1",
+			getConversationOwner: () => owner,
+			listSessions: () => [{ id: "c1", title: "Local", cwd: "", kind: "running" }],
+		});
+		const result = h.api.sessions.open("c1");
+		expect(h.sent).toEqual([{ type: "switch_conversation", id: "c1" }]);
+		owner = null;
+		expect(await result).toEqual({ ok: true, sessionId: "c1" });
+	});
+	it("opens the selected owner and waits for shared ownership even when local c1 already exists", async () => {
+		let owner: string | null = null;
+		const h = harness({
+			getConversationId: () => "c1",
+			getConversationOwner: () => owner,
+			listSessions: () => [
+				{
+					id: JSON.stringify(["bot-b", "c1"]),
+					conversationId: "c1",
+					owner: "bot-b",
+					title: "Bot",
+					cwd: "",
+					kind: "elsewhere",
+					independent: false,
+				},
+			],
+		});
+		let completed = false;
+		const result = h.api.sessions.open(JSON.stringify(["bot-b", "c1"])).then((value) => {
+			completed = true;
+			return value;
+		});
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		expect(completed).toBe(false);
+		expect(h.sent).toEqual([{ type: "open_shared_conversation", owner: "bot-b", id: "c1" }]);
+		owner = "bot-b";
+		expect(await result).toEqual({ ok: true, sessionId: "c1" });
+	});
+});
+
 describe("createPluginHostApi.openSession（多根工作区 + 目录授权，issue #146）", () => {
 	it("folders 多个：第一个当 cwd、其余当额外工作区根（根在切完 cwd 之后再写）", async () => {
 		const h = harnessWith({ cwd: "/a", listProjects: ["/a"] });

@@ -77,6 +77,48 @@ for (const channel of channels) {
 			return { bridge, host, requests };
 		}
 
+		it("returns browser continuations to the original channel and rejects unowned or duplicate events", async () => {
+			const chat = vi.fn(async () => ({
+				conversationId: "c1",
+				clientId: `plugin:${channel.name}:owned`,
+				sessionId: "stable-channel-session",
+				runId: "channel-run",
+			}));
+			const { bridge, requests } = setup(chat);
+			await channel.inbound(bridge, "hello", "1");
+			await bridge.handleRunEvent({ type: "run_end", conversationId: "c1", runId: "channel-run" });
+			requests.length = 0;
+			const identity = { conversationId: "renamed", clientId: "browser-owner", sessionId: "stable-channel-session" };
+			await bridge.handleRunEvent({ ...identity, type: "run_start", runId: "foreign-plugin-run" });
+			await bridge.handleRunEvent({
+				...identity,
+				type: "message",
+				runId: "foreign-plugin-run",
+				message: { role: "assistant", content: "must-not-deliver" },
+			});
+			await bridge.handleRunEvent({ ...identity, type: "run_end", runId: "foreign-plugin-run" });
+			await bridge.handleRunEvent({ ...identity, type: "run_start" });
+			await bridge.handleRunEvent({
+				...identity,
+				type: "message",
+				message: { role: "assistant", content: "browser-channel-answer" },
+			});
+			await bridge.handleRunEvent({ ...identity, type: "run_end" });
+			await bridge.handleRunEvent({ ...identity, type: "run_end" });
+			expect(requests.filter((r) => JSON.stringify(r.body).includes("browser-channel-answer"))).toHaveLength(1);
+			expect(requests.some((r) => JSON.stringify(r.body).includes("must-not-deliver"))).toBe(false);
+			await channel.inbound(bridge, "/new", "1");
+			requests.length = 0;
+			await bridge.handleRunEvent({ ...identity, type: "run_start" });
+			await bridge.handleRunEvent({
+				...identity,
+				type: "message",
+				message: { role: "assistant", content: "stale-channel-answer" },
+			});
+			await bridge.handleRunEvent({ ...identity, type: "run_end" });
+			expect(requests.some((r) => JSON.stringify(r.body).includes("stale-channel-answer"))).toBe(false);
+		});
+
 		it("never forwards an unknown command to the model", async () => {
 			const { bridge, host, requests } = setup();
 			await channel.inbound(bridge, "/definitely_unknown", "1");

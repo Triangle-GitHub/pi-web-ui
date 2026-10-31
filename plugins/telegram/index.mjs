@@ -120,6 +120,9 @@ export class TelegramBotBridge extends ChannelBehavior {
 	async start() {
 		if (this.running) return;
 		this.running = true;
+		const generation = this.stopGeneration || 0;
+		await this.routesReady();
+		if (generation !== (this.stopGeneration || 0)) return;
 		this.status.enabled = true;
 		this.status.state = "connecting";
 
@@ -163,12 +166,13 @@ export class TelegramBotBridge extends ChannelBehavior {
 	}
 
 	async stop() {
+		this.stopGeneration = (this.stopGeneration || 0) + 1;
 		this.running = false;
 		this.status.enabled = false;
 		this.status.connected = false;
 		this.status.state = "idle";
 		const runs = [];
-		for (const peer of this.peerCancels?.keys() || []) runs.push(...this.invalidatePeer(peer));
+		for (const peer of this.peerCancels?.keys() || []) runs.push(...this.invalidatePeer(peer, false));
 		this.earlyRuns.clear();
 
 		if (this.pollAbort) {
@@ -185,6 +189,7 @@ export class TelegramBotBridge extends ChannelBehavior {
 			this.offRunEvent = null;
 		}
 		await this.abortRuns(runs);
+		await this.sessionRouting?.saving;
 	}
 
 	async startPollingLoop(signal) {
@@ -369,6 +374,7 @@ export default async function activate(host) {
 					const incoming = msg.config || {};
 					const secrets = (await host.secrets?.getAll?.()) || {};
 					localConfig = mergeSavedSecrets(incoming, localConfig, secrets);
+					await botBridge.routesReady();
 
 					if (host.secrets) {
 						if (localConfig.botToken) {

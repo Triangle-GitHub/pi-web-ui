@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { SessionRoutes } from "./session-routes.mjs";
 import { mkdir, writeFile, stat, realpath, readFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
@@ -85,6 +86,11 @@ export async function uploadMedia(api, token, args, options) {
 	return api(token, types[kind], form, options);
 }
 export class ChannelBehavior {
+	async routesReady() {
+		this.peerEpochs ||= new Map();
+		this.sessionRouting ||= new SessionRoutes(this);
+		await this.sessionRouting.ready();
+	}
 	peer(msg) {
 		return `${msg.chat.id}:${msg.message_thread_id || 0}:${msg.from.id}`;
 	}
@@ -114,19 +120,25 @@ export class ChannelBehavior {
 		if (reset) {
 			this.userConversations.delete(peer);
 			this.peerEpochs.set(peer, randomUUID());
+			this.sessionRouting?.revoke(peer);
 		}
 		const runs = [...this.pendingRuns.entries()].filter(([, run]) => run.peer === peer);
 		for (const [id] of runs) this.pendingRuns.delete(id);
 		return runs;
 	}
 	async abortRuns(runs) {
-		const results = await Promise.allSettled(runs.map(([id]) => this.host.abortRun(id)));
+		const results = await Promise.allSettled(runs.filter(([, run]) => !run?.web).map(([id]) => this.host.abortRun(id)));
+		if (runs.some(([, run]) => run?.web))
+			throw new Error("Web run reply detached; host cannot precisely abort a run without runId.");
 		for (const result of results) {
 			if (result.status === "rejected") throw result.reason;
 			if (result.value?.ok === false) throw new Error(result.value.error || "Abort failed");
 		}
 	}
 	async onInboundMessage(msg, promptOverride) {
+		const generation = this.stopGeneration || 0;
+		await this.routesReady();
+		if (generation !== (this.stopGeneration || 0)) return;
 		const cfg = this.getConfig();
 		if (!msg?.chat?.id || !msg.from?.id || msg.from.is_bot) return;
 		const user = String(msg.from.id);
@@ -184,7 +196,7 @@ export class ChannelBehavior {
 					const req = {
 						text,
 						attachments,
-						accountId: `tg_${createHash("sha256").update(`${peer}:${epoch}`).digest("hex").slice(0, 16)}`,
+						accountId: `tg_${createHash("sha256").update(`${this.sessionRouting.accountId}:${peer}:${epoch}`).digest("hex").slice(0, 16)}`,
 						cwd,
 						model: pref.model || cfg.model || undefined,
 						thinkingLevel: pref.thinking || cfg.thinkingLevel || undefined,
@@ -202,7 +214,16 @@ export class ChannelBehavior {
 							return;
 						}
 						this.userConversations.set(peer, receipt.conversationId);
-						const run = { peer, msg, controller, conversationId: receipt.conversationId, accumulatedText: "" };
+						const route = this.sessionRouting.bind(receipt, peer, msg);
+						const run = {
+							peer,
+							msg,
+							controller,
+							route,
+							sessionId: receipt.sessionId,
+							conversationId: receipt.conversationId,
+							accumulatedText: "",
+						};
 						this.pendingRuns.set(receipt.runId, run);
 						const events = this.earlyRuns.get(receipt.runId) || [];
 						this.earlyRuns.delete(receipt.runId);
@@ -323,10 +344,37 @@ export class ChannelBehavior {
 		await this.send(msg, `✅ ${cmd.slice(1)} updated for this peer. Next message starts a new conversation.`);
 	}
 	async handleRunEvent(ev) {
-		if (!ev.runId) return;
-		const run = this.pendingRuns.get(ev.runId);
+		const generation = this.stopGeneration || 0;
+		await this.routesReady();
+		if (generation !== (this.stopGeneration || 0)) return;
+		if (ev.runId && this.sessionRouting.completed.has(ev.runId)) return;
+		const key = ev.runId || this.sessionRouting.key(ev);
+		if (!key) return;
+		let run = this.pendingRuns.get(key);
+		if (!run && !ev.runId && ev.type === "run_start") {
+			const route = this.sessionRouting.routes.get(key);
+			if (
+				!this.sessionRouting.valid(route) ||
+				[...this.pendingRuns.values()].some((r) => r.sessionId && r.sessionId === ev.sessionId)
+			)
+				return;
+			run = {
+				...route,
+				route,
+				sessionId: ev.sessionId,
+				conversationId: ev.conversationId,
+				controller: this.peerController(route.peer),
+				accumulatedText: "",
+				web: true,
+			};
+			this.pendingRuns.set(key, run);
+		}
 		if (!run) {
-			if (this.inflight && (ev.type === "run_end" || (ev.type === "message" && ev.message?.role === "assistant"))) {
+			if (
+				ev.runId &&
+				this.inflight &&
+				(ev.type === "run_end" || (ev.type === "message" && ev.message?.role === "assistant"))
+			) {
 				const queue = this.earlyRuns.get(ev.runId) || [];
 				// Reserve terminal state independently of the text budget. A burst of tool
 				// events or assistant messages must never lose run_end and leave a peer busy.
@@ -336,32 +384,40 @@ export class ChannelBehavior {
 						typeof ev.message.content === "string"
 							? ev.message.content
 							: (ev.message.content || []).map((p) => p.text || "").join("\n");
-					const previous = queue[0]?.message.content || "";
+					if (
+						Array.isArray(ev.message.content) &&
+						ev.message.content.some((p) => p.type === "toolCall" || p.type === "tool_use")
+					)
+						return;
 					queue[0] = {
 						...ev,
-						message: { role: "assistant", content: (previous + (previous ? "\n" : "") + content).slice(-256000) },
+						message: { ...ev.message, content: content.slice(-256000) },
 					};
 				}
 				this.earlyRuns.set(ev.runId, queue);
 			}
 			return;
 		}
-		if (run.controller?.signal.aborted) return;
+		if (run.controller?.signal.aborted || (run.sessionId && ev.sessionId && run.sessionId !== ev.sessionId)) return;
+		if (run.route && !this.sessionRouting.valid(run.route)) return;
 		if (ev.conversationId) {
 			run.conversationId = ev.conversationId;
 			this.userConversations.set(run.peer, ev.conversationId);
+			this.sessionRouting.save();
 		}
 		if (ev.type === "message" && ev.message?.role === "assistant") {
 			const c = ev.message.content;
+			if (Array.isArray(c) && c.some((p) => p.type === "toolCall" || p.type === "tool_use")) return;
 			const text = typeof c === "string" ? c : (c || []).map((p) => p.text || "").join("\n");
-			if (text) run.accumulatedText += (run.accumulatedText ? "\n" : "") + text;
+			run.accumulatedText = text;
 		}
 		if (ev.type === "message" && ev.message?.role === "assistant") {
 			if (ev.message.stopReason === "error") run.failure = ev.message.errorMessage || "Agent run failed.";
 			if (ev.message.stopReason === "aborted") run.failure = "Agent run stopped before completion.";
 		}
 		if (ev.type !== "run_end") return;
-		this.pendingRuns.delete(ev.runId);
+		this.pendingRuns.delete(key);
+		this.sessionRouting.done(ev.runId);
 		const text = this.cleanText(run.accumulatedText);
 		const error =
 			ev.error ||
@@ -376,7 +432,7 @@ export class ChannelBehavior {
 			: text || "✅ Task completed (no text output).";
 		try {
 			for (const chunk of this.chunkText(final, 3800)) {
-				if (run.controller?.signal.aborted) return;
+				if (run.controller?.signal.aborted || (run.route && !this.sessionRouting.valid(run.route))) return;
 				await this.send(run.msg, chunk);
 			}
 			this.status.messagesReplied++;

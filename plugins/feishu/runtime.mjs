@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { isAbsolute } from "node:path";
+import { sessionKey } from "./session-routes.mjs";
 
 export function scopeKey(openId, chatId = "", threadId = "") {
 	return createHash("sha256")
@@ -25,15 +26,23 @@ async function resetContext(bridge, scope) {
 	const epoch = bridge.epochs.get(scope);
 	const cancellation = bridge.cancellations.get(scope);
 	bridge.userConversations.delete(scope);
+	bridge.revokeSessionRoutes(scope);
 	bridge.dispatchingScopes?.delete(scope);
 	const runs = [...bridge.pendingRuns.values()].filter((run) => run.scope === scope);
-	for (const run of runs) bridge.pendingRuns.delete(run.runId);
-	const results = await Promise.allSettled(runs.map((run) => bridge.host.abortRun(run.runId)));
+	for (const [key, run] of bridge.pendingRuns) if (run.scope === scope) bridge.pendingRuns.delete(key);
+	const results = await Promise.allSettled(
+		runs.map((run) =>
+			run.runId
+				? bridge.host.abortRun(run.runId)
+				: Promise.resolve({ ok: false, error: "网页任务无法精准停止，请在网页停止。" }),
+		),
+	);
 	return { epoch, cancellation, failed: results.some((result) => result.status === "rejected" || !result.value?.ok) };
 }
 
 export const runtime = {
 	async dispatch(text, attachments, ctx) {
+		this.syncRouteAccount();
 		const { scope, cfg } = ctx;
 		if (ctx.epoch !== undefined && ctx.epoch !== (this.epochs?.get(scope) || 0)) return;
 		if (ctx.cancellation !== undefined && ctx.cancellation !== (this.cancellations?.get(scope) || 0)) return;
@@ -51,7 +60,7 @@ export const runtime = {
 			const preferences = this.preferences?.get(scope) || {};
 			const receipt = await this.host.chat({
 				text: text || "请检查收到的附件。音视频如无解码工具，请明确告知无法解码，不要猜测内容。",
-				accountId: `fs_${scope.slice(0, 32)}_${this.epochs?.get(scope) || 0}`,
+				accountId: `fs_${createHash("sha256").update(`${this.routeAccount}:${scope}`).digest("hex").slice(0, 32)}_${this.epochs?.get(scope) || 0}`,
 				...(this.userConversations.get(scope) ? { conversationId: this.userConversations.get(scope) } : {}),
 				cwd: this.resolveWorkspace(scope, cfg),
 				...(cfg.model ? { model: cfg.model } : {}),
@@ -73,10 +82,13 @@ export const runtime = {
 				cancellation,
 				generation,
 				runId: receipt.runId,
+				sessionId: receipt.sessionId,
+				clientId: receipt.clientId,
 				conversationId: receipt.conversationId,
 				accumulatedText: "",
 				startedAt: Date.now(),
 			};
+			this.bindSessionRoute(receipt, run);
 			this.pendingRuns.set(receipt.runId, run);
 			const events = this.earlyRuns.get(receipt.runId) || [];
 			this.earlyRuns.delete(receipt.runId);
@@ -114,7 +126,8 @@ export const runtime = {
 					this.cancellations ??= new Map();
 					this.cancellations.set(scope, (this.cancellations.get(scope) || 0) + 1);
 					for (const run of runs) {
-						const result = await this.host.abortRun(run.runId || run.conversationId);
+						if (!run.runId) throw new Error("网页任务无法精准停止，请在网页停止。");
+						const result = await this.host.abortRun(run.runId);
 						if (!result?.ok) throw new Error(result?.error || "宿主未能停止任务");
 					}
 					answer =
@@ -185,10 +198,27 @@ export const runtime = {
 	},
 
 	async handleRunEvent(ev) {
-		if (!ev?.runId) return;
-		const run = this.pendingRuns.get(ev.runId);
+		if (!ev) return;
+		this.syncRouteAccount();
+		const key = ev.runId || sessionKey(ev);
+		let run = key && this.pendingRuns.get(key);
+		if (!run && !ev.runId && ev.type === "run_start") {
+			const route = this.sessionRoutes.get(key);
+			if (!this.validSessionRoute(route) || [...this.pendingRuns.values()].some((r) => sessionKey(r) === key)) return;
+			run = {
+				...route,
+				sessionId: ev.sessionId,
+				clientId: ev.clientId,
+				conversationId: ev.conversationId,
+				generation: this.generation || 0,
+				cancellation: this.cancellations?.get(route.scope) || 0,
+				accumulatedText: "",
+				cfg: this.getConfig(),
+			};
+			this.pendingRuns.set(key, run);
+		}
 		if (!run) {
-			if (this.inFlight && ["message", "run_end"].includes(ev.type)) {
+			if (ev.runId && this.inFlight && ["message", "run_end"].includes(ev.type)) {
 				if (!this.earlyRuns.has(ev.runId) && this.earlyRuns.size >= 64) return;
 				const events = this.earlyRuns.get(ev.runId) || [];
 				if (events.length < 128) events.push(ev);
@@ -209,11 +239,16 @@ export const runtime = {
 							.filter((b) => b.type === "text")
 							.map((b) => b.text || "")
 							.join("\n");
-			run.accumulatedText += (run.accumulatedText ? "\n" : "") + text;
+			run.accumulatedText = text;
+			if (
+				ev.message.stopReason === "toolUse" ||
+				(Array.isArray(content) && content.some((b) => ["toolCall", "tool_use", "function_call"].includes(b.type)))
+			)
+				run.accumulatedText = "";
 			if (ev.message.errorMessage) run.error = ev.message.errorMessage;
 		}
 		if (ev.type === "run_end") {
-			this.pendingRuns.delete(ev.runId);
+			this.pendingRuns.delete(key);
 			if (!run.accumulatedText)
 				run.accumulatedText =
 					ev.stopReason === "aborted"

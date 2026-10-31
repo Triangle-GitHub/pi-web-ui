@@ -37,7 +37,7 @@ export function ToolApprovalDialog({
 	return (
 		<PendingQueue
 			items={approvals}
-			itemKey={(item) => item.id}
+			itemKey={(item) => `${item.owner ?? "local"}:${item.id}`}
 			title={t("toolApprovalTitle")}
 			summary={(item) => (
 				<>
@@ -47,14 +47,22 @@ export function ToolApprovalDialog({
 			)}
 			createdAt={(item) => item.createdAt ?? 0}
 			canAutoOpen={(item) =>
-				mode !== "manual" && (mode === "all" || item.conversationId === activeConversationId || !item.conversationId)
+				mode !== "manual" &&
+				(item.global || mode === "all" || item.conversationId === activeConversationId || !item.conversationId)
 			}
 			onNavigate={(item) => {
-				if (item.conversationId) appSend({ type: "switch_conversation", id: item.conversationId });
+				if (item.conversationId)
+					appSend(
+						item.global && item.owner
+							? { type: "open_shared_conversation", owner: item.owner, id: item.conversationId }
+							: { type: "switch_conversation", id: item.conversationId },
+					);
 			}}
 			canNavigate={(item) => !!item.conversationId}
 		>
-			{(approval, onDefer) => <ApprovalDialog key={approval.id} approval={approval} onDefer={onDefer} />}
+			{(approval, onDefer) => (
+				<ApprovalDialog key={`${approval.owner ?? "local"}:${approval.id}`} approval={approval} onDefer={onDefer} />
+			)}
 		</PendingQueue>
 	);
 }
@@ -90,6 +98,8 @@ function ApprovalDialog({ approval, onDefer }: ToolApprovalDialogProps & { onDef
 		appSend({
 			type: "tool_approval_response",
 			id: approval.id,
+			...(approval.owner ? { owner: approval.owner } : {}),
+			...(approval.global ? { global: true } : {}),
 			decision: "approve",
 			...(scope && scope !== "once" ? { scope } : {}),
 		});
@@ -99,6 +109,8 @@ function ApprovalDialog({ approval, onDefer }: ToolApprovalDialogProps & { onDef
 		appSend({
 			type: "tool_approval_response",
 			id: approval.id,
+			...(approval.owner ? { owner: approval.owner } : {}),
+			...(approval.global ? { global: true } : {}),
 			decision: "deny",
 			reason: "Operation rejected by user",
 		});
@@ -123,6 +135,8 @@ function ApprovalDialog({ approval, onDefer }: ToolApprovalDialogProps & { onDef
 			appSend({
 				type: "tool_approval_response",
 				id: approval.id,
+				...(approval.owner ? { owner: approval.owner } : {}),
+				...(approval.global ? { global: true } : {}),
 				decision: "edit",
 				editedParams: edited,
 			});

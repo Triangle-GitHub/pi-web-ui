@@ -184,6 +184,7 @@ import {
 	type SubagentTaskState,
 } from "./subagent-task.js";
 import { resolveUserMessageEntryId, resolveConversationMessageEntry } from "./message-entry-resolver.js";
+import { messageDeletionTargets, undeletedContextEntries } from "./message-deletion.js";
 import { fillSkillContents } from "./skill-content-filler.js";
 import { estimateNonSystemTokens, renderMainCompose } from "./prompt-assembler.js";
 import type { SubagentHandoffRecord } from "./subagent-handoff.js";
@@ -601,6 +602,7 @@ export { workspacePath };
  */
 export interface Conversation {
 	id: string;
+	independent?: boolean;
 	/** Display title: first user prompt (truncated) or the default. */
 	title: string;
 	/** 这是子代理对话（左栏带「子代理」徽标；inMemory session，不进历史/resume）。 */
@@ -2363,7 +2365,11 @@ export class ClientSession {
 	private emitTerminal(conversationId: string, msg: ServerMessage): void {
 		// Background conversations keep collecting output in their own PTY buffer.
 		// Do not stream it into the active xterm; push the retained window on switch.
-		if (msg.type === "terminal_output" && conversationId !== this.activeId) return;
+		if (msg.type === "terminal_output" && conversationId !== this.activeId) {
+			const conv = this.convs.get(conversationId);
+			if (conv) for (const send of this.sharedTerminalSinks?.get(conv) ?? []) send({ ...msg, conversationId });
+			return;
+		}
 		if (msg.type === "terminal_exit") {
 			this.updatesAllCache = null;
 		}
@@ -3429,7 +3435,6 @@ export class ClientSession {
 
 	/** 任务计划管理器（Plan Mode / Step State Machine）。 */
 	private planManager: PlanManager;
-	private approvalSeq = 0;
 
 	/** 确保对话拥有待审批项 Map */
 	private ensurePendingApprovals(conv: Conversation): Map<string, PendingApprovalEntry> {
@@ -4742,17 +4747,144 @@ export class ClientSession {
 		return this.goalSvc.makeGoalStatus();
 	}
 
+	private readConversationIndependent(session: AgentSession): boolean {
+		let independent = !isPseudoClientId(this.clientId ?? "") && !this.clientId?.startsWith("device-task-");
+		for (const entry of session.sessionManager.getEntries()) {
+			if (entry.type === "custom" && entry.customType === "webui/independent")
+				independent = (entry.data as { independent?: boolean } | undefined)?.independent !== false;
+		}
+		return independent;
+	}
+
+	setConversationIndependent(id: string, independent: boolean): void {
+		const conv = this.convs.get(id);
+		if (!conv) return;
+		conv.session.sessionManager.appendCustomEntry("webui/independent", { independent });
+		conv.independent = independent;
+		this.emitConversations();
+	}
+
 	/** Allocate a stable conversation id before constructing its runtime/tools. */
 	private nextConversationId(): string {
 		return `c${++this.convSeq}`;
 	}
 
 	/** Wrap a fresh runtime as a new conversation record. */
+	private conversationViewers = new Map<Conversation, Set<() => void>>();
+	private sharedTerminalSinks = new Map<Conversation, Set<(message: ServerMessage) => void>>();
+
+	emitSharedInteraction(msg: ServerMessage): void {
+		this.emit(msg);
+	}
+
+	sharedPendingMessages(): ServerMessage[] {
+		const messages: ServerMessage[] = [];
+		for (const request of this.pendingQuestions.values()) {
+			if (request.settled || request.audience !== "user") continue;
+			messages.push({
+				type: "question_pending",
+				id: request.id,
+				questions: request.questions,
+				deadline: request.deadline,
+				conversationId: request.conversationId,
+				conversationTitle: this.convs.get(request.conversationId)?.title,
+			});
+		}
+		for (const approval of this.pendingApprovalsForSnapshot())
+			messages.push({ type: "tool_approval_pending", ...approval });
+		return messages;
+	}
+
+	subscribeConversation(conv: Conversation, send: (message: ServerMessage) => void): () => void {
+		if (this.convs.get(conv.id) !== conv) throw new Error("Conversation is no longer available");
+		let viewers = this.conversationViewers.get(conv);
+		if (!viewers) this.conversationViewers.set(conv, (viewers = new Set()));
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		let closed = false;
+		let previous: UiState | undefined;
+		const pushNow = () => {
+			timer = undefined;
+			if (closed || this.convs.get(conv.id) !== conv) return;
+			const state = this.snapshotForConversation(conv);
+			const prior = previous;
+			previous = state;
+			const appendOnly =
+				prior &&
+				state.sessionId === prior.sessionId &&
+				state.messages.length >= prior.messages.length &&
+				prior.messages.every((message, index) => state.messages[index] === message);
+			if (appendOnly) {
+				const { messages, ...light } = state;
+				send({
+					type: "snapshot_delta",
+					conversationId: conv.id,
+					rev: state.rev,
+					baseRev: prior.rev,
+					appended: messages.slice(prior.messages.length),
+					state: light,
+				});
+			} else send({ type: "snapshot", state });
+		};
+		const push = () => {
+			if (!timer && !closed) timer = setTimeout(pushNow, 60);
+		};
+		const deltaSink = (message: ServerMessage) => {
+			if (
+				!closed &&
+				this.convs.get(conv.id) === conv &&
+				(message.type === "message_delta" || message.type === "tool_delta" || message.type === "terminal_list"
+					? message.conversationId === conv.id
+					: (message.type === "terminal_output" || message.type === "terminal_exit") &&
+						message.conversationId === conv.id &&
+						message.ownerKind === "conversation")
+			)
+				send(message);
+		};
+		let terminalSinks = this.sharedTerminalSinks.get(conv);
+		if (!terminalSinks) this.sharedTerminalSinks.set(conv, (terminalSinks = new Set()));
+		terminalSinks.add(deltaSink);
+		this.attachSink(deltaSink);
+		viewers.add(push);
+		pushNow();
+		return () => {
+			closed = true;
+			if (timer) clearTimeout(timer);
+			this.detachSink(deltaSink);
+			terminalSinks.delete(deltaSink);
+			if (!terminalSinks.size) this.sharedTerminalSinks.delete(conv);
+			viewers.delete(push);
+			if (!viewers.size) this.conversationViewers.delete(conv);
+		};
+	}
+
+	snapshotForConversation(conv: Conversation): UiState {
+		if (this.convs.get(conv.id) !== conv) throw new Error("Conversation is no longer available");
+		const state = this.buildLightState(++this.snapRev, true, conv);
+		return {
+			...state,
+			pendingApprovals: state.pendingApprovals?.filter((entry) => entry.conversationId === conv.id),
+			cwd: conv.cwd,
+			messages: this.messagesOf(conv),
+		};
+	}
+
+	async abortConversation(conv: Conversation): Promise<void> {
+		if (this.convs.get(conv.id) !== conv) return;
+		conv.goalGeneration++;
+		conv.queueSteering = [];
+		conv.queueFollowUp = [];
+		conv.queuedSteeringEntries = [];
+		conv.queuedFollowUpEntries = [];
+		await this.interruptRun(conv, "已停止");
+		for (const push of this.conversationViewers?.get(conv) ?? []) push();
+	}
+
 	private makeConversation(runtime: AgentSessionRuntime, id: string, terminals: TerminalManager): Conversation {
 		const conv: Conversation = {
 			id,
 			title: conversationTitle(runtime.session),
 			isSubagent: false,
+			independent: this.readConversationIndependent(runtime.session),
 			runtime,
 			session: runtime.session,
 			cwd: restoreWorkspaceUriFromSessionDir(runtime.cwd),
@@ -5217,6 +5349,7 @@ export class ClientSession {
 			this.onRunEvent({
 				...ev,
 				conversationId: conv.id,
+				sessionId: conv.session.sessionId,
 				clientId: this.clientId,
 				// 通道插件按它认领「自己那一轮」——过户换持有客户端、对话被改 id 都不影响。
 				...(conv.pluginRunId ? { runId: conv.pluginRunId } : {}),
@@ -5992,6 +6125,10 @@ export class ClientSession {
 				// Deferred settings reload: settings (system prompt / skills /
 				// extensions) changed while the run was streaming — applying now
 				// would have torn down the in-flight run.
+				const settingsTarget = this.conversationSettingsTargets.get(conv);
+				if (settingsTarget && this.settingsSvc.consumePendingReload(settingsTarget) && !this.disposed) {
+					void this.settingsSvc.applyRuntime(false, settingsTarget).catch(() => {});
+				}
 				if (this.settingsSvc.hasPendingReload() && !this.disposed) {
 					this.settingsSvc.consumePendingReload();
 					void this.applySettingsReload();
@@ -6163,7 +6300,7 @@ export class ClientSession {
 				// stale state. Only the ACTIVE conversation streams to the browser —
 				// background conversations would clobber the streaming view; their
 				// state arrives via snapshot when switched to.
-				if (conv.id !== this.conv.id) break;
+				if (conv.id !== this.conv.id && !this.conversationViewers?.has(conv)) break;
 				const ame = event.assistantMessageEvent;
 				const m = event.message as { timestamp?: number };
 				this.lastDeltaAt = Date.now();
@@ -6207,6 +6344,7 @@ export class ClientSession {
 		// #259 实测 8 子代理 × 5 次 bash → 8 条全量快照共 39.5MB，而激活对话一个
 		// 字节都没变。后台对话的内容在切过去时取（switch_session / get_state 强制
 		// 全量），它在左栏的运行态由 emitConversations 走另一条通道。
+		for (const push of this.conversationViewers?.get(conv) ?? []) push();
 		if (conv.id !== this.conv.id) return;
 		const eventMsgRole =
 			event.type === "message_start" || event.type === "message_end"
@@ -6397,8 +6535,11 @@ export class ClientSession {
 	}
 
 	/** Build every UiState field EXCEPT messages (the expensive part). */
-	private buildLightState(rev: number, withDraft = false): Omit<UiState, "messages" | "rev"> & { rev: number } {
-		const conv = this.conv;
+	private buildLightState(
+		rev: number,
+		withDraft = false,
+		conv = this.conv,
+	): Omit<UiState, "messages" | "rev"> & { rev: number } {
 		const state = conv.session.agent.state;
 		const model = state.model;
 		let stats: UiState["stats"] = {
@@ -6408,7 +6549,7 @@ export class ClientSession {
 			contextUsage: { tokens: null, contextWindow: 0, percent: null },
 		};
 		try {
-			const s = this.sessionStats();
+			const s = this.sessionStats(conv.session);
 			stats = {
 				totalMessages: s.totalMessages,
 				tokens: s.tokens,
@@ -6451,20 +6592,21 @@ export class ClientSession {
 			// 用户主目录（右栏 🏠）：进程内不变，模块级求值一次，不在热路径调 homedir()。
 			homeDir: HOME_WIRE,
 			desktopDir: DESKTOP_WIRE,
-			sessionId: this.session.sessionId,
-			sessionFile: this.session.sessionFile,
-			conversationId: this.activeId,
+			sessionId: conv.session.sessionId,
+			sessionFile: conv.session.sessionFile,
+			conversationId: conv.id,
+			sharedConversation: null,
 			// 临时对话标记（issue #285）：提示条/转正按钮跟当前对话走。
 			// 不能只靠 conversations 列表 —— 空白的临时对话不在运行列表里（shownInRunningList
 			// 只列有内容的），刚新建时列表里查不到它，提示条就永远不出现。
 			// 必须**恒存在**（不能只在 true 时展开）：转正后它由 true→false，而增量快照是
 			// `{...ui, ...d.state}` 浅合并，缺字段会把 true 残留下来。
-			isEphemeral: !!this.conv?.isEphemeral,
-			sandbox: this.sandboxes?.getByCwd(this.cwd) ?? null,
-			worktree: this.worktreeInfo ?? null,
+			isEphemeral: !!conv.isEphemeral,
+			sandbox: this.sandboxes?.getByCwd(conv.cwd) ?? null,
+			worktree: conv.cwd === this.cwd ? (this.worktreeInfo ?? null) : null,
 			rev,
 			streamingMessage,
-			isStreaming: this.session.isStreaming,
+			isStreaming: conv.session.isStreaming,
 			completionPending: this.completionPending(conv),
 			turnTiming: conv.turnTiming ?? null,
 			model: model
@@ -6478,7 +6620,7 @@ export class ClientSession {
 			thinkingLevel: state.thinkingLevel,
 			// Only the levels the current model actually supports — the SDK clamps
 			// anything else, so the UI must not offer (or must disable) the rest.
-			availableThinkingLevels: this.session.getAvailableThinkingLevels(),
+			availableThinkingLevels: conv.session.getAvailableThinkingLevels(),
 			queue: {
 				steering: conv.queueSteering,
 				followUp: conv.queueFollowUp,
@@ -6490,13 +6632,13 @@ export class ClientSession {
 			errorMessage: state.errorMessage,
 			retry: conv.retryState ?? null,
 			compaction: conv.compactionState ?? null,
-			pendingQuestion: this.pendingQuestionForSnapshot(),
-			actionSuggestions: this.markerSvc.getActionSuggestions(this.activeId) ?? null,
-			pendingApproval: this.pendingApprovalForSnapshot(),
+			pendingQuestion: this.pendingQuestionForSnapshot(conv),
+			actionSuggestions: this.markerSvc.getActionSuggestions(conv.id) ?? null,
+			pendingApproval: this.pendingApprovalForSnapshot(conv),
 			pendingApprovals: this.pendingApprovalsForSnapshot(),
 			// 任务计划看板状态同样是会话级：快照恒给 PlanState 或 null（不用 undefined），
 			// 否则 snapshot_delta 里 key 缺席 → 前端 spread 浅合并会残留上一对话的 plan。
-			plan: this.planManager.getPlan(this.activeId) ?? null,
+			plan: this.planManager.getPlan(conv.id) ?? null,
 			// 计划模式是**会话级**开关：快照恒给布尔（不用 undefined），否则
 			// snapshot_delta 里 key 缺席 → 前端 spread 合并会残留上一对话的 true。
 			planMode: conv?.planMode === true,
@@ -6521,7 +6663,7 @@ export class ClientSession {
 			// 未发送草稿只跟全量快照走（切会话/new_chat/get_state）：增量 delta 里
 			// 这个 key 必须整个缺席（不能是显式的 undefined——前端 delta 合并是
 			// {...ui, ...d.state} 整批覆盖，显式 undefined 会把上次全量带回的草稿洗掉）。
-			...(withDraft ? { draft: this.draftForSnapshot() } : {}),
+			...(withDraft ? { draft: this.draftForSnapshot(conv) } : {}),
 			engineCapabilities: DEFAULT_PI_CAPABILITIES,
 			tools: state.tools.map((t) => t.name),
 			version: ++this.version,
@@ -6547,6 +6689,7 @@ export class ClientSession {
 	 *  "nothing but stats/version changed" checkpoint. */
 	private emitSnapshotNow(forceFull = false): void {
 		if (this.disposed) return;
+		for (const viewers of this.conversationViewers?.values() ?? []) for (const push of viewers) push();
 		if (this.convs.size === 0) {
 			// 自愈兜底：没有任何活跃对话，异步触发 newChat 恢复状态，避免抛错挂死
 			void this.newChat()
@@ -7187,10 +7330,10 @@ export class ClientSession {
 
 	/** 快照侧的待答提问（UiState.pendingQuestion）：只带当前对话的问卷——切回
 	 *  原对话会重推快照，对话框随之回来（重连/刷新/第二标签页的恢复通道）。 */
-	private pendingQuestionForSnapshot(): UiState["pendingQuestion"] {
+	private pendingQuestionForSnapshot(conversation = this.conv): UiState["pendingQuestion"] {
 		for (const [id, p] of this.pendingQuestions) {
 			if (p.audience !== "user" || p.settled) continue;
-			if (p.conversationId !== undefined && p.conversationId !== this.activeId) continue;
+			if (p.conversationId !== undefined && p.conversationId !== conversation.id) continue;
 			const conv = p.conversationId !== undefined ? this.convs.get(p.conversationId) : this.conv;
 			const conversationTitle = conv?.title;
 			return {
@@ -7288,7 +7431,7 @@ export class ClientSession {
 				resolve({ decision: "deny", reason: "会话已关闭" });
 				return;
 			}
-			const id = `appr-${++this.approvalSeq}`;
+			const id = `appr-${randomUUID()}`;
 			const targetConv = conversationId ? this.convs.get(conversationId) : this.conv;
 			const resolvedConvId = conversationId ?? targetConv?.id ?? this.activeId;
 			const conv = (resolvedConvId ? this.convs.get(resolvedConvId) : undefined) ?? targetConv;
@@ -7598,8 +7741,7 @@ export class ClientSession {
 			.sort((a, b) => a.createdAt - b.createdAt);
 	}
 
-	private pendingApprovalForSnapshot(): UiState["pendingApproval"] {
-		const conv = this.conv;
+	private pendingApprovalForSnapshot(conv = this.conv): UiState["pendingApproval"] {
 		if (!conv?.pendingApprovals || conv.pendingApprovals.size === 0) return null;
 		for (const [id, p] of conv.pendingApprovals) {
 			return {
@@ -7908,8 +8050,10 @@ export class ClientSession {
 	/** 前端回页面调用结果（index.ts 的 page_response → cs.resolvePageCall）。
 	 *  找不到 id 就静默忽略：那是正常竞态（超时后才迟到、页面刷新后重发、旧链接
 	 *  残留），不是错误，也没人能处理。 */
-	resolvePageCall(id: string, ok: boolean, result?: unknown, error?: string): void {
+	resolvePageCall(id: string, ok: boolean, result?: unknown, error?: string, conversationId?: string): void {
 		const pending = this.pendingPageCalls.get(id);
+		if (conversationId && pending?.conversationId !== conversationId)
+			throw new Error("Page request does not belong to the shared conversation");
 		if (!pending) return;
 		this.pendingPageCalls.delete(id);
 		clearTimeout(pending.timer);
@@ -8456,12 +8600,12 @@ export class ClientSession {
 	 * Callers that need the authoritative value can still call the session
 	 * directly; every cache hit here is at most STATS_CACHE_MS stale.
 	 */
-	private sessionStats(): ReturnType<AgentSession["getSessionStats"]> {
+	private sessionStats(session = this.session): ReturnType<AgentSession["getSessionStats"]> {
 		const now = Date.now();
 		const hit = this.sessionStatsCache;
-		if (hit && hit.session === this.session && now - hit.at < STATS_CACHE_MS) return hit.value;
-		const value = this.session.getSessionStats();
-		this.sessionStatsCache = { at: now, session: this.session, value };
+		if (hit && hit.session === session && now - hit.at < STATS_CACHE_MS) return hit.value;
+		const value = session.getSessionStats();
+		this.sessionStatsCache = { at: now, session, value };
 		return value;
 	}
 
@@ -9176,8 +9320,32 @@ export class ClientSession {
 	}
 
 	/** Replace the current settings with the named preset and apply it. */
-	async applyPreset(name: string): Promise<void> {
-		return this.settingsSvc.applyPreset(name);
+	private readonly conversationSettingsTargets = new WeakMap<
+		Conversation,
+		{ isStreaming: () => boolean; reloadSession: () => Promise<void> }
+	>();
+
+	private conversationSettingsTarget(conv: Conversation) {
+		let target = this.conversationSettingsTargets.get(conv);
+		if (!target) {
+			const runtime = conv.runtime;
+			target = {
+				isStreaming: () => runtime.session.isStreaming || Boolean(conv.promptInFlight),
+				reloadSession: async () => {
+					if (this.disposed || this.convs.get(conv.id) !== conv || conv.runtime !== runtime)
+						throw new Error("Conversation runtime no longer available");
+					await runtime.session.reload();
+					if (this.disposed || this.convs.get(conv.id) !== conv || conv.runtime !== runtime) return;
+					this.applySessionOverrides(conv);
+				},
+			};
+			this.conversationSettingsTargets.set(conv, target);
+		}
+		return target;
+	}
+
+	async applyPreset(name: string, conv?: Conversation): Promise<void> {
+		return this.settingsSvc.applyPreset(name, conv ? this.conversationSettingsTarget(conv) : undefined);
 	}
 
 	/** Remove a named preset. */
@@ -10953,6 +11121,7 @@ export class ClientSession {
 		cwd: string;
 		isStreaming: boolean;
 		convId: string;
+		independent: boolean;
 		hasQuestion: boolean;
 		questionTitle?: string;
 		sessionFile?: string;
@@ -10967,6 +11136,7 @@ export class ClientSession {
 			cwd: string;
 			isStreaming: boolean;
 			convId: string;
+			independent: boolean;
 			hasQuestion: boolean;
 			questionTitle?: string;
 			sessionFile?: string;
@@ -10993,6 +11163,7 @@ export class ClientSession {
 				cwd: conv.cwd,
 				isStreaming: streaming,
 				convId: conv.id,
+				independent: conv.independent !== false,
 				hasQuestion: !!pq,
 				...(pq?.title ? { questionTitle: pq.title } : {}),
 				...(sessionFile ? { sessionFile } : {}),
@@ -11747,11 +11918,16 @@ export class ClientSession {
 	 *  本轮已停止并标红，用户点「重试」再触发一轮 LLM 调用。不新增用户气泡——
 	 *  用 display:false 的 custom 消息 triggerTurn 续跑，模型基于完整上下文
 	 * （含上次报错）继续生成。流式中 / 无可重试失败时只发 notice 拒绝。 */
-	async retryLast(): Promise<void> {
-		const conv = this.conv;
+	async retryLast(targetConversation?: Conversation): Promise<void> {
+		const conv = targetConversation ?? this.conv;
+		if (targetConversation && this.convs.get(conv.id) !== conv)
+			throw new Error("Retry conversation is no longer available");
+		const runtime = conv.runtime;
+		const s = conv.session;
+		const current = () => this.convs.get(conv.id) === conv && conv.runtime === runtime && conv.session === s;
+
 		try {
 			if (this.quiesceBlocked()) return;
-			const s = this.session;
 			if (s.isStreaming) {
 				this.emit({
 					type: "notice",
@@ -11809,6 +11985,7 @@ export class ClientSession {
 				},
 				{ triggerTurn: true },
 			);
+			if (!current()) return;
 			conv.promptedSinceActive = true;
 			conv.lastActiveAt = Date.now();
 			conv.lastSdkEventAt = Date.now();
@@ -11836,8 +12013,19 @@ export class ClientSession {
 	 * item still at that position; on any mismatch we fall back to first-occurrence
 	 * text match (old clients, or the queue shifted between click and handling).
 	 */
-	async removeQueued(kind: "steer" | "followUp", text: string, index?: number, id?: string): Promise<void> {
-		const conv = this.conv;
+	async removeQueued(
+		kind: "steer" | "followUp",
+		text: string,
+		index?: number,
+		id?: string,
+		targetConversation?: Conversation,
+	): Promise<void> {
+		const conv = targetConversation ?? this.conv;
+		if (targetConversation && this.convs.get(conv.id) !== conv)
+			throw new Error("Queue conversation is no longer available");
+		const runtime = conv.runtime;
+		const s = conv.session;
+		const current = () => this.convs.get(conv.id) === conv && conv.runtime === runtime && conv.session === s;
 		// Always-defined display mirrors; also the provenance of bubble rendering.
 		const local = kind === "steer" ? conv.queueSteering : conv.queueFollowUp;
 		let targetText = text;
@@ -11859,7 +12047,6 @@ export class ClientSession {
 				return;
 			}
 		}
-		const s = this.conv.session;
 		if (!s) {
 			// Runtime not bound yet (fresh conversation) — drop the display mirror;
 			// a later queue_update reconciles any SDK-side state.
@@ -11932,10 +12119,13 @@ export class ClientSession {
 		// Re-queue the survivors in original order. Guard each call so a single
 		// failure can't leave the queue half-drained silently.
 		for (const entry of keptSteeringEntries) {
+			if (!current()) return;
 			try {
 				conv.queuedSteeringEntries.push(entry);
 				await s.steer(entry.text, entry.images);
+				if (!current()) return;
 			} catch (err) {
+				if (!current()) return;
 				conv.queuedSteeringEntries.pop();
 				this.emit({
 					type: "notice",
@@ -11946,10 +12136,13 @@ export class ClientSession {
 			}
 		}
 		for (const entry of keptFollowUpEntries) {
+			if (!current()) return;
 			try {
 				conv.queuedFollowUpEntries.push(entry);
 				await s.followUp(entry.text, entry.images);
+				if (!current()) return;
 			} catch (err) {
+				if (!current()) return;
 				conv.queuedFollowUpEntries.pop();
 				this.emit({
 					type: "notice",
@@ -11974,9 +12167,15 @@ export class ClientSession {
 	 *  晚于服务端的切换到达）。空白新会话的转录还没落盘，但 id 内存里已有。
 	 *  存完不推快照：同页的草稿本来就是自己打的；恢复走全量快照的 draft 字段。
 	 *  陈旧写由 ComposerDraftsStore 的 clear 水位丢弃（ts <= clearTs 不复活）。 */
-	saveDraft(sessionId: string, text: string, ts: number): void {
+	saveDraft(sessionId: string, text: string, ts: number, targetConversation?: Conversation): void {
 		try {
 			if (!sessionId) return;
+			if (
+				targetConversation &&
+				(this.convs.get(targetConversation.id) !== targetConversation ||
+					targetConversation.session.sessionId !== sessionId)
+			)
+				throw new Error("Draft conversation is no longer available or does not match the session");
 			this.drafts.save(sessionId, text, ts);
 		} catch {
 			this.emitNotice(
@@ -11988,9 +12187,9 @@ export class ClientSession {
 	}
 
 	/** 当前活跃对话的草稿（全量快照用；增量 snapshot_delta 传 withDraft=false 不带）。 */
-	private draftForSnapshot(): UiState["draft"] {
+	private draftForSnapshot(conv = this.conv): UiState["draft"] {
 		try {
-			return this.drafts.get(this.conv.session.sessionId) ?? null;
+			return this.drafts.get(conv.session.sessionId) ?? null;
 		} catch {
 			return null;
 		}
@@ -12331,7 +12530,12 @@ export class ClientSession {
 	 *  空白新对话」——/new <prompt> 只在 true 时投递首条提示；false 表示没能进入
 	 *  新对话（准入关闭 / 同项目对话数达上限 / runtime 创建失败），此时照发会把
 	 *  首条提示投进用户原本正在用的那个对话里。 */
-	async newChat(_preset?: string, ephemeral?: boolean, onReady?: (id: string) => void): Promise<boolean> {
+	async newChat(
+		_preset?: string,
+		ephemeral?: boolean,
+		onReady?: (id: string) => void,
+		independent = true,
+	): Promise<boolean> {
 		if (this.quiesceBlocked()) return false;
 		// Reuse an already-open blank conversation instead of piling up new ones
 		// on every click: if the active chat has no messages it IS the new chat
@@ -12355,6 +12559,7 @@ export class ClientSession {
 				this.pushSettings();
 				this.flushSnapshot();
 			}
+			this.setConversationIndependent(active.id, independent);
 			onReady?.(active.id);
 			return true;
 		}
@@ -12365,6 +12570,7 @@ export class ClientSession {
 					await this.switchConversation(conv.id);
 					if (_preset) await this.selectAgentPreset(_preset);
 					else this.flushSnapshot();
+					this.setConversationIndependent(conv.id, independent);
 					onReady?.(conv.id);
 					return true;
 				}
@@ -12436,6 +12642,8 @@ export class ClientSession {
 			);
 			const conv = this.makeConversation(runtime, conversationId, terminals);
 			conv.cwd = this.cwd;
+			conv.independent = independent;
+			conv.session.sessionManager.appendCustomEntry("webui/independent", { independent });
 			if (ephemeral) conv.isEphemeral = true;
 			if (_preset) {
 				const hit = PI_AGENT_PRESETS.find((p) => p.id === _preset);
@@ -13171,7 +13379,7 @@ export class ClientSession {
 		// 主对话的立即弹窗（子代理的靠角标与快照呈现，与问卷同一口径）。
 		for (const a of payload.approvals) {
 			if (settledApprovalRequests.has(a)) continue;
-			const nid = `appr-${++this.approvalSeq}`;
+			const nid = `appr-${randomUUID()}`;
 			const aConvId = fix(a.conversationId);
 			const targetConv = this.convs.get(aConvId);
 			if (targetConv) {
@@ -13378,6 +13586,7 @@ export class ClientSession {
 			}
 			conversations.push({
 				id: conv.id,
+				independent: conv.independent !== false,
 				title: conv.title,
 				cwd: conv.cwd,
 				messageCount,
@@ -14570,7 +14779,7 @@ export class ClientSession {
 	 * current runtime, which would otherwise stop a response merely because the
 	 * user opened history while it was streaming.
 	 */
-	async switchSession(path: string, sessionId?: string): Promise<void> {
+	async switchSession(path: string, sessionId?: string, independent?: boolean): Promise<void> {
 		if (this.quiesceBlocked()) return;
 		const timing = startLoadTiming();
 		let outcome: "loaded" | "reused" | "stopped" | "error" = "stopped";
@@ -14622,6 +14831,7 @@ export class ClientSession {
 			for (const conv of this.convs.values()) {
 				const sessionFile = conv.session.sessionFile;
 				if (sessionFile && resolve(sessionFile) === targetPath) {
+					if (independent !== undefined) this.setConversationIndependent(conv.id, independent);
 					await this.switchConversation(conv.id);
 					outcome = "reused";
 					this.emit({
@@ -14768,6 +14978,10 @@ export class ClientSession {
 			}
 
 			const conv = this.makeConversation(openedRuntime, conversationId, openedTerminals);
+			if (independent !== undefined) {
+				conv.session.sessionManager.appendCustomEntry("webui/independent", { independent });
+				conv.independent = independent;
+			}
 			// Deliberately resumed — must not be dismissed when the user later
 			// switches away without sending a new message.
 			conv.listed = true;
@@ -14856,8 +15070,11 @@ export class ClientSession {
 	 * Map a rendered user-message id (`u-<timestamp>-<seq>`, assigned in
 	 * serialize.ts) back to its append-only session entry id.
 	 */
-	private resolveUserMessageEntryId(messageId: string): string | null {
-		return resolveUserMessageEntryId(this.session.sessionManager.buildContextEntries(), messageId);
+	private resolveUserMessageEntryId(messageId: string, targetConversation?: Conversation): string | null {
+		return resolveUserMessageEntryId(
+			undeletedContextEntries((targetConversation ?? this.conv).session.sessionManager.buildContextEntries()),
+			messageId,
+		);
 	}
 
 	/**
@@ -14869,7 +15086,7 @@ export class ClientSession {
 		messageId: string,
 	): import("@earendil-works/pi-coding-agent").SessionEntry | null {
 		return resolveConversationMessageEntry(
-			conv.session.sessionManager.buildContextEntries() as never,
+			undeletedContextEntries(conv.session.sessionManager.buildContextEntries()) as never,
 			messageId,
 			(m) => this.uiMessageKey(conv, m).n,
 			(id) => conv.session.sessionManager.getEntry(id),
@@ -14879,12 +15096,13 @@ export class ClientSession {
 	/**
 	 * 获取被某个压缩卡片折叠的历史消息（issue #398，按需惰性加载）。
 	 */
-	getCompactedMessages(compactionMessageId: string, targetConvId?: string): void {
-		const targetConv = (targetConvId ? this.convs.get(targetConvId) : this.conv) ?? this.conv;
+	getCompactedMessages(compactionMessageId: string, targetConvId?: string, send = this.emit.bind(this)): void {
+		const targetConv = targetConvId ? this.convs.get(targetConvId) : this.conv;
+		if (!targetConv) throw new Error("Conversation no longer available");
 		const sm = targetConv.session.sessionManager as SessionManagerLike;
 		const result = getCompactedMessages(sm, compactionMessageId, (m) => this.uiMessageKey(targetConv, m).n);
 
-		this.emit({
+		send({
 			type: "compacted_messages_result",
 			compactionMessageId,
 			conversationId: targetConv.id,
@@ -15220,10 +15438,50 @@ export class ClientSession {
 	 * Replace a past question and its later history in the same SDK session/file.
 	 * Attachments are re-sent through prompt() after removing the original turn.
 	 */
+	async deleteMessage(messageId: string, conversationId?: string): Promise<void> {
+		if (this.quiesceBlocked()) return;
+		const target = conversationId ? this.convs.get(conversationId) : this.conv;
+		try {
+			if (!target) throw new Error("Conversation is no longer available");
+			const session = target.session;
+			if (session.isStreaming) throw new Error("Stop generation before deleting a message");
+			const manager = session.sessionManager;
+			if (typeof manager.appendContextEdit !== "function")
+				throw new Error("This engine does not support message deletion");
+			const entry = this.resolveMessageEntry(target, messageId);
+			if (!entry) throw new Error("Message not found");
+			const ids = messageDeletionTargets(manager.buildContextEntries(), entry.id);
+			try {
+				for (const id of ids) manager.appendContextEdit(id, null);
+			} catch (error) {
+				// SDK mutates indexes before writing; restore the committed transcript on failure.
+				if (session.sessionFile) manager.setSessionFile(session.sessionFile);
+				throw error;
+			} finally {
+				session.agent.state.messages = manager.buildSessionContext().messages;
+				target.uiMessageCache.clear();
+				target.userSeqByTs.clear();
+				target.lastMessagesSig = "";
+				target.lastMessagesArray = [];
+			}
+			this.invalidateSessionInfos();
+			this.scheduleSessionsRefresh();
+		} catch (error) {
+			this.emit({
+				type: "notice",
+				level: "error",
+				text: `删除消息失败：${(error as Error).message}`,
+				textEn: `Failed to delete message: ${(error as Error).message}`,
+			});
+		}
+		this.flushSnapshot();
+	}
+
 	async editMessage(
 		messageId: string,
 		text: string,
 		attachments?: Parameters<ClientSession["prompt"]>[1],
+		targetConversation?: Conversation,
 	): Promise<void> {
 		if (this.quiesceBlocked()) return;
 		const trimmed = text.trim();
@@ -15238,7 +15496,11 @@ export class ClientSession {
 			this.flushSnapshot();
 			return;
 		}
-		const entryId = this.resolveUserMessageEntryId(messageId);
+		if (targetConversation && this.convs.get(targetConversation.id) !== targetConversation)
+			throw new Error("Edit conversation is no longer available");
+		const entryId = targetConversation
+			? this.resolveUserMessageEntryId(messageId, targetConversation)
+			: this.resolveUserMessageEntryId(messageId);
 		if (!entryId) {
 			this.emit({
 				type: "notice",
@@ -15249,7 +15511,7 @@ export class ClientSession {
 			this.flushSnapshot();
 			return;
 		}
-		const target = this.conv;
+		const target = targetConversation ?? this.conv;
 		const runtime = target.runtime;
 		const session = target.session;
 		const sessionFile = session.sessionFile;
@@ -15555,18 +15817,18 @@ export class ClientSession {
 	 * 恰好应答一次：任何失败都以 ok:false 的 scm_data（kind "commitmsg"）收尾，
 	 * 前端按钮不会卡在转圈。
 	 */
-	async scmGenCommitMessage(reqId: number): Promise<void> {
+	async scmGenCommitMessage(reqId: number, conv = this.conv, send = this.emit.bind(this)): Promise<void> {
 		const lang = this.getLang();
-		const cwd = this.convs.get(this.activeId)?.cwd ?? this.cwd;
+		const cwd = conv.cwd;
 		const reply = (ok: boolean, extra: { text?: string; error?: string }) => {
-			this.emit({ type: "scm_data", reqId, kind: "commitmsg", ok, ...extra });
+			send({ type: "scm_data", reqId, kind: "commitmsg", ok, ...extra });
 		};
 		const fail = (err: unknown) => {
 			reply(false, { error: err instanceof Error ? err.message : String(err) });
 		};
 		try {
-			const runtime = this.runtime.services.modelRuntime;
-			const model = this.session?.model;
+			const runtime = conv.runtime.services.modelRuntime;
+			const model = conv.session?.model;
 			if (!model) {
 				throw new Error(
 					pick(
@@ -15594,6 +15856,18 @@ export class ClientSession {
 		} catch (err) {
 			fail(err);
 		}
+	}
+
+	/** Shared viewers use a captured workspace instead of active getters. */
+	createConversationFiles(conv: Conversation, send: (message: ServerMessage) => void): FilesService {
+		const cwd = conv.cwd;
+		return new FilesService({
+			emit: send,
+			isDisposed: () => this.disposed || this.convs.get(conv.id) !== conv,
+			getCwd: () => cwd,
+			getActiveCwd: () => cwd,
+			getLang: () => this.getLang(),
+		});
 	}
 
 	/** Read a workspace file for the preview panel (size-capped, binary-safe). */
@@ -16302,8 +16576,9 @@ export class ClientSession {
 			execModel?: string;
 			autoStart?: boolean;
 		},
+		conv?: Conversation,
 	): Promise<void> {
-		return this.goalSvc.setGoal(goalText, opts);
+		return this.goalSvc.setGoal(goalText, { ...opts, ...(conv ? { targetConvId: conv.id } : {}) });
 	}
 
 	async startGoalWizard(
@@ -16313,21 +16588,25 @@ export class ClientSession {
 			maxRounds?: number;
 			locked?: boolean;
 		},
+		conv?: Conversation,
 	): Promise<void> {
-		return this.goalSvc.startGoalWizard(text, opts);
+		return this.goalSvc.startGoalWizard(text, opts, conv);
 	}
 
-	async setGoalPrefs(opts?: {
-		reviewModel?: string;
-		maxRounds?: number;
-		locked?: boolean;
-		execModel?: string;
-	}): Promise<void> {
-		return this.goalSvc.setGoalPrefs(opts);
+	async setGoalPrefs(
+		opts?: {
+			reviewModel?: string;
+			maxRounds?: number;
+			locked?: boolean;
+			execModel?: string;
+		},
+		conv?: Conversation,
+	): Promise<void> {
+		return this.goalSvc.setGoalPrefs(opts, conv);
 	}
 
-	async clearGoal(): Promise<void> {
-		return this.goalSvc.clearGoal();
+	async clearGoal(conv?: Conversation): Promise<void> {
+		return this.goalSvc.clearGoal(conv);
 	}
 
 	/**
@@ -16359,10 +16638,10 @@ export class ClientSession {
 	/** Switch to a specific model by "provider/id" (e.g. "anthropic/claude-sonnet-5").
 	 *  失败时只发 notice 不抛错（UI 路径靠 notice 提示，见 cycleModel 等调用方）。
 	 *  需要「失败即拒绝」的无头路径（插件/定时任务）用 switchModelOrThrow。 */
-	async setModel(modelId: string): Promise<void> {
+	async setModel(modelId: string, conv = this.conv): Promise<void> {
 		if (this.botExecution) throw new Error("Bot model is fixed");
 		try {
-			const mr = this.runtime.services.modelRuntime;
+			const mr = conv.runtime.services.modelRuntime;
 			const slash = modelId.indexOf("/");
 			if (slash <= 0 || slash === modelId.length - 1) {
 				throw new Error(`无效的模型 ID：${modelId}`);
@@ -16372,15 +16651,16 @@ export class ClientSession {
 			const model = mr.getModel(provider, id);
 			if (!model) throw new Error(`模型不存在：${modelId}`);
 			// 先恢复 provider key，再 setModel（否则 checkAuth 鉴权失败）
-			await this.restoreKeyForModel(modelId, this.cwd);
-			await this.applySessionModel(this.session, model);
+			await this.restoreKeyForModel(modelId, conv.cwd);
+			if (this.convs.get(conv.id) !== conv) return;
+			await this.applySessionModel(conv.session, model);
 			// Immediately remember the model + the key it uses for the current
 			// project (not only after a turn). This is what makes project switching
 			// restore both the model and the provider key.
-			this.rememberProjectModel(modelId);
+			if (conv === this.conv) this.rememberProjectModel(modelId);
 			// 换模型后按新模型的窗口重算软上限覆盖已由 applySessionModel 完成（issue #229/#773）。
 			// 切换成功 → 立即通知插件（#542：不发消息也能收到）；失败路径落在 catch 里，不发。
-			this.notifyPluginModelChange();
+			if (conv === this.conv) this.notifyPluginModelChange();
 		} catch (err) {
 			this.emit({
 				type: "notice",
@@ -16479,13 +16759,13 @@ export class ClientSession {
 	}
 
 	/** Set the thinking level for future turns. */
-	setThinking(level: string): void {
+	setThinking(level: string, conv = this.conv): void {
 		try {
 			const thinkingLevel = level as Parameters<AgentSession["setThinkingLevel"]>[0];
-			this.session.setThinkingLevel(thinkingLevel, { persist: true });
-			const cur = this.session.model;
+			conv.session.setThinkingLevel(thinkingLevel, { persist: true });
+			const cur = conv.session.model;
 			if (cur) {
-				this.session.settingsManager.setModelThinkingLevel(cur.provider, cur.id, thinkingLevel);
+				conv.session.settingsManager.setModelThinkingLevel(cur.provider, cur.id, thinkingLevel);
 			}
 		} catch (err) {
 			this.emit({
@@ -16518,7 +16798,11 @@ export class ClientSession {
 		this.emit({ type: "notice", level: "info", text: `命令已保存：${path}`, textEn: `Command saved: ${path}` });
 	}
 
+	onDisposed: (() => void) | undefined;
+
 	async dispose(): Promise<void> {
+		this.onDisposed?.();
+		this.onDisposed = undefined;
 		// Escalate incoming decisions while this holder is still live, then close execution identities.
 		for (const conv of this.convs.values()) {
 			for (const request of conversationCommunication.incomingRequests(conv)) {

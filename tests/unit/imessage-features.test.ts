@@ -82,7 +82,7 @@ describe("IMessageBotBridge 双工逻辑测试", () => {
 		const execMock = vi.fn().mockResolvedValue({ stdout: "" });
 
 		let runHandler: ((ev: any) => void) | null = null;
-		const chatSpy = vi.fn().mockResolvedValue({ conversationId: "conv_im_1" });
+		const chatSpy = vi.fn().mockResolvedValue({ conversationId: "conv_im_1", clientId: "legacy-imessage" });
 
 		const bridge = new IMessageBotBridge({
 			host: {
@@ -115,6 +115,7 @@ describe("IMessageBotBridge 双工逻辑测试", () => {
 
 		runHandler!({
 			conversationId: convId,
+			clientId: "legacy-imessage",
 			type: "message",
 			message: {
 				role: "assistant",
@@ -124,6 +125,7 @@ describe("IMessageBotBridge 双工逻辑测试", () => {
 
 		await runHandler!({
 			conversationId: convId,
+			clientId: "legacy-imessage",
 			type: "run_end",
 		});
 

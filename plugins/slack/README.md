@@ -31,7 +31,9 @@
 - 音频/语音及视频以文件收发，不接入实时语音频道、录音或视频通话，不自动转写或解码；模型需要可用的读取、转写或解码工具。下载或投递失败会回复错误。
 - AI `slack` 工具的 `send` 支持 `file` 本地路径（图片、语音文件、普通文件、视频），通过平台上传真实字节；统一上限 20 MiB，平台或工作区可能施加更低限额。上传失败工具抛错；回复投递失败记入 lastError 并通知浏览器。
 - 指令作为普通消息发送；频道内需 @ 机器人，私聊可直接发送。未注册平台原生 slash command。模型/思考设置下一次消息生效，宿主校验无效配置并反馈失败。`default` 恢复插件默认配置。
-- 模型、思考强度、目录和会话映射按用户 + 频道 + thread 隔离（Slack 普通私聊共用该私聊会话），只保存在内存，重启后重置。运行中拒绝第二条任务；`/stop` 可立即取消正在下载的附件并阻止后续派发。`/new`、`/clear`（`/reset`）、`/cwd`（`/workspace`）、`/model`、`/thinking` 修改设置前需先停止并等待；它们会更换账号 epoch，确保 daemon 不复用旧会话。模型或思考强度切换会开启新上下文，无参数查询保留上下文，新建不删除历史。
+- 模型、思考强度、目录和会话映射按用户 + 频道 + thread 隔离（Slack 普通私聊共用该私聊会话），会话映射、设置与 epoch 随 `sessionRoutes` 持久保存，插件重载后可继续同一 scope 的会话。运行中拒绝第二条任务；`/stop` 可立即取消正在下载的附件并阻止后续派发。`/new`、`/clear`（`/reset`）、`/cwd`（`/workspace`）、`/model`、`/thinking` 修改设置前需先停止并等待；它们会更换账号 epoch，确保 daemon 不复用旧会话。模型或思考强度切换会开启新上下文，无参数查询保留上下文，新建不删除历史。
+- 网页续聊须先收到无 `runId` 的 `run_start`，再按已绑定的稳定 SDK `sessionId` 回传到原用户、频道及 thread；旧宿主仅兼容完整 `clientId + conversationId`，不会按匿名 `c1` 认领。带 `runId` 的事件必须与通道回执精确匹配，未知 ID 不借用 session 路由。每轮仅回传最后一个助手正文候选，不拼接工具前言，重复结束事件不重复发送。
+- `/new`、`/reset` 和上下文设置变更撤销旧 epoch 的路由，切换机器人凭据清除旧账号绑定，重载不会复活已撤销路由。网页运行没有精确 `runId` 时，`/stop` 提示到网页停止，不猜测 canonical conversationId。发送仍走原 Slack API，错误保留在 lastError 并通知网页。
 - 收发使用模拟 API 行为测试，未以真实机器人凭据验证平台端到端。
 
 Slack 附件还需 Bot Token scopes `files:read`、`files:write`（修改 scopes 后重新安装应用）。上传使用 `files.getUploadURLExternal` + 字节上传 + `files.completeUploadExternal`；频道中的文件消息仍需 @ 机器人，回复保持原 thread。私有文件下载只接受 `files.slack.com` 且不跟随重定向。

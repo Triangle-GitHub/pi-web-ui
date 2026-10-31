@@ -68,16 +68,18 @@ describe("Matrix channel behavior", () => {
 		expect(sent.some((s) => s.body.includes("未知命令"))).toBe(true);
 	});
 	it("rotates daemon account identity for new, clear, cwd and model", async () => {
-		const { inbound, host, bridge } = setup();
+		const { inbound, host, bridge } = setup(
+			vi.fn(async (request: any) => ({ conversationId: "c1", runId: `run:${request.accountId}` })),
+		);
 		const accounts = [];
 		await inbound("first");
 		accounts.push(host.chat.mock.calls.at(-1)[0].accountId);
-		await bridge.handleRunEvent({ type: "run_end", runId: "stable" });
+		await bridge.handleRunEvent({ type: "run_end", runId: (await host.chat.mock.results.at(-1).value).runId });
 		for (const command of ["/new", "/clear", `/cwd ${process.cwd()}`, "/model test/model"]) {
 			await inbound(command);
 			await inbound("next");
 			accounts.push(host.chat.mock.calls.at(-1)[0].accountId);
-			await bridge.handleRunEvent({ type: "run_end", runId: "stable" });
+			await bridge.handleRunEvent({ type: "run_end", runId: (await host.chat.mock.results.at(-1).value).runId });
 		}
 		expect(new Set(accounts).size).toBe(5);
 	});

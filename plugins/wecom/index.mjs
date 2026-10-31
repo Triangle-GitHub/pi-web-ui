@@ -8,6 +8,7 @@
 
 import { createHash, randomUUID } from "node:crypto";
 import { chunkMarkdownText } from "./markdown-chunks.mjs";
+import { SessionRoutes, accountKey, identityKey, scopeKey } from "./session-routes.mjs";
 
 export const SECRET_CORP_SECRET = "wecom.corpSecret";
 export const SECRET_WEBHOOK_KEY = "wecom.webhookKey";
@@ -97,6 +98,9 @@ export class WecomBotBridge {
 		this.dispatching = new Map();
 		this.epochs = new Map();
 		this.instanceId = randomUUID();
+		this.sessionRoutes = new SessionRoutes(host, getConfig, this.log);
+		this.completedRuns = new Set();
+		this.generation = 0;
 
 		this.status = {
 			enabled: false,
@@ -120,6 +124,7 @@ export class WecomBotBridge {
 
 	async start() {
 		if (this.running) return;
+		await this.sessionRoutes.ready;
 		this.running = true;
 		this.status.enabled = true;
 		this.status.connected = false;
@@ -133,6 +138,11 @@ export class WecomBotBridge {
 
 	async stop() {
 		this.running = false;
+		this.generation++;
+		this.pendingRuns.clear();
+		this.dispatching.clear();
+		this.earlyRuns.clear();
+		await this.sessionRoutes.saving;
 		this.status.enabled = false;
 		this.status.connected = false;
 		this.status.state = "idle";
@@ -158,16 +168,18 @@ export class WecomBotBridge {
 
 	async onInboundMessage(event) {
 		if (!event) return;
+		await this.sessionRoutes.ready;
+		await this.sessionRoutes.syncAccount();
 		const cfg = this.getConfig();
 		const sender = String(event.fromUserName || event.FromUserName || event.userId || "");
 		if (!sender) return;
 		const allowed = (cfg.allowedUsers || []).map(String);
 		if (allowed.length && !allowed.includes(sender)) return;
 		const webhookKey = event.webhookKey || cfg.webhookKey || "";
-		const scope = createHash("sha256")
-			.update(JSON.stringify([sender, webhookKey, event.chatId || event.ChatId || "", event.threadId || ""]))
-			.digest("hex")
-			.slice(0, 24);
+		const scope = scopeKey(event, sender, webhookKey, cfg);
+		this.epochs.set(scope, this.sessionRoutes.state(scope).epoch);
+		const generation = this.generation;
+		const account = accountKey(cfg);
 		const msgId = event.msgId || event.MsgId;
 		if (msgId) {
 			const id = scope + ":" + msgId;
@@ -211,9 +223,9 @@ export class WecomBotBridge {
 		const prefs = this.preferences.get(scope) || {};
 		const req = {
 			text: text.slice(0, 8000),
-			accountId: peerAccountId(this.instanceId + ":" + scope + ":" + epoch),
+			accountId: peerAccountId(scope + ":" + epoch),
 		};
-		const conversationId = this.userConversations.get(scope);
+		const conversationId = this.userConversations.get(scope) || this.sessionRoutes.state(scope).conversationId;
 		if (conversationId) req.conversationId = conversationId;
 		const cwd = this.resolveWorkspace(scope, cfg);
 		if (cwd) req.cwd = cwd;
@@ -222,26 +234,46 @@ export class WecomBotBridge {
 		this.dispatching.set(scope, epoch);
 		try {
 			const result = await this.host.chat(req);
-			if ((this.epochs.get(scope) || 0) !== epoch) {
+			if (
+				generation !== this.generation ||
+				account !== accountKey(this.getConfig()) ||
+				(this.epochs.get(scope) || 0) !== epoch
+			) {
 				this.abortDetachedRun(result);
 				return;
 			}
 			if (!result?.conversationId) throw new Error("宿主未返回真实会话 ID");
 			this.userConversations.set(scope, result.conversationId);
-			const key = result.runId || result.conversationId;
-			this.pendingRuns.set(key, {
+			this.sessionRoutes.state(scope).conversationId = result.conversationId;
+			const key = result.runId ? `run:${result.runId}` : identityKey(result) || `receipt:${randomUUID()}`;
+			const run = {
 				scope,
 				epoch,
 				webhookKey,
 				conversationId: result.conversationId,
 				runId: result.runId,
+				sessionId: result.sessionId,
+				clientId: result.clientId,
+				account,
+				generation,
 				accumulatedText: "",
-			});
+			};
+			this.pendingRuns.set(key, run);
+			await this.sessionRoutes.bind(result, run);
+			if (!this.validRun(run)) {
+				this.pendingRuns.delete(key);
+				return;
+			}
 			const early = this.earlyRuns.get(key) || [];
 			this.earlyRuns.delete(key);
 			for (const ev of early) await this.handleRunEvent(ev);
 		} catch (err) {
-			if ((this.epochs.get(scope) || 0) !== epoch) return;
+			if (
+				generation !== this.generation ||
+				account !== accountKey(this.getConfig()) ||
+				(this.epochs.get(scope) || 0) !== epoch
+			)
+				return;
 			this.log("warn", "WeCom dispatch failed: " + err.message);
 			await this.reply(webhookKey, "投递失败：" + err.message);
 		} finally {
@@ -251,7 +283,7 @@ export class WecomBotBridge {
 	}
 
 	abortDetachedRun(run) {
-		if (!run || !this.host.abortRun) return;
+		if (!run?.runId || !this.host.abortRun) return;
 		Promise.resolve()
 			.then(() => this.host.abortRun(run.runId || run.conversationId))
 			.catch((err) => this.log("warn", "WeCom detached run abort failed: " + err.message));
@@ -260,7 +292,8 @@ export class WecomBotBridge {
 	resetScope(scope) {
 		// Rotate the host account too: omitting conversationId alone can reuse
 		// the host account's old conversation and pending queue.
-		this.epochs.set(scope, (this.epochs.get(scope) || 0) + 1);
+		this.sessionRoutes.reset(scope);
+		this.epochs.set(scope, this.sessionRoutes.state(scope).epoch);
 		this.userConversations.delete(scope);
 		this.dispatching.delete(scope);
 		for (const [key, run] of this.pendingRuns) {
@@ -269,6 +302,15 @@ export class WecomBotBridge {
 			this.earlyRuns.delete(key);
 			this.abortDetachedRun(run);
 		}
+		return this.sessionRoutes.save();
+	}
+
+	validRun(run) {
+		return (
+			run.generation === this.generation &&
+			run.account === accountKey(this.getConfig()) &&
+			this.sessionRoutes.state(run.scope).epoch === run.epoch
+		);
 	}
 
 	async handleSlashCommand(cmdText, { userId, webhookKey, cfg }) {
@@ -294,7 +336,9 @@ export class WecomBotBridge {
 					await send("当前没有运行中的任务。");
 					return true;
 				}
-				const result = await this.host.abortRun?.(run.runId || run.conversationId);
+				const result = run.runId
+					? await this.host.abortRun?.(run.runId)
+					: { ok: false, error: "宿主未提供精确 runId，无法安全中止此任务" };
 				await send(result?.ok ? "已请求停止当前任务。" : "停止失败：" + (result?.error || "宿主不支持中止"));
 				return true;
 			}
@@ -313,7 +357,7 @@ export class WecomBotBridge {
 					}
 					prefs[cmd === "/model" ? "model" : "thinkingLevel"] = value === "default" ? undefined : value;
 					this.preferences.set(userId, prefs);
-					this.resetScope(userId);
+					await this.resetScope(userId);
 				}
 				await send(
 					"模型：" +
@@ -333,16 +377,19 @@ export class WecomBotBridge {
 					return true;
 				}
 				this.userWorkspaces.set(userId, arg.toLowerCase() === "default" ? "" : arg);
-				this.resetScope(userId);
+				await this.resetScope(userId);
 				await send("项目根目录已设置：" + arg + "\n下次投递由宿主验证路径并创建新会话。");
 				return true;
 			case "/clear":
 			case "/new":
-			case "/reset":
-				this.resetScope(userId);
-				if (prompt.trim()) return { prompt, epoch: this.epochs.get(userId) };
+			case "/reset": {
+				const saving = this.resetScope(userId);
+				const epoch = this.epochs.get(userId);
+				await saving;
+				if (prompt.trim()) return { prompt, epoch };
 				await send("已清空当前上下文，下次消息开启全新会话。");
 				return true;
+			}
 			case "/status":
 				await send(
 					"内部桥接状态：" +
@@ -362,10 +409,27 @@ export class WecomBotBridge {
 	}
 
 	async handleRunEvent(ev) {
-		const convId = ev.runId || ev.conversationId;
-		if (!convId) return;
-		if (!this.pendingRuns.has(convId)) {
-			if (this.dispatching.size && ["message", "run_end"].includes(ev.type)) {
+		await this.sessionRoutes.ready;
+		await this.sessionRoutes.syncAccount();
+		const identity = identityKey(ev);
+		let convId = ev.runId ? `run:${ev.runId}` : identity;
+		if (!convId || (ev.runId && this.completedRuns.has(convId))) return;
+		let owner = this.pendingRuns.get(convId);
+		if (!owner && !ev.runId && identity) {
+			const matches = [...this.pendingRuns].filter(([, run]) => identityKey(run) === identity);
+			if (matches.length === 1) [convId, owner] = matches[0];
+		}
+		if (!owner && !ev.runId && ev.type === "run_start") {
+			const route = this.sessionRoutes.routes.get(identity);
+			if (!this.sessionRoutes.valid(route)) return;
+			owner = { ...route, route, generation: this.generation, accumulatedText: "", web: true };
+			this.pendingRuns.set(convId, owner);
+			owner.ready = this.sessionRoutes.destination(route).then((key) => {
+				owner.webhookKey = key;
+			});
+		}
+		if (!owner) {
+			if (ev.runId && this.dispatching.size) {
 				if (!this.earlyRuns.has(convId) && this.earlyRuns.size >= 64) return;
 				const early = this.earlyRuns.get(convId) || [];
 				if (early.length < 128) early.push(ev);
@@ -373,11 +437,21 @@ export class WecomBotBridge {
 			}
 			return;
 		}
-		const owner = this.pendingRuns.get(convId);
-		if ((this.epochs.get(owner.scope) || 0) !== owner.epoch) return;
-		if (ev.conversationId) {
+		if (owner.ready) await owner.ready;
+		if (!this.validRun(owner) || (owner.sessionId && ev.sessionId && owner.sessionId !== ev.sessionId)) return;
+		if (
+			!ev.sessionId &&
+			owner.clientId &&
+			ev.clientId &&
+			(owner.clientId !== ev.clientId || owner.conversationId !== ev.conversationId)
+		)
+			return;
+
+		if (ev.runId && ev.conversationId) {
 			owner.conversationId = ev.conversationId;
 			this.userConversations.set(owner.scope, ev.conversationId);
+			this.sessionRoutes.state(owner.scope).conversationId = ev.conversationId;
+			void this.sessionRoutes.save().catch((err) => this.log("warn", err.message));
 		}
 
 		if (ev.type === "message" && ev.message) {
@@ -391,11 +465,11 @@ export class WecomBotBridge {
 					.trim();
 			}
 
-			if (content && (m.role === "assistant" || m.author === "assistant")) {
-				if (this.pendingRuns.has(convId)) {
-					const r = this.pendingRuns.get(convId);
-					r.accumulatedText += (r.accumulatedText ? "\n" : "") + content;
-				}
+			if (m.role === "assistant" || m.author === "assistant") {
+				owner.accumulatedText =
+					m.stopReason === "toolUse" || (Array.isArray(m.content) && m.content.some((part) => part.type === "toolCall"))
+						? ""
+						: content;
 			}
 			return;
 		}
@@ -406,6 +480,8 @@ export class WecomBotBridge {
 
 			this.pendingRuns.delete(convId);
 			this.earlyRuns.delete(convId);
+			if (ev.runId) this.completedRuns.add(convId);
+			while (this.completedRuns.size > 500) this.completedRuns.delete(this.completedRuns.values().next().value);
 
 			const rawText = run.accumulatedText || "";
 			const cleanText = stripInternalMarkers(rawText);
@@ -421,30 +497,23 @@ export class WecomBotBridge {
 			// 纯中文时 2048 字 ≈ 6KB UTF-8 → 平台返回 errcode≠0 直接丢——按字节数
 			// 切（3900 字节内）
 			const chunks = chunkByUtf8Bytes(finalText, 3900);
-			const cfg = this.getConfig();
-			const key = run.webhookKey || cfg.webhookKey;
-
+			const key = run.webhookKey;
+			if (!key) {
+				this.status.lastError = "回复失败：原目的地 Webhook 不可用";
+				this.log("warn", this.status.lastError);
+				return;
+			}
 			if (key) {
 				try {
-					const url = `https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=${key}`;
 					for (const chunk of chunks) {
-						if ((this.epochs.get(run.scope) || 0) !== run.epoch) return;
-						const res = await fetch(url, {
-							method: "POST",
-							headers: { "content-type": "application/json; charset=utf-8" },
-							body: JSON.stringify(buildWecomMessage({ msgType: "markdown", title: "AI 回复", text: chunk })),
-						});
-						// 回复路径此前不查 errcode：平台拒绝（超限/限频）被当成功，
-						// AI 回复整段静默丢失（sendWebhookMessage 是查的，口径不一）
-						const json = await res.json().catch(() => ({}));
-						if (!res.ok || json.errcode !== 0) {
-							throw new Error(`WeCom error ${json.errcode ?? res.status}: ${json.errmsg ?? res.statusText}`);
-						}
+						if (!this.validRun(run)) return;
+						await this.reply(key, chunk);
 					}
 					this.status.messagesReplied++;
 					this.status.lastReplyAt = Date.now();
 				} catch (err) {
-					this.log("warn", `WeCom delivery failed: ${err.message}`);
+					this.status.lastError = `WeCom delivery failed: ${err.message}`;
+					this.log("warn", this.status.lastError);
 				}
 			}
 		}
@@ -611,6 +680,7 @@ export default async function activate(host) {
 					const incoming = msg.config || {};
 					const secrets = (await host.secrets?.getAll?.()) || {};
 					localConfig = mergeSavedSecrets(incoming, localConfig, secrets);
+					await botBridge.sessionRoutes.syncAccount();
 
 					if (host.secrets) {
 						if (localConfig.corpSecret) {

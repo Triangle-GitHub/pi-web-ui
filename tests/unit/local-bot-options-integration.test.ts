@@ -7,7 +7,7 @@ import { dirname, join } from "node:path";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { getLocalBotOptions, type BotCatalogSources } from "../../server/device-center/bot-catalog.js";
 import { installLocalDeviceCenter } from "../../server/device-center/local.js";
-import { registerBotExecution, isBotToolAllowed } from "../../server/device-center/bot-execution.js";
+import { registerBotExecution, isBotToolHighPrivilege } from "../../server/device-center/bot-execution.js";
 import type { LocalBot } from "../../server/device-center/bots.js";
 
 const cleanup: (() => Promise<unknown> | void)[] = [];
@@ -107,9 +107,10 @@ describe("Local Bot catalog real SDK/config integration", () => {
 		expect(result.mcpServers.filter((server) => server.id === "shared")).toHaveLength(1);
 		expect(JSON.stringify(result)).not.toMatch(/fixture-private|must-never-start|Authorization/);
 		expect(peek).toHaveBeenCalledExactlyOnceWith(f.cwd);
-		expect(result.tools.every((tool) => isBotToolAllowed(tool.id))).toBe(true);
-		for (const barred of ["conversation", "subagent", "browser_page", "mcp_manage", "codemode"])
-			expect(result.tools.some((tool) => tool.id === barred)).toBe(false);
+		for (const name of ["conversation", "browser_page", "mcp_manage", "codemode"]) {
+			expect(isBotToolHighPrivilege(name)).toBe(true);
+			expect(result.tools.find((tool) => tool.id === name)).toMatchObject({ warning: "high_privilege" });
+		}
 		const binding = registerBotExecution({
 			id: "fixture-bot",
 			name: "Fixture",

@@ -372,6 +372,8 @@ export interface ChatState {
 	/** 待用户审批的高危工具调用（Human-in-the-Loop: Edit & Run）。 */
 	approval: UiToolApproval | null;
 	approvals: UiToolApproval[];
+	globalQuestions: UiPendingQuestion[];
+	globalApprovals: UiToolApproval[];
 	/** 待用户回答的模型提问（ask_user_question）——两个引擎共用。服务端是事实源：
 	 *  即时通道（question_pending）+ 快照（UiState.pendingQuestion，见 syncPendingQuestion）。 */
 	question: UiPendingQuestion | null;
@@ -765,6 +767,9 @@ type Action =
 				conversationTitle?: string;
 			} | null;
 	  }
+	| { type: "global_interactions"; questions: UiPendingQuestion[]; approvals: UiToolApproval[] }
+	| { type: "global_question"; question?: UiPendingQuestion; id: string; owner?: string }
+	| { type: "global_approval"; approval?: UiToolApproval; id: string; owner?: string }
 	| { type: "question_queue"; questions: UiQueuedQuestion[] }
 	| { type: "question_queue_answered"; id: string; owner?: string }
 	| { type: "commands"; commands: CommandDef[]; path: string }
@@ -954,7 +959,18 @@ function pruneToolStatuses(statuses: Map<string, ToolStatus>, state: UiState): M
 	return changed ? new Map(statuses) : statuses;
 }
 
-function reducer(state: ChatState, action: Action): ChatState {
+function updateGlobalPending<T extends { id: string; owner?: string }>(
+	items: T[],
+	id: string,
+	owner: string | undefined,
+	item?: T,
+): T[] {
+	const next = items.filter((entry) => entry.id !== id || entry.owner !== owner);
+	if (item) next.push(item);
+	return next;
+}
+
+export function reducer(state: ChatState, action: Action): ChatState {
 	switch (action.type) {
 		case "status":
 			return {
@@ -1299,6 +1315,18 @@ function reducer(state: ChatState, action: Action): ChatState {
 			return { ...state, dialog: action.dialog };
 		case "tui_overlay":
 			return { ...state, tuiOverlay: action.overlay };
+		case "global_interactions":
+			return { ...state, globalQuestions: action.questions, globalApprovals: action.approvals };
+		case "global_question":
+			return {
+				...state,
+				globalQuestions: updateGlobalPending(state.globalQuestions, action.id, action.owner, action.question),
+			};
+		case "global_approval":
+			return {
+				...state,
+				globalApprovals: updateGlobalPending(state.globalApprovals, action.id, action.owner, action.approval),
+			};
 		case "question":
 			return { ...state, question: action.question };
 		case "remote_question":
@@ -1870,6 +1898,8 @@ export function useChat() {
 		tuiOverlay: null,
 		approval: null,
 		approvals: [],
+		globalQuestions: [],
+		globalApprovals: [],
 		question: null,
 		questionQueue: null,
 		remoteQuestion: null,
@@ -2136,7 +2166,9 @@ export function useChat() {
 			// 提交/取消模型提问后立即收起对话框：服务端只 resolve 模型侧 Promise，
 			// 不会发任何回执清除前端面板（否则会出现“回答后不消失、取消无效”）。
 			// 模型再次 ask_user_question 时会重新 question_pending，面板自动回来。
-			if (msg.type === "question_answer") {
+			if (msg.type === "question_answer" && msg.global) {
+				dispatch({ type: "global_question", id: msg.id, owner: msg.owner });
+			} else if (msg.type === "question_answer") {
 				dispatch({ type: "question_queue_answered", id: msg.id, owner: msg.owner });
 				if (msg.owner) {
 					// Queued pi requests use stable UUIDs, including the local pending mirror.
@@ -2655,7 +2687,14 @@ export function useChat() {
 					resetTuiOverlayRender();
 					dispatch({ type: "tui_overlay", overlay: null });
 					break;
+				case "global_interactions":
+					dispatch(msg);
+					break;
 				case "question_pending":
+					if (msg.global) {
+						dispatch({ type: "global_question", id: msg.id, owner: msg.owner, question: msg });
+						break;
+					}
 					questionSourceRef.current = "live";
 					dispatch({
 						type: "question",
@@ -2669,6 +2708,10 @@ export function useChat() {
 					});
 					break;
 				case "tool_approval_pending":
+					if (msg.global) {
+						dispatch({ type: "global_approval", id: msg.id, owner: msg.owner, approval: msg });
+						break;
+					}
 					dispatch({
 						type: "tool_approval",
 						approval: {
@@ -2687,9 +2730,17 @@ export function useChat() {
 					});
 					break;
 				case "tool_approval_resolved":
+					if (msg.global) {
+						dispatch({ type: "global_approval", id: msg.id, owner: msg.owner });
+						break;
+					}
 					dispatch({ type: "tool_approval", approval: null, resolvedId: msg.id });
 					break;
 				case "question_retracted": {
+					if (msg.global) {
+						dispatch({ type: "global_question", id: msg.id, owner: msg.owner });
+						break;
+					}
 					if (chatApi.current.chat.remoteQuestion?.id === msg.id) {
 						dispatch({ type: "remote_question", question: null });
 					}

@@ -172,6 +172,22 @@ export function createDeviceTaskExecutor(options: DeviceTaskExecutorOptions) {
 				let capturedPath: string | undefined;
 				let settled = false;
 				let idleConfirmed = false;
+				// Immediate notifications can precede snapshots. Keep them until an
+				// explicit resolution or a snapshot-observed wait has disappeared.
+				const humanWaits = new Set<string>();
+				let snapshotWaits = new Set<string>();
+				let queuedQuestions = new Set<string>();
+				let waitingForHuman = false;
+				const belongsToTask = (entry: { conversationId?: string }) =>
+					!entry.conversationId || entry.conversationId === conversationId;
+				const waitsInSnapshot = (value: UiState) => {
+					const ids = new Set<string>();
+					if (value.pendingQuestion && belongsToTask(value.pendingQuestion))
+						ids.add(`question:${value.pendingQuestion.id}`);
+					for (const approval of [value.pendingApproval, ...(value.pendingApprovals ?? [])])
+						if (approval && belongsToTask(approval)) ids.add(`approval:${approval.id}`);
+					return ids;
+				};
 				let stopBaselineRev = -1;
 				let stopTimer: ReturnType<typeof setTimeout> | undefined;
 				let resolveStopped!: () => void;
@@ -261,8 +277,20 @@ export function createDeviceTaskExecutor(options: DeviceTaskExecutorOptions) {
 						);
 					else resolveRun(result);
 				};
-				const timer = setTimeout(() => finish("20 minute timeout; no automatic retry"), TIMEOUT_MS);
-				timer.unref();
+				let timer: ReturnType<typeof setTimeout> | undefined;
+				const armTimeout = () => {
+					clearTimeout(timer);
+					timer = setTimeout(() => finish("20 minute timeout; no automatic retry"), TIMEOUT_MS);
+					timer.unref();
+				};
+				const updateHumanWait = () => {
+					const waiting = humanWaits.size > 0 || queuedQuestions.size > 0;
+					if (waiting === waitingForHuman) return;
+					waitingForHuman = waiting;
+					if (waiting) clearTimeout(timer);
+					else armTimeout();
+				};
+				armTimeout();
 				cancel = () => finish("Executor closed; task cancelled");
 				try {
 					ws = new WebSocket(wsUrl, {
@@ -310,10 +338,33 @@ export function createDeviceTaskExecutor(options: DeviceTaskExecutorOptions) {
 						}
 						return;
 					}
-					if (phase === "run" && (message.type === "question_pending" || message.type === "tool_approval_pending")) {
-						if (!message.conversationId || message.conversationId === conversationId)
-							finish("Task paused for local human question/approval; execution aborted, inspect retained conversation");
-						return;
+					if (phase === "run") {
+						if (message.type === "question_pending" || message.type === "tool_approval_pending") {
+							if (belongsToTask(message)) {
+								humanWaits.add(`${message.type === "question_pending" ? "question" : "approval"}:${message.id}`);
+								updateHumanWait();
+							}
+							return;
+						}
+						if (message.type === "question_retracted" || message.type === "tool_approval_resolved") {
+							const id = `${message.type === "question_retracted" ? "question" : "approval"}:${message.id}`;
+							humanWaits.delete(id);
+							queuedQuestions.delete(id);
+							updateHumanWait();
+							send({ type: "get_state" });
+							return;
+						}
+						if (message.type === "question_queue") {
+							queuedQuestions = new Set(
+								message.questions
+									.filter((q) => q.conversationId === conversationId || q.rootConversationId === conversationId)
+									.map((q) => `question:${q.id}`),
+							);
+							for (const id of humanWaits)
+								if (id.startsWith("question:") && !queuedQuestions.has(id)) humanWaits.delete(id);
+							updateHumanWait();
+							return;
+						}
 					}
 					if (message.type === "snapshot") state = message.state;
 					else if (message.type === "snapshot_delta") {
@@ -336,8 +387,7 @@ export function createDeviceTaskExecutor(options: DeviceTaskExecutorOptions) {
 							!state.isStreaming &&
 							!state.retry &&
 							!state.streamingMessage &&
-							!state.pendingQuestion &&
-							!state.pendingApproval
+							waitsInSnapshot(state).size === 0
 						)
 							confirmStopped();
 						return;
@@ -359,8 +409,8 @@ export function createDeviceTaskExecutor(options: DeviceTaskExecutorOptions) {
 						} else {
 							phase = "new";
 							baselineRev = state.rev;
-							if (options.resumePath) send({ type: "switch_session", path: options.resumePath });
-							else send({ type: "new_chat", ephemeral: false });
+							if (options.resumePath) send({ type: "switch_session", path: options.resumePath, independent: false });
+							else send({ type: "new_chat", ephemeral: false, independent: false });
 						}
 						return;
 					}
@@ -431,11 +481,13 @@ export function createDeviceTaskExecutor(options: DeviceTaskExecutorOptions) {
 							return;
 						}
 					}
-					if (state.pendingQuestion || state.pendingApproval) {
-						finish("Task paused for local human question/approval; execution aborted, inspect retained conversation");
-						return;
-					}
+					const nextWaits = waitsInSnapshot(state);
+					for (const id of snapshotWaits) if (!nextWaits.has(id)) humanWaits.delete(id);
+					for (const id of nextWaits) humanWaits.add(id);
+					snapshotWaits = nextWaits;
+					updateHumanWait();
 					sawRunning ||= state.isStreaming;
+					if (waitingForHuman) return;
 					if (state.isStreaming || state.retry || state.streamingMessage) return;
 					if (state.rev <= promptRev) return;
 					const assistant = state.messages.filter((m) => m.role === "assistant" && !priorMessageIds.has(m.id));

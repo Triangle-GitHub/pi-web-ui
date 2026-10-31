@@ -28,6 +28,7 @@ interface QuestionItem {
 interface QuestionDialogProps {
 	question: {
 		id: string;
+		global?: boolean;
 		/** 服务端超时时间戳（epoch ms）——仅显示倒计时，由服务端处理超时。 */
 		deadline?: number;
 		conversationId?: string;
@@ -57,13 +58,14 @@ interface QuestionDialogProps {
  */
 export function QuestionDialog({ question, owner, conversationTitle, onDefer, onNavigate }: QuestionDialogProps) {
 	const t = useT();
+	const draftId = question.global ? JSON.stringify([owner, question.id]) : question.id;
 	const convTitle = question.conversationTitle || conversationTitle;
 	const [selections, setSelections] = useState<Record<string, string[]>>(() => {
-		const draft = loadQuestionDraft(question.id);
+		const draft = loadQuestionDraft(draftId);
 		return draft?.selections ?? {};
 	});
 	const [customs, setCustoms] = useState<Record<string, string>>(() => {
-		const draft = loadQuestionDraft(question.id);
+		const draft = loadQuestionDraft(draftId);
 		return draft?.customs ?? {};
 	});
 	const [collapsed, setCollapsed] = useState(false);
@@ -78,7 +80,7 @@ export function QuestionDialog({ question, owner, conversationTitle, onDefer, on
 	const imeGuard = useImeCompositionGuard();
 	/** 向导当前步（question.questions 下标），支持从草稿恢复。 */
 	const [step, setStep] = useState<number>(() => {
-		const draft = loadQuestionDraft(question.id);
+		const draft = loadQuestionDraft(draftId);
 		return draft?.step ?? 0;
 	});
 	// Display only: the server owns timeout resolution.
@@ -91,7 +93,7 @@ export function QuestionDialog({ question, owner, conversationTitle, onDefer, on
 	useEffect(() => {
 		submittedRef.current = false;
 		// 优先从草稿恢复，未找到草稿才重置本地状态。
-		const draft = loadQuestionDraft(question.id);
+		const draft = loadQuestionDraft(draftId);
 		if (draft) {
 			setSelections(draft.selections);
 			setCustoms(draft.customs);
@@ -109,7 +111,7 @@ export function QuestionDialog({ question, owner, conversationTitle, onDefer, on
 	// 草稿自动暂存：作答状态变更时即时同步到持久化存储（切会话/刷新防丢）
 	useEffect(() => {
 		if (submittedRef.current) return;
-		saveQuestionDraft(question.id, { selections, customs, step });
+		saveQuestionDraft(draftId, { selections, customs, step });
 	}, [question.id, selections, customs, step]);
 
 	useEffect(() => {
@@ -125,12 +127,13 @@ export function QuestionDialog({ question, owner, conversationTitle, onDefer, on
 	const cancel = useCallback(
 		(reason?: string) => {
 			submittedRef.current = true;
-			clearQuestionDraft(question.id);
+			clearQuestionDraft(draftId);
 			appSend({
 				type: "question_answer",
 				id: question.id,
 				answers: [],
 				cancelled: true,
+				...(question.global ? { global: true } : {}),
 				...(reason?.trim() ? { cancelReason: reason.trim() } : {}),
 				...(owner ? { owner } : {}),
 			});
@@ -167,6 +170,7 @@ export function QuestionDialog({ question, owner, conversationTitle, onDefer, on
 				id: question.id,
 				answers: [],
 				cancelled: true,
+				...(question.global ? { global: true } : {}),
 				...(owner ? { owner } : {}),
 			});
 		}, 1500);
@@ -217,7 +221,7 @@ export function QuestionDialog({ question, owner, conversationTitle, onDefer, on
 	/** 把（可能刚更新、尚未落 state 的）选中结果连同全部题的答案一并提交。 */
 	const submitSelections = (sel: Record<string, string[]>) => {
 		submittedRef.current = true;
-		clearQuestionDraft(question.id);
+		clearQuestionDraft(draftId);
 		const answers = question.questions
 			.filter((qq) => isQuestionVisible(qq, sel))
 			.map((qq) => {
@@ -225,7 +229,13 @@ export function QuestionDialog({ question, owner, conversationTitle, onDefer, on
 				const custom = (customs[qq.id] ?? "").trim();
 				return { id: qq.id, selected, ...(custom ? { custom } : {}) };
 			});
-		appSend({ type: "question_answer", id: question.id, answers, ...(owner ? { owner } : {}) });
+		appSend({
+			type: "question_answer",
+			id: question.id,
+			answers,
+			...(question.global ? { global: true } : {}),
+			...(owner ? { owner } : {}),
+		});
 	};
 
 	const toggleOption = (qid: string, label: string) => {

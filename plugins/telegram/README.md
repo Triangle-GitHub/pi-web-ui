@@ -4,6 +4,8 @@ Telegram Bot API long polling integration. Configure a BotFather token in the pl
 
 Private chats accept messages directly. In groups, mention `@yourbot`, use `/command@yourbot`, or reply to the bot. Commands addressed to other bots are ignored. Sessions, model, thinking and workspace preferences are isolated by chat ID, forum topic ID and sender ID. Replies retain the originating topic and message. Preferences are in memory and reset when the plugin restarts. Active runs are tracked by the host's stable `runId`, including events arriving before the chat receipt and conversation renames.
 
+Stable host `sessionId` routes and conversation choices persist across plugin restarts, retaining the bot account, chat, topic, sender and reset epoch. Continuing that same session on the web sends its final assistant message back to the original Telegram destination once. Intermediate tool preambles are replaced by the last assistant candidate. Older hosts require the complete client ID and conversation ID; bare `c1` and unknown run IDs cannot claim a route. `/new` and account changes revoke old routes. Reload preserves routes without reviving reset sessions. A web run without a run ID can be detached from delivery, but cannot be precisely aborted; the command reports this limitation. Delivery and persistence failures appear in plugin status/logs.
+
 Commands:
 
 - `/help` (`/start`): list commands.

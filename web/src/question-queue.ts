@@ -3,6 +3,8 @@ import type { ClientMessage, UiPendingQuestion, UiQueuedQuestion } from "./types
 export type QuestionQueueMode = "queue" | "all" | "manual";
 
 export function questionNavigation(question: QueueQuestion): ClientMessage | undefined {
+	if (question.global && question.owner && question.conversationId)
+		return { type: "open_shared_conversation", owner: question.owner, id: question.conversationId };
 	if (question.owner) return { type: "navigate_question", id: question.id };
 	const id = question.conversationId ?? question.rootConversationId;
 	return id ? { type: "switch_conversation", id } : undefined;
@@ -32,9 +34,18 @@ export function resolveQuestionQueue(
 	queue: UiQueuedQuestion[] | null,
 	question: UiPendingQuestion | null,
 	remoteQuestion: RemoteQuestion | null,
+	globalQuestions: UiPendingQuestion[] = [],
+	sharedOwner?: string,
 ): QueueQuestion[] {
+	const global = globalQuestions.map((q) => ({
+		...q,
+		global: true,
+		audience: "user" as const,
+		createdAt: q.createdAt ?? 0,
+	}));
+	const merge = (local: QueueQuestion[]) => mergeOwnedPending(local, global, sharedOwner);
 	// Once available, the entire queue is authoritative, including an empty queue.
-	if (queue !== null) return queue.filter((q) => q.audience === "user");
+	if (queue !== null) return merge(queue.filter((q) => q.audience === "user"));
 	const result: QueueQuestion[] = [];
 	// Older engines without the queue protocol retain both legacy channels.
 	for (const fallback of [
@@ -54,7 +65,23 @@ export function resolveQuestionQueue(
 				: !fallback.conversationId || q.conversationId === fallback.conversationId);
 		if (!result.some(matches)) result.push(fallback);
 	}
-	return result;
+	return merge(result);
+}
+
+/** A shared snapshot mirrors the owner's local interactions. Global copies take precedence. */
+export function mergeOwnedPending<T extends { id: string; owner?: string; global?: boolean }>(
+	local: T[],
+	global: T[],
+	sharedOwner?: string,
+): T[] {
+	const merged = new Map<string, T>();
+	for (const entry of [
+		...local.map((item) => (sharedOwner && !item.owner ? { ...item, owner: sharedOwner, global: true } : item)),
+		...global,
+	]) {
+		merged.set(JSON.stringify([entry.owner ?? "", entry.id]), entry);
+	}
+	return [...merged.values()];
 }
 
 /** IDs are scoped to their owner; two engines may both issue q1. */
@@ -79,6 +106,6 @@ export function automaticQuestion(
 	return questions.find(
 		(q) =>
 			!deferred.has(questionQueueKey(q)) &&
-			(mode === "all" || q.conversationId === activeConversationId || !q.conversationId),
+			(q.global || mode === "all" || q.conversationId === activeConversationId || !q.conversationId),
 	);
 }

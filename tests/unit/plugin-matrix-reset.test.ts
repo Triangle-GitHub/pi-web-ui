@@ -6,7 +6,10 @@ afterEach(() => vi.unstubAllGlobals());
 function setup() {
 	const host = {
 		cwd: process.cwd(),
-		chat: vi.fn<(request: any) => Promise<any>>(async () => ({ conversationId: "actual", runId: "run" })),
+		chat: vi.fn<(request: any) => Promise<any>>(async (request) => ({
+			conversationId: "actual",
+			runId: `run:${request.accountId}`,
+		})),
 		models: { list: vi.fn<any>(async () => [{ provider: "p", id: "m" }]) },
 		fs: { statPath: vi.fn<any>(async () => ({ type: "dir" })) },
 	};
@@ -33,18 +36,19 @@ describe("Matrix reset command lifecycle", () => {
 		await send("hello");
 		await bridge.handleRunEvent({
 			type: "message",
-			runId: "run",
+			runId: (await host.chat.mock.results[0].value).runId,
 			message: { role: "assistant", content: "old output ".repeat(1000) },
 		});
 		bridge.feedback = vi.fn(async () => {
 			await send("/reset");
 		});
-		await bridge.handleRunEvent({ type: "run_end", runId: "run" });
+		await bridge.handleRunEvent({ type: "run_end", runId: (await host.chat.mock.results.at(-1)!.value).runId });
 		expect(bridge.feedback).toHaveBeenCalledTimes(1);
 		expect(host.chat).toHaveBeenCalledTimes(1);
 	});
 	it("does not send after reset during the room state check", async () => {
 		const { bridge, send } = setup();
+		bridge.getConfig = () => ({ homeserverUrl: "https://matrix.test", accessToken: "token" });
 		await send("/reset");
 		const epoch = [...bridge.epochs.values()][0];
 		const sent: any[] = [];
@@ -59,7 +63,6 @@ describe("Matrix reset command lifecycle", () => {
 				return Response.json({});
 			}),
 		);
-		bridge.getConfig = () => ({ homeserverUrl: "https://matrix.test", accessToken: "token" });
 		await bridge.sendContent("room", { body: "obsolete" }, "", () => [...bridge.epochs.values()][0] === epoch);
 		expect(sent).toHaveLength(0);
 	});
@@ -69,7 +72,7 @@ describe("Matrix reset command lifecycle", () => {
 		for (const prompt of ["/model DEFAULT", "DeFaUlT", "／UNKNOWN keep CASE"]) {
 			await send(command + " " + prompt);
 			expect(host.chat).toHaveBeenLastCalledWith(expect.objectContaining({ text: prompt }));
-			await bridge.handleRunEvent({ type: "run_end", runId: "run" });
+			await bridge.handleRunEvent({ type: "run_end", runId: (await host.chat.mock.results.at(-1)!.value).runId });
 		}
 	});
 	it("does not dispatch reset prompts while busy", async () => {
@@ -78,17 +81,18 @@ describe("Matrix reset command lifecycle", () => {
 		for (const command of ["/new", "/clear", "／RESET"]) await send(command + " do not run");
 		expect(host.chat).toHaveBeenCalledTimes(1);
 	});
-	it.each(commands)("%s cannot be undone by a late dispatch receipt", async (command) => {
+	it.each(commands)("%s cannot be undone by duplicate events from a completed dispatch", async (command) => {
 		const { host, bridge, send, key } = setup();
 		let finish!: (value: any) => void;
 		host.chat.mockImplementationOnce(() => new Promise((resolve) => (finish = resolve)));
 		const dispatch = send("hello");
-		const requestedId = host.chat.mock.calls[0][0].conversationId;
-		await bridge.handleRunEvent({ type: "run_end", conversationId: requestedId });
+		await vi.waitFor(() => expect(host.chat).toHaveBeenCalledTimes(1));
+		await bridge.handleRunEvent({ type: "run_end", runId: "old-run" });
+		finish({ conversationId: "actual", runId: "old-run", sessionId: "old-session" });
+		await dispatch;
 		await send(command);
 		expect(bridge.epochs.get(key())).toBe(1);
-		finish({ conversationId: "obsolete", runId: "old-run" });
-		await dispatch;
+		await bridge.handleRunEvent({ type: "run_end", runId: "old-run" });
 		expect(bridge.userConversations.get(key())).not.toBe("obsolete");
 		expect(bridge.pendingRuns.size).toBe(0);
 		await send("next");
@@ -99,7 +103,8 @@ describe("Matrix reset command lifecycle", () => {
 		let finish!: (value: any) => void;
 		host.chat.mockImplementationOnce(() => new Promise((resolve) => (finish = resolve)));
 		const dispatch = send("hello");
-		await bridge.handleRunEvent({ type: "run_end", conversationId: host.chat.mock.calls[0][0].conversationId });
+		await vi.waitFor(() => expect(host.chat).toHaveBeenCalledTimes(1));
+		await bridge.handleRunEvent({ type: "run_end", runId: "run" });
 		finish({ conversationId: "actual", runId: "run" });
 		await dispatch;
 		expect(bridge.pendingRuns.size).toBe(0);

@@ -8,6 +8,7 @@ export type BotCatalogEntry = {
 	path?: string;
 	status?: string;
 	source?: string;
+	warning?: "high_privilege" | "unsupported_platform";
 };
 
 export function LocalBotCatalogPicker({
@@ -86,6 +87,8 @@ export function LocalBotCatalogPicker({
 						/>
 						<span>
 							<strong>{entry.name}</strong>
+							{entry.warning === "high_privilege" && <small>{t("localBotToolHighPrivilege")}</small>}
+							{entry.warning === "unsupported_platform" && <small>{t("localBotToolUnsupportedPlatform")}</small>}
 							{!known.has(entry.id) && <small>{pending ? t("localBotUnverified") : t("localBotUnavailable")}</small>}
 							{entry.description && (
 								<small className="dc-bot-option-description" title={entry.description}>

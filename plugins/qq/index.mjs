@@ -143,7 +143,9 @@ export async function qqApi(
 
 	if (!res.ok) {
 		const errJson = await res.json().catch(() => ({}));
-		throw new Error(errJson.message || `QQ HTTP ${res.status}`);
+		throw new Error(
+			`${errJson.message || `QQ HTTP ${res.status}`}${errJson.code !== undefined ? ` (${errJson.code})` : ""}`,
+		);
 	}
 
 	return await res.json().catch(() => ({}));
@@ -271,6 +273,8 @@ export class QqBotBridge {
 		this.inFlightConvs = new Set();
 		this.lastInFlightStartedAt = 0;
 		this.earlyRunEvents = new Map();
+		this.sessionRoutes = new Map();
+		this.completedRuns = new Set();
 
 		this.userWorkspaces = new Map();
 		this.userModels = new Map();
@@ -314,15 +318,23 @@ export class QqBotBridge {
 	recordRecentChat(conversationId, authorId, { userText, assistantText } = {}) {
 		if (!conversationId) return;
 		// 严防非 QQ 会话写入：必须属于 QQ 绑定或当前排队任务
-		if (!this.conversationBindings.has(conversationId) && !this.pendingRuns.has(conversationId)) {
+		const recordKey = `peer:${authorId}:${this.peerSessionSeq.get(authorId) || 0}`;
+		const pending = this.pendingRuns.get(conversationId);
+		if (
+			!this.conversationBindings.has(recordKey) &&
+			!pending &&
+			![...this.sessionRoutes.values()].some((route) => route.authorId === authorId && this.validSessionRoute(route))
+		) {
 			return;
 		}
 		const seq = this.peerSessionSeq.get(authorId) || 0;
 		const pseudoOwner = `plugin:qq:${peerAccountId(authorId, seq)}`;
-		let item = this.recentChats.find((c) => c.conversationId === conversationId);
+		conversationId = pending?.canonicalId || this.userActiveConvs.get(authorId) || conversationId;
+		let item = this.recentChats.find((c) => c.recordKey === recordKey);
 		if (!item) {
 			item = {
 				conversationId,
+				recordKey,
 				authorId: String(authorId || "qq_user"),
 				ownerId: pseudoOwner,
 				lastUserText: "",
@@ -331,9 +343,13 @@ export class QqBotBridge {
 			};
 			this.recentChats.unshift(item);
 		} else {
-			this.recentChats = this.recentChats.filter((c) => c.conversationId !== conversationId);
+			this.recentChats = this.recentChats.filter((c) => c.recordKey !== recordKey);
 			this.recentChats.unshift(item);
 		}
+		item.conversationId = conversationId;
+		item.sessionId = pending?.sessionId || item.sessionId;
+		item.clientId = pending?.clientId || item.clientId || pseudoOwner;
+		item.openId = JSON.stringify([item.clientId, conversationId]);
 		if (pseudoOwner) item.ownerId = pseudoOwner;
 		if (userText !== undefined) item.lastUserText = String(userText).slice(0, 300);
 		if (assistantText !== undefined) item.lastAssistantText = String(assistantText).slice(0, 300);
@@ -356,7 +372,7 @@ export class QqBotBridge {
 		return String(this.userThinkingLevels.get(authorId) || cfg?.thinkingLevel || "").trim();
 	}
 
-	resolvePlanMode(authorId, cfg) {
+	resolvePlanMode(authorId, _cfg) {
 		if (this.userPlanMode.has(authorId)) {
 			return Boolean(this.userPlanMode.get(authorId));
 		}
@@ -764,6 +780,7 @@ export class QqBotBridge {
 		let conversationId =
 			(this.userActiveSeq.get(authorId) === seq && this.userActiveConvs.get(authorId)) ||
 			`qq_${String(authorId).slice(-8)}_${seq}`;
+		const dispatchKey = `peer:${authorId}:${seq}`;
 		let bindCid = null;
 
 		// An explicit reset owns its new context; never bind it back to the web context.
@@ -777,16 +794,13 @@ export class QqBotBridge {
 			} catch {}
 		}
 
-		if (
-			[...this.pendingRuns.values()].some((run) => run.authorId === authorId || run.canonicalId === conversationId) ||
-			this.pendingRuns.has(conversationId)
-		) {
+		if ([...this.pendingRuns.values()].some((run) => run.authorId === authorId) || this.pendingRuns.has(dispatchKey)) {
 			await this.replyMessage(replyTarget, "⏳ 当前会话仍在执行，请等待完成或发送 /abort。").catch(() => {});
 			return;
 		}
 		const timeoutSec = Math.max(15, Number(cfg.replyTimeoutSec) || 90);
 		const timeoutTimer = setTimeout(() => {
-			const run = this.pendingRuns.get(conversationId);
+			const run = this.pendingRuns.get(dispatchKey);
 			if (run && !run.noticed) {
 				run.noticed = true;
 				this.replyMessage(replyTarget, "⏳ 任务还在深度执行中，稍后把结果推给您…").catch(() => {});
@@ -795,23 +809,24 @@ export class QqBotBridge {
 
 		const dispatchedRun = {
 			authorId,
+			canonicalId: conversationId,
 			replyTarget,
 			accumulatedText: "",
 			startedAt: Date.now(),
 			timeoutTimer,
 			noticed: false,
 		};
-		this.pendingRuns.set(conversationId, dispatchedRun);
+		this.pendingRuns.set(dispatchKey, dispatchedRun);
 		// Both the epoch and object identity must survive reset, abort and bridge stop.
 		const ownsDispatch = () =>
-			(this.peerSessionSeq.get(authorId) || 0) === seq && this.pendingRuns.get(conversationId) === dispatchedRun;
+			(this.peerSessionSeq.get(authorId) || 0) === seq && this.pendingRuns.get(dispatchKey) === dispatchedRun;
 
-		this.conversationBindings.set(conversationId, {
+		this.conversationBindings.set(dispatchKey, {
 			authorId,
 			replyTarget,
 			updatedAt: Date.now(),
 		});
-		this.recordRecentChat(conversationId, authorId, { userText: cleanText });
+		this.recordRecentChat(dispatchKey, authorId, { userText: cleanText });
 
 		try {
 			const workspace = this.resolveWorkspace(authorId, cfg);
@@ -831,45 +846,27 @@ export class QqBotBridge {
 			if (planMode) chatReq.planMode = true;
 
 			const startedAt = Date.now();
-			if (conversationId) this.inFlightConvs.add(conversationId);
+			this.inFlightConvs.add(dispatchKey);
 			this.lastInFlightStartedAt = startedAt;
 
 			const r = await this.host.chat(chatReq);
 			if (!ownsDispatch()) return;
-			this.inFlightConvs.delete(conversationId);
+			this.inFlightConvs.delete(dispatchKey);
 			if (r?.conversationId) {
-				this.inFlightConvs.delete(r.conversationId);
-				this.inFlightConvs.delete(conversationId);
 				this.userActiveConvs.set(authorId, r.conversationId);
 				this.userActiveSeq.set(authorId, seq);
-				if (r.conversationId !== conversationId) {
-					const curRun = this.pendingRuns.get(conversationId);
-					if (curRun) {
-						curRun.canonicalId = r.conversationId;
-						curRun.aliasId = conversationId;
-						this.pendingRuns.set(r.conversationId, curRun);
-					}
-					const curBinding = this.conversationBindings.get(conversationId);
-					if (curBinding) {
-						this.conversationBindings.set(r.conversationId, curBinding);
-					}
-					// 关键修复：从 recentChats 中迁移旧的临时 conversationId，防止列表中同时出现两条相同的提问
-					const oldIndex = this.recentChats.findIndex((c) => c.conversationId === conversationId);
-					if (oldIndex >= 0) {
-						this.recentChats[oldIndex].conversationId = r.conversationId;
-						// 去重保障：避免重复
-						this.recentChats = this.recentChats.filter(
-							(c, i) => i === this.recentChats.findIndex((x) => x.conversationId === c.conversationId),
-						);
-						this.host?.broadcast?.({ type: "recent_chats", recentChats: this.getRecentChats() });
-					} else {
-						this.recordRecentChat(r.conversationId, authorId, { userText: cleanText });
-					}
-				}
+				dispatchedRun.canonicalId = r.conversationId;
+				this.recordRecentChat(dispatchKey, authorId, { userText: cleanText });
 			}
-			const runKey = r?.conversationId || conversationId;
+			const runKey = dispatchKey;
 			const pending = this.pendingRuns.get(runKey);
-			if (pending) pending.runId = r?.runId;
+			if (pending) {
+				pending.runId = r?.runId;
+				pending.sessionId = r?.sessionId;
+				pending.clientId = r?.clientId;
+				pending.route = this.bindSessionRoute(r || {}, authorId, replyTarget);
+			}
+			this.recordRecentChat(runKey, authorId, { userText: cleanText });
 			this.rememberRunId(runKey, r?.runId);
 			const early = r?.runId ? this.earlyRunEvents.get(r.runId) || [] : [];
 			if (r?.runId) this.earlyRunEvents.delete(r.runId);
@@ -878,12 +875,12 @@ export class QqBotBridge {
 		} catch (err) {
 			if (!ownsDispatch()) return;
 			this.log("warn", `QQBot host.chat dispatch failed: ${err.message}`);
-			const run = this.pendingRuns.get(conversationId);
+			const run = this.pendingRuns.get(dispatchKey);
 			if (run?.timeoutTimer) clearTimeout(run.timeoutTimer);
-			this.forgetRun(conversationId, run?.canonicalId);
-			this.inFlightConvs.delete(conversationId);
+			this.forgetRun(dispatchKey);
+			this.inFlightConvs.delete(dispatchKey);
 			if (!this.inFlightConvs.size) this.earlyRunEvents.clear();
-			this.conversationBindings.delete(conversationId);
+			this.conversationBindings.delete(dispatchKey);
 			this.recentChats = this.recentChats.filter((c) => c.conversationId !== conversationId);
 			this.host?.broadcast?.({ type: "recent_chats", recentChats: this.getRecentChats() });
 			await this.replyMessage(replyTarget, `⚠️ 任务启动失败：${err.message}`).catch(() => {});
@@ -959,6 +956,9 @@ export class QqBotBridge {
 	}
 
 	async resetAuthorSession(authorId, replyTarget, cfg) {
+		for (const [key, run] of this.pendingRuns) {
+			if (run.authorId === authorId && run.web && !run.runId) this.forgetRun(key);
+		}
 		if ([...this.pendingRuns.values()].some((run) => run.authorId === authorId)) {
 			await this.handleSlashCommand("/abort", { authorId, replyTarget, cfg });
 			if ([...this.pendingRuns.values()].some((run) => run.authorId === authorId)) return false;
@@ -971,6 +971,10 @@ export class QqBotBridge {
 			this.conversationBindings.delete(key);
 			this.webRunTexts.delete(key);
 		}
+		for (const [key, route] of this.sessionRoutes) {
+			if (route.authorId === authorId) this.sessionRoutes.delete(key);
+		}
+		this.saveSessionRoutes();
 		return true;
 	}
 
@@ -1215,6 +1219,7 @@ export class QqBotBridge {
 					if (run.authorId !== authorId) continue;
 					const key = [...this.pendingRuns].find(([, value]) => value === run)?.[0];
 					try {
+						if (run.web && !run.runId) throw new Error("请在网页端停止此任务，当前宿主不支持精确中止");
 						const result = await this.host.abortRun?.(run.runId || run.canonicalId || key);
 						if (!result?.ok) throw new Error(result?.error || "宿主未确认中止");
 						if (run.timeoutTimer) clearTimeout(run.timeoutTimer);
@@ -1255,13 +1260,27 @@ export class QqBotBridge {
 	resolveRunKey(ev) {
 		const rid = typeof ev?.runId === "string" ? ev.runId.trim() : "";
 		const mapped = rid ? this.runIdIndex.get(rid) : undefined;
-		// 映射已失效（该轮已收尾/被清理）时回落当前 conversationId，别拿旧 key 误吞事件。
-		return mapped && this.pendingRuns.has(mapped) ? mapped : ev.conversationId;
+		// Unknown run IDs never borrow a session or a local conversation alias.
+		if (rid) return mapped && this.pendingRuns.has(mapped) ? mapped : undefined;
+		const identity = this.sessionKey(ev);
+		if (identity && this.pendingRuns.has(identity)) return identity;
+		const matches = [...this.pendingRuns].filter(
+			([key, run]) =>
+				!run.runId &&
+				(run.sessionId
+					? run.sessionId === ev.sessionId
+					: run.clientId
+						? run.clientId === ev.clientId && (run.canonicalId || key) === ev.conversationId
+						: false),
+		);
+		return new Set(matches.map(([, run]) => run)).size === 1 ? matches[0][0] : undefined;
 	}
 
 	/** 某轮收尾/作废：连同 runId 索引一起清，防陈旧映射把后续运行认错。 */
 	forgetRun(key, ...aliasKeys) {
-		const keys = [key, ...aliasKeys].filter(Boolean);
+		const run = this.pendingRuns.get(key);
+		const keys = [key, ...aliasKeys].filter((k) => k && (!run || this.pendingRuns.get(k) === run));
+		for (const [k, value] of this.pendingRuns) if (run && value === run && !keys.includes(k)) keys.push(k);
 		for (const k of keys) this.pendingRuns.delete(k);
 		const keySet = new Set(keys);
 		for (const [rid, k] of this.runIdIndex) {
@@ -1278,10 +1297,72 @@ export class QqBotBridge {
 			(!binding || this.conversationBindings.get(conversationId) === binding);
 	}
 
+	sessionKey(identity) {
+		return identity.sessionId
+			? `session:${identity.sessionId}`
+			: identity.clientId && (identity.conversationId || identity.canonicalId)
+				? `owner:${JSON.stringify([identity.clientId, identity.conversationId || identity.canonicalId])}`
+				: "";
+	}
+
+	validSessionRoute(route) {
+		const cfg = this.getConfig() || {};
+		return (
+			route &&
+			!route.ambiguous &&
+			route.epoch === (this.peerSessionSeq.get(route.authorId) || 0) &&
+			route.appId === String(cfg.appId || "") &&
+			route.sandbox === (cfg.useSandbox === true) &&
+			route.account === peerAccountId(route.authorId, route.epoch)
+		);
+	}
+
+	saveSessionRoutes() {
+		while (this.sessionRoutes.size > 200) this.sessionRoutes.delete(this.sessionRoutes.keys().next().value);
+		const saved = JSON.parse(
+			JSON.stringify({
+				routes: [...this.sessionRoutes].filter(([key]) => key.startsWith("session:")),
+				epochs: [...this.peerSessionSeq].slice(-200),
+			}),
+		);
+		this.routeSave = (this.routeSave || Promise.resolve())
+			.catch(() => {})
+			.then(() => this.host.storage?.set("sessionRoutes", saved))
+			.catch((err) => this.log("warn", `QQ route save failed: ${err.message}`));
+	}
+
+	bindSessionRoute(identity, authorId, replyTarget) {
+		const key = this.sessionKey(identity);
+		if (!key) return null;
+		const previous = this.sessionRoutes.get(key);
+		if (previous?.ambiguous || (this.validSessionRoute(previous) && previous.authorId !== authorId)) {
+			this.sessionRoutes.set(key, { ambiguous: true });
+			this.saveSessionRoutes();
+			return null;
+		}
+		const epoch = this.peerSessionSeq.get(authorId) || 0;
+		const route = {
+			authorId,
+			replyTarget,
+			epoch,
+			account: peerAccountId(authorId, epoch),
+			appId: String(this.getConfig()?.appId || ""),
+			sandbox: this.getConfig()?.useSandbox === true,
+		};
+		this.sessionRoutes.set(key, route);
+		this.saveSessionRoutes();
+		return route;
+	}
+
+	rememberCompleted(runId) {
+		if (runId) this.completedRuns.add(runId);
+		while (this.completedRuns.size > 500) this.completedRuns.delete(this.completedRuns.values().next().value);
+	}
+
 	async handleRunEvent(ev) {
-		const convId = this.resolveRunKey(ev);
-		if (!convId) return;
-		const pending = this.pendingRuns.get(convId);
+		if (ev.runId && this.completedRuns.has(ev.runId)) return;
+		let convId = this.resolveRunKey(ev);
+		let pending = this.pendingRuns.get(convId);
 		if (pending?.runId && ev.runId && pending.runId !== ev.runId) return;
 		// A receipt is the only authority for a run whose canonical ID is not known yet.
 		if (ev.runId && !this.runIdIndex.has(ev.runId) && this.inFlightConvs.size && (!pending || !pending.runId)) {
@@ -1292,6 +1373,46 @@ export class QqBotBridge {
 			this.earlyRunEvents.set(ev.runId, events);
 			return;
 		}
+
+		if (!pending && !ev.runId && ev.type === "run_start") {
+			const key = this.sessionKey(ev);
+			let route = this.sessionRoutes.get(key);
+			if (!route && ev.clientId) {
+				const candidates = [...this.conversationBindings.values()].filter(
+					(binding) =>
+						ev.clientId ===
+						`plugin:qq:${peerAccountId(binding.authorId, this.peerSessionSeq.get(binding.authorId) || 0)}`,
+				);
+				if (new Set(candidates.map((binding) => binding.authorId)).size === 1)
+					route = this.bindSessionRoute(ev, candidates[0].authorId, candidates[0].replyTarget);
+			}
+			if (
+				key &&
+				this.validSessionRoute(route) &&
+				this.pendingRuns.size < 200 &&
+				![...this.pendingRuns.values()].some((run) => this.sessionKey(run) === key)
+			) {
+				convId = key;
+				pending = {
+					...route,
+					route,
+					sessionId: ev.sessionId,
+					clientId: ev.clientId,
+					canonicalId: ev.conversationId,
+					accumulatedText: "",
+					web: true,
+				};
+				this.pendingRuns.set(key, pending);
+			}
+		}
+		if (!pending && ev.runId) return;
+		if (pending?.sessionId && ev.sessionId && pending.sessionId !== ev.sessionId) return;
+		if (pending?.web && !this.validSessionRoute(pending.route)) {
+			this.forgetRun(convId);
+			return;
+		}
+
+		convId ||= `unbound:${this.sessionKey(ev) || ev.conversationId}`;
 
 		// 1. 全局运行轨迹监听：用于频道广播通知与统计
 		if (ev.type === "run_start") {
@@ -1328,7 +1449,12 @@ export class QqBotBridge {
 					.trim();
 			}
 
-			if (content && (m.role === "assistant" || m.author === "assistant")) {
+			if (
+				m.stopReason === "toolUse" ||
+				(Array.isArray(m.content) && m.content.some((part) => part.type === "toolCall"))
+			)
+				content = "";
+			if (m.role === "assistant" || m.author === "assistant") {
 				this.recentAssistantTexts.set(convId, content);
 				if (this.recentAssistantTexts.size > 50) {
 					const first = this.recentAssistantTexts.keys().next().value;
@@ -1337,7 +1463,7 @@ export class QqBotBridge {
 
 				if (this.pendingRuns.has(convId)) {
 					const r = this.pendingRuns.get(convId);
-					r.accumulatedText += (r.accumulatedText ? "\n" : "") + content;
+					r.accumulatedText = content.slice(0, 64000);
 				} else if (this.conversationBindings.has(convId)) {
 					const prev = this.webRunTexts.get(convId) || "";
 					this.webRunTexts.set(convId, (prev ? "\n" : "") + content);
@@ -1389,7 +1515,8 @@ export class QqBotBridge {
 				if (run.timeoutTimer) {
 					clearTimeout(run.timeoutTimer);
 				}
-				this.forgetRun(convId, run.aliasId, run.canonicalId);
+				this.rememberCompleted(run.runId);
+				this.forgetRun(convId, run.aliasId, run.web ? undefined : run.canonicalId);
 				if (run.aliasId) {
 					this.conversationBindings.delete(run.aliasId);
 				}
@@ -1403,7 +1530,11 @@ export class QqBotBridge {
 				this.recordRecentChat(targetConvId, run.authorId, { assistantText: finalText });
 
 				const chunks = chunkMarkdownText(finalText, 3000);
-				const canDeliver = this.createDeliveryGuard(run.authorId);
+				const epochGuard = this.createDeliveryGuard(run.authorId);
+				const canDeliver = () =>
+					epochGuard() &&
+					(!run.web ||
+						(this.validSessionRoute(run.route) && this.sessionRoutes.get(this.sessionKey(run)) === run.route));
 
 				try {
 					for (let i = 0; i < chunks.length; i++) {
@@ -1412,11 +1543,15 @@ export class QqBotBridge {
 						await this.replyMessage(run.replyTarget, chunks[i], seq);
 					}
 					if (!canDeliver()) return;
+					this.saveSessionRoutes();
+					this.status.lastError = null;
 					this.status.messagesReplied++;
 					this.status.lastReplyAt = Date.now();
 					this.host?.broadcast?.({ type: "bot_status", status: this.getStatus() });
 				} catch (err) {
 					this.log("warn", `QQ reply delivery failed: ${err.message}`);
+					this.status.lastError = `QQ reply delivery failed: ${err.message}`;
+					this.host?.broadcast?.({ type: "bot_status", status: this.getStatus() });
 				}
 				return;
 			}
@@ -1568,6 +1703,8 @@ export function mergeSavedSecrets(incoming, prev = {}, savedSecrets = {}) {
 	return out;
 }
 
+export const VERSION = "0.1.18";
+
 export default async function activate(host) {
 	let localConfig = (await host.storage.get("config")) || {};
 	const savedSecrets = (await host.secrets?.getAll?.()) || {};
@@ -1583,6 +1720,23 @@ export default async function activate(host) {
 		botBridge.start().catch((err) => {
 			host.log?.("warn", `QQBot start note: ${err.message}`);
 		});
+	}
+
+	const savedRoutes = await host.storage.get("sessionRoutes");
+	if (savedRoutes && typeof savedRoutes === "object") {
+		for (const entry of Array.isArray(savedRoutes.epochs) ? savedRoutes.epochs.slice(-200) : []) {
+			if (Array.isArray(entry) && typeof entry[0] === "string" && Number.isSafeInteger(entry[1]) && entry[1] >= 0)
+				botBridge.peerSessionSeq.set(...entry);
+		}
+		for (const entry of Array.isArray(savedRoutes.routes) ? savedRoutes.routes.slice(-200) : []) {
+			if (
+				Array.isArray(entry) &&
+				typeof entry[0] === "string" &&
+				entry[0].startsWith("session:") &&
+				(entry[1]?.ambiguous || botBridge.validSessionRoute(entry[1]))
+			)
+				botBridge.sessionRoutes.set(...entry);
+		}
 	}
 
 	// Register project right-click context menu action

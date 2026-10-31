@@ -95,7 +95,7 @@ describe("WecomBotBridge 双工逻辑测试", () => {
 		vi.stubGlobal("fetch", fetchMock);
 
 		let runHandler: ((ev: any) => void) | null = null;
-		const chatSpy = vi.fn().mockResolvedValue({ conversationId: "conv_wc_1" });
+		const chatSpy = vi.fn().mockResolvedValue({ conversationId: "conv_wc_1", clientId: "owner-1" });
 
 		const bridge = new WecomBotBridge({
 			host: {
@@ -127,8 +127,9 @@ describe("WecomBotBridge 双工逻辑测试", () => {
 
 		const convId = "conv_wc_1";
 
-		runHandler!({
+		await runHandler!({
 			conversationId: convId,
+			clientId: "owner-1",
 			type: "message",
 			message: {
 				role: "assistant",
@@ -138,6 +139,7 @@ describe("WecomBotBridge 双工逻辑测试", () => {
 
 		await runHandler!({
 			conversationId: convId,
+			clientId: "owner-1",
 			type: "run_end",
 		});
 
@@ -160,7 +162,7 @@ describe("WecomBotBridge 双工逻辑测试", () => {
 		vi.stubGlobal("fetch", fetchMock);
 
 		let runHandler: ((ev: any) => void) | null = null;
-		const chatSpy = vi.fn().mockResolvedValue({ conversationId: "conv_wc_bytes" });
+		const chatSpy = vi.fn().mockResolvedValue({ conversationId: "conv_wc_bytes", clientId: "owner-1" });
 
 		const bridge = new WecomBotBridge({
 			host: {
@@ -185,14 +187,16 @@ describe("WecomBotBridge 双工逻辑测试", () => {
 
 		// 构造 2000 个中文字符，每个 3 字节，共 6000 字节，必拆成至少 2 块
 		const chineseLong = "测".repeat(2000);
-		runHandler!({
+		await runHandler!({
 			conversationId: convId,
+			clientId: "owner-1",
 			type: "message",
 			message: { role: "assistant", content: chineseLong },
 		});
 
 		await runHandler!({
 			conversationId: convId,
+			clientId: "owner-1",
 			type: "run_end",
 		});
 

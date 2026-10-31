@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getLocalBotOptions } from "../../server/device-center/bot-catalog.js";
-import { isBotToolAllowed, registerBotExecution } from "../../server/device-center/bot-execution.js";
+import { isBotToolHighPrivilege, registerBotExecution } from "../../server/device-center/bot-execution.js";
 import { McpProjectRuntimeRegistry } from "../../server/mcp-project-runtime.js";
 import type { LocalBot } from "../../server/device-center/bots.js";
 
@@ -21,6 +21,17 @@ async function fixture() {
 	return { defaultCwd: cwd, agentDir, dataDir: join(root, "data") };
 }
 describe("local Bot catalog", () => {
+	it("captures current default tools without replacing an explicitly empty selection", async () => {
+		const sources = await fixture();
+		let selected = ["read", "device_collab", "conversation"];
+		const configured = { ...sources, defaultTools: () => selected };
+		const first = await getLocalBotOptions(configured, undefined, new AbortController().signal);
+		expect(first.defaultTools).toEqual(selected);
+		selected.push("write");
+		expect(first.defaultTools).not.toContain("write");
+		selected = [];
+		expect((await getLocalBotOptions(configured, undefined, new AbortController().signal)).defaultTools).toEqual([]);
+	});
 	it("inspects unknown project MCP state without constructing a bridge", async () => {
 		const sources = await fixture();
 		let created = 0;
@@ -100,6 +111,8 @@ describe("local Bot catalog", () => {
 		await mkdir(join(sources.agentDir, "skills", "folder-name"), { recursive: true });
 		await writeFile(path, "---\nname: actual-runtime-name\ndescription: Test skill\n---\nInstructions\n");
 		const result = await getLocalBotOptions(sources, undefined, new AbortController().signal);
+		expect(result.tools.find((tool) => tool.id === "conversation")).toMatchObject({ warning: "high_privilege" });
+		expect(result.tools.find((tool) => tool.id === "device_collab")).not.toHaveProperty("warning");
 		const skill = result.skills.find((item) => item.path === path)!;
 		expect(skill.id).toBe("actual-runtime-name");
 		const execution = registerBotExecution({
@@ -114,9 +127,8 @@ describe("local Bot catalog", () => {
 		try {
 			expect(execution.capability.filterSkills([{ name: skill.id }, { name: path }])).toEqual([{ name: skill.id }]);
 			for (const name of ["conversation", "subagent_custom", "team_custom"]) {
-				expect(isBotToolAllowed(name)).toBe(false);
-				expect(execution.capability.allowsTool(name)).toBe(false);
-				expect(result.tools.some((tool) => tool.id === name)).toBe(false);
+				expect(isBotToolHighPrivilege(name)).toBe(true);
+				expect(execution.capability.allowsTool(name)).toBe(true);
 			}
 		} finally {
 			execution.release();

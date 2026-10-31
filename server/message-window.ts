@@ -144,6 +144,15 @@ export class MessageWindowTap {
 	private readonly convs = new Map<string, ConvWindow>();
 	/** 最近一次快照所属的对话 —— `load_earlier_messages` 不带 id，按「当前对话」服务。 */
 	private lastConversationId = "";
+	private scope = "";
+
+	/** Local conversation IDs are unique only within an execution owner. */
+	setScope(scope: string): void {
+		if (this.scope === scope) return;
+		this.scope = scope;
+		this.convs.clear();
+		this.lastConversationId = "";
+	}
 
 	constructor(
 		private readonly send: (msg: ServerMessage) => void,

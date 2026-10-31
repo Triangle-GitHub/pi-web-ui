@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { AgentService } from "../../server/agent-service-daemon.js";
 
 function fixture() {
-	const conv = { id: "c1", cwd: process.cwd() };
+	const conv = { id: "c1", cwd: process.cwd(), session: { sessionId: "sdk-session-peer" } };
 	const owner = {
 		getConversation: vi.fn((id: string) => (id === conv.id ? conv : undefined)),
 		readConversationForPlugins: vi.fn(() => ({ conversationId: conv.id })),
@@ -10,6 +10,7 @@ function fixture() {
 		prompt: vi.fn().mockResolvedValue(undefined),
 		switchModelOrThrow: vi.fn().mockResolvedValue(undefined),
 		setThinking: vi.fn(),
+		setConversationIndependent: vi.fn(),
 	};
 	const svc = Object.create(AgentService.prototype) as any;
 	svc.clients = new Map([["plugin:telegram:peer", owner]]);
@@ -43,8 +44,10 @@ describe("plugin media delivery", () => {
 		expect(receipt).toMatchObject({
 			conversationId: "c1",
 			clientId: "plugin:telegram:peer",
+			sessionId: "sdk-session-peer",
 			runId: expect.any(String),
 		});
+		expect(owner.setConversationIndependent).toHaveBeenCalledWith("c1", false);
 		expect(owner.prompt).toHaveBeenCalledWith(
 			"Describe",
 			expect.arrayContaining([expect.objectContaining({ imageData: "YQ==" })]),
@@ -58,6 +61,7 @@ describe("plugin media delivery", () => {
 		svc.clients.set("browser", { getConversation: () => ({ id: "c1" }) });
 		await svc.chatFromPlugin("telegram", { accountId: "peer", text: "Describe", conversationId: "c1", attachments });
 		expect(svc.attach).not.toHaveBeenCalled();
+		expect(owner.setConversationIndependent).not.toHaveBeenCalled();
 		expect(owner.prompt).toHaveBeenCalledWith("Describe", expect.any(Array), false, conv);
 	});
 	it("refuses ambiguous local conversation ids instead of delivering to another user's conversation", async () => {

@@ -216,6 +216,8 @@ export interface PluginConversationSnapshot {
  * 文件改动 → 产出结果」聚成时间线；payload 全部截断封顶，可直接存/广播。
  */
 export interface PluginRunEvent {
+	/** Stable SDK session identity, retained across viewer changes and ownership transfer. */
+	sessionId?: string;
 	type:
 		"run_start" | "run_end" | "turn_start" | "turn_end" | "turn_first_token" | "message" | "tool_start" | "tool_end";
 	/** 事件所属对话。 */
@@ -255,6 +257,8 @@ export interface PluginRunEvent {
  *  issue #226：对齐定时任务（chatFromScheduler）的四件套——cwd 不传时回落
  *  该伪客户端当前目录（首次即宿主启动目录），传了则做存在性 + 系统目录校验。 */
 export interface PluginChatRequest {
+	/** Whether newly created channel conversations require ownership transfer to open. Defaults to false. */
+	independent?: boolean;
 	/** Image bytes or file references, validated before delivery (8 items, 10 MiB each, 20 MiB total). */
 	attachments?: PromptAttachment[];
 	/** 送给 agent 的任务文本（插件应已拼好发送者前缀、裁剪封顶）。 */
@@ -275,6 +279,8 @@ export interface PluginChatRequest {
 
 /** host.chat 的投递回执（运行中，结论经 run_end 事件）。 */
 export interface PluginChatResult {
+	/** Stable SDK session identity for channel replies originating from other clients. */
+	sessionId?: string;
 	conversationId: string;
 	clientId: string;
 	/** 本轮运行的稳定标识（见 PluginRunEvent.runId）。插件应记住它并按它认领后续

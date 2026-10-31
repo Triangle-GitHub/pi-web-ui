@@ -36,7 +36,8 @@ export function QuestionQueue({ questions, activeConversationId, mode }: Questio
 			)}
 			createdAt={(q) => q.createdAt}
 			canAutoOpen={(q) =>
-				mode !== "manual" && (mode === "all" || q.conversationId === activeConversationId || !q.conversationId)
+				mode !== "manual" &&
+				(q.global || mode === "all" || q.conversationId === activeConversationId || !q.conversationId)
 			}
 			onNavigate={navigate}
 			canNavigate={(q) =>

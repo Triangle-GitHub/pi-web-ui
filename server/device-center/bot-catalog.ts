@@ -6,7 +6,7 @@ import { ALL_AGENT_TOOL_ENTRIES, isToolSupportedOnPlatform } from "../tool-manag
 import { discoverDiskSkills, mergeSkillCollections } from "../skill-discovery.js";
 import { listAllMcpServers } from "../mcp-manager.js";
 import { getMcpToolServer, type McpBridge } from "../mcp-bridge.js";
-import { isBotToolAllowed } from "./bot-execution.js";
+import { isBotToolHighPrivilege } from "./bot-execution.js";
 import { DeviceWorkspaceError } from "./workspaces.js";
 
 export interface BotToolOption {
@@ -14,11 +14,13 @@ export interface BotToolOption {
 	name: string;
 	description?: string;
 	source?: string;
+	warning?: "high_privilege" | "unsupported_platform";
 }
 export interface LocalBotOptions {
 	cwd: string;
 	defaultCwd: string;
 	defaultModel?: string;
+	defaultTools: string[];
 	projects: { path: string }[];
 	models: ModelInfo[];
 	tools: BotToolOption[];
@@ -38,6 +40,8 @@ export interface BotCatalogSources {
 	models?: (signal: AbortSignal) => Promise<ModelInfo[]>;
 	projects?: () => { path: string }[] | Promise<{ path: string }[]>;
 	defaultModel?: () => string | undefined;
+	/** Current saved tool switches, captured when the catalog is requested. */
+	defaultTools?: () => string[];
 	/** Must only inspect an existing bridge; do not initialize one for browsing. */
 	peekMcpBridge?: (cwd: string) => McpBridge | undefined;
 }
@@ -55,6 +59,7 @@ export async function getLocalBotOptions(
 	if (!(await stat(cwd).catch(() => undefined))?.isDirectory())
 		throw new DeviceWorkspaceError(400, "BOT_CWD_INVALID", "Project directory does not exist");
 	signal.throwIfAborted();
+	const defaultTools = [...(sources.defaultTools?.() ?? [])];
 	const agentDir = sources.agentDir ?? getAgentDir();
 	const settings = SettingsManager.create(cwd, agentDir);
 	// Match ResourceLoader package/path resolution, but skip missing packages rather than installing.
@@ -95,12 +100,15 @@ export async function getLocalBotOptions(
 					: definitions
 							.filter(
 								(tool) =>
-									getMcpToolServer(tool) === server.name &&
-									counts.get(tool.name) === 1 &&
-									!reserved.has(tool.name) &&
-									isBotToolAllowed(tool.name),
+									getMcpToolServer(tool) === server.name && counts.get(tool.name) === 1 && !reserved.has(tool.name),
 							)
-							.map((tool) => ({ id: tool.name, name: tool.name, description: tool.description, source: server.name })),
+							.map((tool) => ({
+								id: tool.name,
+								name: tool.name,
+								description: tool.description,
+								source: server.name,
+								...(isBotToolHighPrivilege(tool.name) ? { warning: "high_privilege" as const } : {}),
+							})),
 		}));
 	const models = (await sources.models?.(signal)) ?? [];
 	signal.throwIfAborted();
@@ -110,6 +118,7 @@ export async function getLocalBotOptions(
 	return {
 		cwd,
 		defaultCwd: sources.defaultCwd,
+		defaultTools,
 		...(defaultModel ? { defaultModel } : {}),
 		projects,
 		models: models.map(({ id, name, provider, reasoning, vision, enabled }) => ({
@@ -120,9 +129,16 @@ export async function getLocalBotOptions(
 			vision,
 			...(enabled === undefined ? {} : { enabled }),
 		})),
-		tools: ALL_AGENT_TOOL_ENTRIES.filter(
-			(tool) => isToolSupportedOnPlatform(tool.name) && isBotToolAllowed(tool.name),
-		).map(({ name }) => ({ id: name, name, source: "builtin" })),
+		tools: ALL_AGENT_TOOL_ENTRIES.map(({ name }) => ({
+			id: name,
+			name,
+			source: "builtin",
+			...(!isToolSupportedOnPlatform(name)
+				? { warning: "unsupported_platform" as const }
+				: isBotToolHighPrivilege(name)
+					? { warning: "high_privilege" as const }
+					: {}),
+		})),
 		skills: skills.map((skill) => ({
 			id: skill.name,
 			name: skill.name,

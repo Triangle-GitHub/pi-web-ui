@@ -33,6 +33,8 @@ export class IMessageBotBridge {
 		this.offRunEvent = null;
 		this.seenMessageIds = new Set();
 		this.pendingRuns = new Map();
+		this.sessionRoutes = new Map();
+		this.completedRuns = new Set();
 		this.earlyRuns = new Map();
 		this.dispatches = 0;
 		this.generation = 0;
@@ -51,6 +53,92 @@ export class IMessageBotBridge {
 			messagesReplied: 0,
 			lastError: null,
 		};
+	}
+	sessionKey(identity) {
+		return identity.sessionId
+			? `session:${identity.sessionId}`
+			: identity.clientId && identity.conversationId
+				? `owner:${JSON.stringify([identity.clientId, identity.conversationId])}`
+				: "";
+	}
+	accountIdentity() {
+		const cfg = this.getConfig() || {};
+		return JSON.stringify([cfg.accountId || "", cfg.defaultRecipient || ""]);
+	}
+	validRoute(route) {
+		return (
+			route &&
+			!route.ambiguous &&
+			route.account === this.accountIdentity() &&
+			route.epoch === (this.sessionEpochs.get(route.key) || 0)
+		);
+	}
+	async restoreRoutes() {
+		const saved = await this.host.storage?.get("sessionRoutes");
+		for (const [key, epoch] of saved?.epochs || []) {
+			if (typeof key === "string" && Number.isSafeInteger(epoch) && epoch >= 0) this.sessionEpochs.set(key, epoch);
+		}
+		for (const [key, route] of saved?.routes || []) {
+			if (
+				typeof key === "string" &&
+				key.startsWith("session:") &&
+				(route?.ambiguous || (typeof route?.key === "string" && route.target && this.validRoute(route)))
+			)
+				this.sessionRoutes.set(key, route);
+		}
+	}
+	saveRoutes() {
+		const saved = JSON.parse(
+			JSON.stringify({
+				epochs: [...this.sessionEpochs],
+				routes: [...this.sessionRoutes].filter(([key]) => key.startsWith("session:")),
+			}),
+		);
+		this.routeSave = (this.routeSave || Promise.resolve())
+			.catch(() => {})
+			.then(() => this.host.storage?.set("sessionRoutes", saved));
+		return this.routeSave;
+	}
+	async bindRoute(identity, run) {
+		const key = this.sessionKey(identity);
+		if (!key) return;
+		const previous = this.sessionRoutes.get(key);
+		this.sessionRoutes.set(
+			key,
+			previous?.ambiguous || (this.validRoute(previous) && previous.key !== run.key)
+				? { ambiguous: true }
+				: {
+						key: run.key,
+						target: run.target,
+						epoch: this.sessionEpochs.get(run.key) || 0,
+						account: this.accountIdentity(),
+					},
+		);
+		await this.saveRoutes();
+	}
+	async invalidateAccount() {
+		const keys = new Set([
+			...this.userConversations.keys(),
+			...this.sessionEpochs.keys(),
+			...this.queues.keys(),
+			...[...this.pendingRuns.values()].map((run) => run.key),
+			...[...this.sessionRoutes.values()].map((route) => route.key).filter(Boolean),
+		]);
+		// Revoke captured work before yielding to shutdown or persistence.
+		for (const key of keys) {
+			this.sessionEpochs.set(key, (this.sessionEpochs.get(key) || 0) + 1);
+			this.cancelEpochs.set(key, (this.cancelEpochs.get(key) || 0) + 1);
+		}
+		this.userConversations.clear();
+		this.sessionRoutes.clear();
+		this.queues.clear();
+		await this.stop();
+		await this.saveRoutes();
+	}
+	async abort(run) {
+		return run.web && !run.runId
+			? { ok: false, error: "请在网页端停止此任务，宿主未提供精确运行 ID" }
+			: await this.host.abortRun?.(run.runId || run.conversationId);
 	}
 	getStatus() {
 		return { ...this.status };
@@ -116,6 +204,7 @@ export class IMessageBotBridge {
 		this.offRunEvent = null;
 		this.pendingRuns.clear();
 		this.earlyRuns.clear();
+		await this.routeSave;
 		this.status.enabled = false;
 		this.status.connected = false;
 		this.status.state = "idle";
@@ -255,6 +344,7 @@ export class IMessageBotBridge {
 			text: "",
 			conversationId: this.userConversations.get(key),
 			runId: null,
+			account: this.accountIdentity(),
 			generation,
 			cancelEpoch,
 		};
@@ -263,7 +353,7 @@ export class IMessageBotBridge {
 			const opts = this.settings.get(key) || {};
 			const receipt = await this.host.chat({
 				text: text || "请查看附件",
-				accountId: peerAccountId(`${key}:${this.sessionEpochs.get(key) || 0}`),
+				accountId: peerAccountId(JSON.stringify([this.accountIdentity(), key, this.sessionEpochs.get(key) || 0])),
 				...(run.conversationId ? { conversationId: run.conversationId } : {}),
 				cwd: this.resolveWorkspace(key, cfg),
 				...(cfg.model ? { model: cfg.model } : {}),
@@ -279,9 +369,18 @@ export class IMessageBotBridge {
 			if (!receipt?.conversationId) throw new Error("Host returned no conversation ID");
 			run.conversationId = receipt.conversationId;
 			run.runId = receipt.runId;
+			run.sessionId = receipt.sessionId;
+			run.clientId = receipt.clientId;
 			this.userConversations.set(key, receipt.conversationId);
-			const token = receipt.runId || receipt.conversationId;
+			const token = receipt.runId || this.sessionKey(run);
+			if (!token) throw new Error("Host returned no scoped session identity");
+			this.completedRuns.delete(receipt.runId);
 			this.pendingRuns.set(token, run);
+			await this.bindRoute(run, run);
+			if (generation !== this.generation || cancelEpoch !== (this.cancelEpochs.get(key) || 0)) {
+				this.pendingRuns.delete(token);
+				return;
+			}
 			const early = this.earlyRuns.get(token) || [];
 			this.earlyRuns.delete(token);
 			for (const ev of early) await this.handleRunEvent(ev);
@@ -341,7 +440,7 @@ export class IMessageBotBridge {
 					await this.reply(target, "已取消正在准备的请求；当前没有已启动的任务。");
 					return;
 				}
-				const result = await this.host.abortRun?.(run.runId || run.conversationId);
+				const result = await this.abort(run);
 				await this.reply(target, result?.ok ? "已请求停止。" : `停止失败：${result?.error || "宿主不支持中止"}`);
 				return;
 			}
@@ -391,20 +490,25 @@ export class IMessageBotBridge {
 		this.queues.delete(key);
 		this.userConversations.delete(key);
 		this.sessionEpochs.set(key, (this.sessionEpochs.get(key) || 0) + 1);
+		for (const [identity, route] of this.sessionRoutes) {
+			if (route.key === key) this.sessionRoutes.delete(identity);
+		}
 		// Unbind synchronously: abortRun may emit events before its promise resolves.
 		for (const [token] of runs) {
 			this.pendingRuns.delete(token);
 			this.earlyRuns.delete(token);
 		}
+		const persisted = this.saveRoutes();
 		const failures = [];
 		for (const [, run] of runs) {
 			try {
-				const result = await this.host.abortRun?.(run.runId || run.conversationId);
+				const result = await this.abort(run);
 				if (!result?.ok) failures.push(result?.error || "宿主不支持中止");
 			} catch (error) {
 				failures.push(error.message);
 			}
 		}
+		await persisted;
 		if (generation !== this.generation || cancelEpoch + 1 !== (this.cancelEpochs.get(key) || 0)) return;
 		await this.reply(
 			target,
@@ -417,9 +521,31 @@ export class IMessageBotBridge {
 		}
 	}
 	async handleRunEvent(ev) {
-		const token = ev.runId || ev.conversationId;
+		if (ev.runId && this.completedRuns.has(ev.runId)) return;
+		const identity = this.sessionKey(ev);
+		const token = ev.runId || identity;
 		if (!token) return;
-		const run = this.pendingRuns.get(token);
+		let run = this.pendingRuns.get(token);
+		if (!run && !ev.runId && ev.type === "run_start") {
+			const route = this.sessionRoutes.get(identity);
+			if (
+				this.validRoute(route) &&
+				![...this.pendingRuns.values()].some((pending) => this.sessionKey(pending) === identity)
+			) {
+				run = {
+					...route,
+					route,
+					web: true,
+					sessionId: ev.sessionId,
+					clientId: ev.clientId,
+					conversationId: ev.conversationId,
+					text: "",
+					generation: this.generation,
+					cancelEpoch: this.cancelEpochs.get(route.key) || 0,
+				};
+				this.pendingRuns.set(identity, run);
+			}
+		}
 		if (!run) {
 			if (this.dispatches) {
 				if (!this.earlyRuns.has(token) && this.earlyRuns.size >= 64) return;
@@ -431,23 +557,37 @@ export class IMessageBotBridge {
 			}
 			return;
 		}
-		if (run.generation !== this.generation || run.cancelEpoch !== (this.cancelEpochs.get(run.key) || 0)) return;
+		if (
+			run.generation !== this.generation ||
+			run.cancelEpoch !== (this.cancelEpochs.get(run.key) || 0) ||
+			run.account !== this.accountIdentity() ||
+			(run.web && !this.validRoute(run.route))
+		) {
+			if (ev.type === "run_end") this.pendingRuns.delete(token);
+			return;
+		}
+		if (run.sessionId && ev.sessionId && run.sessionId !== ev.sessionId) return;
+		if (!run.sessionId && run.clientId && ev.clientId && run.clientId !== ev.clientId) return;
 		if (ev.conversationId) run.conversationId = ev.conversationId;
 		if (ev.type === "message" && (ev.message?.role === "assistant" || ev.message?.author === "assistant")) {
 			const content = ev.message.content;
-			run.text +=
-				(run.text ? "\n" : "") +
-				(typeof content === "string"
-					? content
-					: Array.isArray(content)
+			run.text =
+				ev.message.stopReason === "toolUse" ||
+				(Array.isArray(content) && content.some((part) => part?.type === "toolCall"))
+					? ""
+					: typeof content === "string"
 						? content
-								.filter((c) => c.type === "text" || typeof c === "string")
-								.map((c) => (typeof c === "string" ? c : c.text || ""))
-								.join("\n")
-						: "");
+						: Array.isArray(content)
+							? content
+									.filter((c) => c.type === "text" || typeof c === "string")
+									.map((c) => (typeof c === "string" ? c : c.text || ""))
+									.join("\n")
+							: "";
 		}
 		if (ev.type !== "run_end") return;
 		this.pendingRuns.delete(token);
+		if (ev.runId) this.completedRuns.add(ev.runId);
+		while (this.completedRuns.size > 500) this.completedRuns.delete(this.completedRuns.values().next().value);
 		this.userConversations.set(run.key, run.conversationId);
 		const text =
 			stripInternalMarkers(run.text) ||
@@ -457,10 +597,19 @@ export class IMessageBotBridge {
 					? "任务已停止。"
 					: "任务完成，无文本输出。附件不会自动发送，请使用 imessage 工具的 file 参数。");
 		for (const chunk of chunkMarkdownText(text, 3000)) {
-			if (run.generation !== this.generation || run.cancelEpoch !== (this.cancelEpochs.get(run.key) || 0)) return;
+			if (
+				run.generation !== this.generation ||
+				run.cancelEpoch !== (this.cancelEpochs.get(run.key) || 0) ||
+				run.account !== this.accountIdentity()
+			)
+				return;
 			await this.reply(run.target, chunk);
 		}
-		if (run.generation === this.generation && run.cancelEpoch === (this.cancelEpochs.get(run.key) || 0))
+		if (
+			run.generation === this.generation &&
+			run.cancelEpoch === (this.cancelEpochs.get(run.key) || 0) &&
+			run.account === this.accountIdentity()
+		)
 			this.status.messagesReplied++;
 	}
 }

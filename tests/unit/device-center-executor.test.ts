@@ -214,7 +214,7 @@ describe("device task executor", () => {
 		const input = { ...task(), resume: true };
 		expect(await f.executor.run(input)).toBe("CONTINUED");
 		expect(f.received.some((m) => m.type === "new_chat")).toBe(false);
-		expect(f.received).toContainEqual({ type: "switch_session", path: resumePath });
+		expect(f.received).toContainEqual({ type: "switch_session", path: resumePath, independent: false });
 		expect(onSession).toHaveBeenCalledWith(input.id, "restored-sdk-session");
 		expect(onSessionPath).toHaveBeenCalledWith(input.id, resumePath);
 	});
@@ -273,7 +273,11 @@ describe("device task executor", () => {
 		expect(result).not.toMatch(/OLD HISTORY|RESUMED HISTORY|SECRET TOOL OUTPUT|HIDDEN THINKING/);
 		expect(f.authorization()).toBe("Bearer test-token");
 		expect(f.received.map((m) => m.type)).toEqual(["hello", "new_chat", "prompt"]);
-		expect(f.received.find((m) => m.type === "new_chat")).toEqual({ type: "new_chat", ephemeral: false });
+		expect(f.received.find((m) => m.type === "new_chat")).toEqual({
+			type: "new_chat",
+			ephemeral: false,
+			independent: false,
+		});
 		const prompt = f.received.find((m) => m.type === "prompt");
 		expect(prompt?.text).toContain("deadbeef");
 		expect(prompt?.text).toContain('"conversationId":"receiver-address"');
@@ -355,28 +359,117 @@ describe("device task executor", () => {
 		other.close();
 	});
 
-	it.each(["question_pending", "tool_approval_pending", "pendingQuestion", "pendingApproval"])(
-		"aborts for %s without approving or changing settings",
-		async (kind) => {
-			const f = await fixture((socket, state) => {
-				if (kind.startsWith("pending")) delta(socket, state, { [kind]: { id: "approval" } } as Partial<UiState>);
-				else socket.send(JSON.stringify({ type: kind, id: "approval", conversationId: state.conversationId }));
-			});
-			const error = await f.executor.run(task()).catch((error: unknown) => error);
-			expect(error).toBeInstanceOf(DeviceExecutionError);
-			expect((error as DeviceExecutionError).failure).toMatchObject({
-				phase: "approval",
-				category: "approval_required",
-			});
-			await vi.waitFor(() => expect(f.received.some((m) => m.type === "abort")).toBe(true));
-			expect(f.received.map((m) => m.type)).not.toEqual(expect.arrayContaining(["tool_approval_answer"]));
-			expect(
-				f.received.every((m) =>
-					["hello", "new_chat", "rename_conversation", "prompt", "abort", "get_state"].includes(m.type),
-				),
-			).toBe(true);
-		},
-	);
+	it.each([
+		"question_pending",
+		"tool_approval_pending",
+		"pendingQuestion",
+		"pendingApproval",
+		"pendingApprovals",
+		"question_queue",
+	])("waits for %s without completing idle or consuming the execution timeout", async (kind) => {
+		let socket!: WebSocket;
+		let baseline!: UiState;
+		const f = await fixture((ws, state) => {
+			socket = ws;
+			baseline = state;
+		});
+		vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+		let completed = false;
+		const running = f.executor.run(task());
+		void running.then(
+			() => {
+				completed = true;
+			},
+			() => {
+				completed = true;
+			},
+		);
+		for (let i = 0; i < 1000 && !socket; i++) await new Promise<void>((done) => setImmediate(done));
+		expect(socket).toBeDefined();
+		await vi.advanceTimersByTimeAsync(19 * 60 * 1000);
+		const entry = { id: "human", conversationId: baseline.conversationId };
+		const patch: Partial<UiState> = { messages: [assistant("Still waiting") as any], isStreaming: false };
+		if (kind.startsWith("pending")) Object.assign(patch, { [kind]: kind === "pendingApprovals" ? [entry] : entry });
+		else if (kind === "question_queue")
+			socket.send(
+				JSON.stringify({
+					type: kind,
+					questions: [{ ...entry, rootConversationId: baseline.conversationId, conversationId: "child" }],
+				}),
+			);
+		else socket.send(JSON.stringify({ type: kind, ...entry }));
+		f.push(socket, patch);
+		// Drain real socket events before advancing the fake execution clock.
+		for (let i = 0; i < 20; i++) await new Promise<void>((done) => setImmediate(done));
+		await vi.advanceTimersByTimeAsync(40 * 60 * 1000);
+		expect(completed).toBe(false);
+		expect(
+			f.received.some((m) => m.type === "abort" || m.type === "tool_approval_response" || m.type === "question_answer"),
+		).toBe(false);
+		if (kind === "question_pending") socket.send(JSON.stringify({ type: "question_retracted", id: entry.id }));
+		if (kind === "tool_approval_pending") socket.send(JSON.stringify({ type: "tool_approval_resolved", id: entry.id }));
+		if (kind === "question_queue") socket.send(JSON.stringify({ type: kind, questions: [] }));
+		f.push(socket, { pendingQuestion: null, pendingApproval: null, pendingApprovals: [], isStreaming: true });
+		for (let i = 0; i < 20; i++) await new Promise<void>((done) => setImmediate(done));
+		await vi.advanceTimersByTimeAsync(19 * 60 * 1000);
+		expect(completed).toBe(false);
+		f.push(socket, { isStreaming: false, messages: [assistant("Human answered; done") as any] });
+		expect(await running).toBe("Human answered; done");
+	});
+
+	it("keeps waiting until every approval resolves, then enforces a fresh execution timeout", async () => {
+		let socket!: WebSocket;
+		let baseline!: UiState;
+		const f = await fixture((ws, state) => {
+			socket = ws;
+			baseline = state;
+		});
+		vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+		let completed = false;
+		const running = f.executor.run(task());
+		const rejected = expect(running).rejects.toThrow("20 minute timeout");
+		void running.then(
+			() => {
+				completed = true;
+			},
+			() => {
+				completed = true;
+			},
+		);
+		for (let i = 0; i < 1000 && !socket; i++) await new Promise<void>((done) => setImmediate(done));
+		const approvals = ["first", "second"].map((id) => ({ id, conversationId: baseline.conversationId }));
+		f.push(socket, { pendingApprovals: approvals as any, isStreaming: false, messages: [assistant("Waiting") as any] });
+		for (let i = 0; i < 20; i++) await new Promise<void>((done) => setImmediate(done));
+		socket.send(JSON.stringify({ type: "tool_approval_resolved", id: "first" }));
+		f.push(socket, { pendingApprovals: [approvals[1]] as any });
+		// Unrelated notifications must not release the remaining approval.
+		socket.send(JSON.stringify({ type: "tool_approval_resolved", id: "unrelated" }));
+		for (let i = 0; i < 20; i++) await new Promise<void>((done) => setImmediate(done));
+		await vi.advanceTimersByTimeAsync(40 * 60 * 1000);
+		expect(completed).toBe(false);
+		socket.send(JSON.stringify({ type: "tool_approval_resolved", id: "second" }));
+		f.push(socket, { pendingApprovals: [], isStreaming: true });
+		for (let i = 0; i < 20; i++) await new Promise<void>((done) => setImmediate(done));
+		await vi.advanceTimersByTimeAsync(20 * 60 * 1000 - 1);
+		expect(completed).toBe(false);
+		await vi.advanceTimersByTimeAsync(1);
+		await rejected;
+	});
+
+	it("ignores human waits belonging to another conversation", async () => {
+		const f = await fixture((socket, state) => {
+			socket.send(JSON.stringify({ type: "question_pending", id: "other", conversationId: "other-chat" }));
+			delta(
+				socket,
+				state,
+				{
+					pendingApprovals: [{ id: "other", conversationId: "other-chat" }] as any,
+				},
+				[assistant("done")],
+			);
+		});
+		expect(await f.executor.run(task())).toBe("done");
+	});
 
 	it("close waits for the same SDK session to acknowledge idle after abort", async () => {
 		let socket!: WebSocket;
@@ -590,7 +683,7 @@ describe("device task executor", () => {
 		expect(result).toContain("Report truncated");
 	});
 
-	it.each(["completed", "approval", "disconnect", "close", "timeout"])(
+	it.each(["completed", "disconnect", "close", "timeout"])(
 		"binds the SDK session before prompt and clears ownership on %s",
 		async (outcome) => {
 			const sessions = new Map<string, string>();
@@ -606,8 +699,6 @@ describe("device task executor", () => {
 					expect(sessions.get(state.conversationId)).toBeUndefined();
 					expect(sessions.get("same-root-human-sdk-session")).toBeUndefined();
 					if (outcome === "completed") delta(socket, state, { isStreaming: false }, [assistant("done")]);
-					if (outcome === "approval")
-						socket.send(JSON.stringify({ type: "tool_approval_pending", conversationId: state.conversationId }));
 					if (outcome === "disconnect") socket.close();
 				},
 				{ onSession },

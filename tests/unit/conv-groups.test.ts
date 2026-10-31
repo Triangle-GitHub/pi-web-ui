@@ -62,6 +62,57 @@ describe("groupConversations", () => {
 		expect(groups[0].isCurrent).toBe(true);
 	});
 
+	it("跨目录多级子代理跟随根对话，分组后仍能折叠整棵树", () => {
+		const root = conv("root", A);
+		const child = conv("child", B, { isSubagent: true, parentId: "root" });
+		const grandchild = conv("grandchild", B, { isSubagent: true, parentId: "child", isStreaming: true });
+		const leaf = conv("leaf", "C:/worktree", { isSubagent: true, parentId: "grandchild", hasQuestion: true });
+		// Descendants can arrive before their ancestors in the running list.
+		const groups = groupConversations([leaf, grandchild, child, root], B, "leaf");
+		expect(groups).toHaveLength(1);
+		expect(groups[0]).toMatchObject({ cwd: A, isCurrent: true });
+		const expanded = buildConversationRows(groups[0].convs);
+		expect(expanded.map((row) => [row.c.id, row.depth])).toEqual([
+			["root", 0],
+			["child", 1],
+			["grandchild", 2],
+			["leaf", 3],
+		]);
+		const collapsed = buildConversationRows(groups[0].convs, new Set(["root"]));
+		expect(collapsed).toHaveLength(1);
+		expect(collapsed[0]).toMatchObject({ descendantCount: 3, hasStreaming: true, hasQuestion: true });
+	});
+
+	it("祖先缺失时跟随可找到的最高父节点，其他任务保持独立", () => {
+		const groups = groupConversations(
+			[
+				conv("leaf", A, { isSubagent: true, parentId: "orphan" }),
+				conv("orphan", B, { isSubagent: true, parentId: "missing" }),
+				conv("unrelated", A),
+			],
+			A,
+			"leaf",
+		);
+		expect(groups.map((group) => [group.cwd, group.convs.map((item) => item.id)])).toEqual([
+			[B, ["leaf", "orphan"]],
+			[A, ["unrelated"]],
+		]);
+	});
+
+	it("循环父关系不会无限遍历，且分组不依赖列表顺序", () => {
+		const a = conv("a", A, { isSubagent: true, parentId: "b" });
+		const b = conv("b", B, { isSubagent: true, parentId: "a" });
+		for (const list of [
+			[a, b],
+			[b, a],
+		]) {
+			const groups = groupConversations(list, B, "b");
+			expect(groups).toHaveLength(1);
+			expect(groups[0]).toMatchObject({ cwd: A, isCurrent: true });
+			expect(buildConversationRows(groups[0].convs)).toHaveLength(2);
+		}
+	});
+
 	it("空列表 → 空分组", () => {
 		expect(groupConversations([], A, "")).toEqual([]);
 	});

@@ -28,7 +28,17 @@ let root: Root | null = null;
 
 /** 宿主内置的 message.actions 条目（真实运行时 App 用 buildUiSlots 算好后透传；
  *  这里手搓一份等价的，让 Message 走数据驱动分支，而不是「宿主还没接线」的兜底。 */
-function Probe({ message }: { message: UiMessage }) {
+function Probe({
+	message,
+	showDelete = false,
+	streaming = false,
+	readOnly = false,
+}: {
+	message: UiMessage;
+	showDelete?: boolean;
+	streaming?: boolean;
+	readOnly?: boolean;
+}) {
 	const t = useT();
 	const entries = BUILTIN_UI_ITEMS.filter((b) => b.slot === "message.actions").map(
 		(b) =>
@@ -43,7 +53,7 @@ function Probe({ message }: { message: UiMessage }) {
 				order: b.order ?? 100,
 				group: b.group,
 				align: b.align ?? "start",
-				hidden: b.hidden ?? false,
+				hidden: b.id === "host:msg-delete" && showDelete ? false : (b.hidden ?? false),
 				userOverrides: [],
 				arrangedBy: [],
 			}) as unknown as UiSlotEntry,
@@ -53,18 +63,19 @@ function Probe({ message }: { message: UiMessage }) {
 		toolResults: new Map(),
 		liveOutputs: new Map(),
 		toolStatuses: new Map(),
-		streaming: false,
+		streaming,
+		readOnly,
 		isLast: false,
 		uiMessageActions: entries,
 	} as unknown as Parameters<typeof Message>[0]);
 }
 
-function mount(message: UiMessage) {
+function mount(message: UiMessage, options: { showDelete?: boolean; streaming?: boolean; readOnly?: boolean } = {}) {
 	const container = document.createElement("div");
 	document.body.appendChild(container);
 	root = createRoot(container);
 	act(() => {
-		root!.render(createElement(LanguageProvider, null, createElement(Probe, { message })));
+		root!.render(createElement(LanguageProvider, null, createElement(Probe, { message, ...options })));
 	});
 	return container;
 }
@@ -118,6 +129,30 @@ const userMessage = {
 } as unknown as UiMessage;
 
 describe("消息级按钮落点：卡头只复制，行给正文/用户消息", () => {
+	it("删除默认隐藏，右键入口保留", () => {
+		expect(BUILTIN_UI_ITEMS.find((entry) => entry.id === "host:msg-delete")?.hidden).toBe(true);
+		expect(BUILTIN_UI_ITEMS.find((entry) => entry.id === "host:msg-ctx-delete")?.hidden).not.toBe(true);
+		expect(
+			mount(textOnly).querySelector('.msg-actions button[aria-label="删除"], .msg-actions button[aria-label="Delete"]'),
+		).toBeNull();
+	});
+
+	it.each([textOnly, userMessage])("开启后在消息操作栏显示删除", (message) => {
+		expect(
+			mount(message, { showDelete: true }).querySelector(
+				'.msg-actions button[aria-label="删除"], .msg-actions button[aria-label="Delete"]',
+			),
+		).not.toBeNull();
+	});
+
+	it.each([{ streaming: true }, { readOnly: true }])("生成中或只读时不显示删除", (options) => {
+		expect(
+			mount(textOnly, { showDelete: true, ...options }).querySelector(
+				'.msg-actions button[aria-label="删除"], .msg-actions button[aria-label="Delete"]',
+			),
+		).toBeNull();
+	});
+
 	it("纯工具调用消息：无底部行，卡头仍留复制键", () => {
 		const container = mount(toolOnly);
 		expect(container.querySelector(".toolcall")).not.toBeNull();

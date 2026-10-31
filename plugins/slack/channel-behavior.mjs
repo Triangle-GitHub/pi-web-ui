@@ -1,11 +1,13 @@
 import { randomUUID, createHash } from "node:crypto";
 import { resolve, basename, isAbsolute } from "node:path";
+import { accountKey, identityKey, installSessionRoutes } from "./session-routes.mjs";
 
 const MAX_BYTES = 20 * 1024 * 1024;
 const OUTPUT_BYTES = 256 * 1024;
 
 function appendAssistant(run, message, budget = OUTPUT_BYTES) {
 	const content = message.content;
+	if (Array.isArray(content) && content.some((part) => part.type === "toolCall" || part.type === "tool_use")) return;
 	const text =
 		(typeof content === "string"
 			? content
@@ -14,20 +16,22 @@ function appendAssistant(run, message, budget = OUTPUT_BYTES) {
 					.map((p) => p.text)
 					.join("\n")) + "\n";
 	const bytes = Buffer.from(text);
-	const remaining = Math.max(0, Math.min(OUTPUT_BYTES - Buffer.byteLength(run.text), budget));
-	run.text += bytes.subarray(0, remaining).toString("utf8");
-	if (bytes.length > remaining) run.truncated = true;
+	const remaining = Math.max(0, Math.min(OUTPUT_BYTES, budget));
+	run.text = bytes.subarray(0, remaining).toString("utf8");
+	run.truncated = bytes.length > remaining;
 }
 const THINKING = ["off", "minimal", "low", "medium", "high", "xhigh"];
 
 export function installChannelBehavior(Bridge, platform, api, extract, chunk, strip) {
 	const discord = platform === "discord";
+	installSessionRoutes(Bridge);
 	Object.assign(Bridge.prototype, {
 		async reply(route, text, isCurrent = () => true) {
 			const cfg = this.getConfig();
+			const generation = this.generation;
 			try {
 				for (const part of chunk(text, discord ? 1900 : 3800)) {
-					if (!isCurrent()) return;
+					if (generation !== this.generation || !isCurrent()) return;
 					if (discord)
 						await api(cfg.botToken, "POST", `/channels/${route.channelId}/messages`, {
 							content: part,
@@ -55,6 +59,7 @@ export function installChannelBehavior(Bridge, platform, api, extract, chunk, st
 		},
 		async handleSlashCommand(text, route) {
 			const state = this.stateFor(route);
+			const previousEpoch = state.epoch;
 			const cfg = this.getConfig();
 			text = text.trim().replace(/^／/, "/");
 			const [command] = text.split(/\s+/);
@@ -77,7 +82,11 @@ export function installChannelBehavior(Bridge, platform, api, extract, chunk, st
 						answer = "Download cancelled; no model dispatch.";
 						break;
 					}
-					const result = await this.host.abortRun(state.runId || state.conversationId);
+					if (!state.runId) {
+						answer = "Stop failed: no exact run ID; stop this run in the web conversation.";
+						break;
+					}
+					const result = await this.host.abortRun(state.runId);
 					answer = result?.ok ? "Stop requested." : `Stop failed: ${result?.error || "no active run"}`;
 					break;
 				}
@@ -90,6 +99,7 @@ export function installChannelBehavior(Bridge, platform, api, extract, chunk, st
 					}
 					state.conversationId = `${platform}_${randomUUID()}`;
 					state.epoch = randomUUID();
+					await this.revokeSessionRoutes(state);
 					if (arg) return { prompt: arg, epoch: state.epoch };
 					answer = "Started a fresh conversation (history retained).";
 					break;
@@ -145,10 +155,12 @@ export function installChannelBehavior(Bridge, platform, api, extract, chunk, st
 				default:
 					answer = `Unknown command: ${command}. Use /help.`;
 			}
+			if (state.epoch !== previousEpoch) await this.revokeSessionRoutes(state);
 			await this.reply(route, answer);
 			return true;
 		},
 		async inbound(event) {
+			const generation = this.generation;
 			if (
 				!event ||
 				(discord
@@ -193,6 +205,7 @@ export function installChannelBehavior(Bridge, platform, api, extract, chunk, st
 					if (command.epoch !== state.epoch) throw new Error("Session changed; retry reset prompt");
 					text = command.prompt;
 				}
+				if (generation !== this.generation) return;
 				if (state.busy) {
 					await this.reply(route, "Run active. Wait or use /stop.");
 					return;
@@ -236,12 +249,21 @@ export function installChannelBehavior(Bridge, platform, api, extract, chunk, st
 					}
 				}
 				controller.signal.throwIfAborted();
+				if (generation !== this.generation) return;
 				state.downloadController = null;
 				this.status.messagesReceived++;
 				this.status.lastMessageAt = Date.now();
 				this.dispatches ??= new Set();
 				this.ownedRuns ??= new Map();
-				const run = { route, state, epoch: state.epoch, text: "", events: new Map(), truncated: false };
+				const run = {
+					route,
+					state,
+					epoch: state.epoch,
+					account: accountKey(cfg),
+					text: "",
+					events: new Map(),
+					truncated: false,
+				};
 				this.dispatches.add(run);
 				try {
 					const result = await this.host.chat({
@@ -258,11 +280,21 @@ export function installChannelBehavior(Bridge, platform, api, extract, chunk, st
 					});
 					if (result?.ok === false || !result?.conversationId || !result?.runId)
 						throw new Error(result?.error || "Host did not return conversationId and stable runId");
-					if (state.epoch !== run.epoch) return;
+					if (
+						generation !== this.generation ||
+						state.epoch !== run.epoch ||
+						run.account !== accountKey(this.getConfig()) ||
+						![...(this.channelStates?.values() || [])].includes(state)
+					)
+						return;
 					state.conversationId = result.conversationId;
+					run.sessionId = result.sessionId;
+					run.clientId = result.clientId;
 					run.runId = result.runId;
 					state.runId = result.runId;
 					this.ownedRuns.set(result.runId, run);
+					await this.bindSessionRoute(result, run);
+					if (generation !== this.generation) return;
 					this.dispatches.delete(run);
 					const early = run.events.get(result.runId);
 					if (early) {
@@ -275,6 +307,7 @@ export function installChannelBehavior(Bridge, platform, api, extract, chunk, st
 					this.dispatches.delete(run);
 				}
 			} catch (error) {
+				if (generation !== this.generation) return;
 				if (acquired) {
 					state.busy = false;
 					state.downloadController = null;
@@ -284,25 +317,33 @@ export function installChannelBehavior(Bridge, platform, api, extract, chunk, st
 			}
 		},
 		async handleRunEvent(ev) {
-			if (!ev.runId) return;
-			const run = this.ownedRuns?.get(ev.runId);
+			const generation = this.generation;
+			const run = await this.findSessionRun(ev);
+			if (generation !== this.generation) return;
 			if (!run) {
+				if (!ev.runId) return;
 				for (const pending of this.dispatches || []) {
 					if (ev.type !== "run_end" && !(ev.type === "message" && ev.message?.role === "assistant")) continue;
 					let early = pending.events.get(ev.runId);
 					if (!early) {
+						if (pending.events.size >= 64) continue;
 						early = { text: "", truncated: false };
 						pending.events.set(ev.runId, early);
 					}
 					if (ev.type === "run_end") early.end = ev;
 					else {
-						const used = [...pending.events.values()].reduce((sum, item) => sum + Buffer.byteLength(item.text), 0);
-						appendAssistant(early, ev.message, Math.max(0, OUTPUT_BYTES - used));
+						appendAssistant(early, ev.message);
 					}
 				}
 				return;
 			}
-			if (run.epoch !== run.state.epoch) {
+			if (
+				run.ended ||
+				(ev.sessionId && run.sessionId && ev.sessionId !== run.sessionId) ||
+				(ev.clientId && run.clientId && ev.clientId !== run.clientId)
+			)
+				return;
+			if (run.epoch !== run.state.epoch || run.account !== accountKey(this.getConfig())) {
 				this.ownedRuns.delete(ev.runId);
 				return;
 			}
@@ -310,7 +351,9 @@ export function installChannelBehavior(Bridge, platform, api, extract, chunk, st
 				appendAssistant(run, ev.message);
 			}
 			if (ev.type === "run_end") {
-				this.ownedRuns.delete(ev.runId);
+				run.ended = true;
+				this.ownedRuns?.delete(ev.runId);
+				if (!ev.runId) this.webRuns?.delete(identityKey(ev));
 				run.state.busy = false;
 				if (run.state.runId === ev.runId) run.state.runId = undefined;
 				await this.reply(
@@ -326,8 +369,12 @@ export function installChannelBehavior(Bridge, platform, api, extract, chunk, st
 					]
 						.filter(Boolean)
 						.join("\n\n") || "Task completed (no text output).",
-					() => run.epoch === run.state.epoch,
+					() =>
+						generation === this.generation &&
+						run.epoch === run.state.epoch &&
+						run.account === accountKey(this.getConfig()),
 				);
+				if (generation !== this.generation) return;
 				this.status.messagesReplied++;
 				this.status.lastReplyAt = Date.now();
 			}

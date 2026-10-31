@@ -1393,6 +1393,8 @@
 		"localBotSelectAll": "Select all",
 		"localBotClear": "Clear",
 		"localBotUnavailable": "Unavailable in this project; retained until removed",
+		"localBotToolHighPrivilege": "Can create other execution contexts or modify host configuration. Authorize as needed.",
+		"localBotToolUnsupportedPlatform": "Unsupported on this device platform; execution may still be unavailable after authorization.",
 		"localBotUnverified": "Not verified; selection retained",
 		"localBotOptionsLoading": "Loading project catalogs…",
 		"localBotNoOptions": "No matching options",

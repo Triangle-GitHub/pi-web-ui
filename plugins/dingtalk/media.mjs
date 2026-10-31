@@ -159,9 +159,23 @@ export async function sendMedia(cfg, args) {
 							duration: String(args.duration),
 							picMediaId: await uploadMedia(args.coverPath, "image", token),
 						};
+	return sendRobotMessage(
+		cfg,
+		args,
+		{ image: "sampleImageMsg", audio: "sampleAudio", file: "sampleFile", video: "sampleVideo" }[type],
+		params,
+		token,
+	);
+}
+
+/** Shared enterprise delivery, preserving recipient validation and honest API errors. */
+export async function sendRobotMessage(cfg, args, msgKey, params, token) {
+	if (!cfg.robotCode || (!args.openConversationId && !args.userId) || (args.openConversationId && args.userId))
+		throw new Error("企业机器人发送需要 robotCode 和唯一的精确接收目标");
+	token ||= await accessToken(cfg);
 	const body = {
 		robotCode: cfg.robotCode,
-		msgKey: { image: "sampleImageMsg", audio: "sampleAudio", file: "sampleFile", video: "sampleVideo" }[type],
+		msgKey,
 		msgParam: JSON.stringify(params),
 		...(args.openConversationId ? { openConversationId: args.openConversationId } : { userIds: [args.userId] }),
 	};

@@ -1393,6 +1393,8 @@
 		"localBotSelectAll": "全选",
 		"localBotClear": "清空",
 		"localBotUnavailable": "当前專案不可用；保留至手动移除",
+		"localBotToolHighPrivilege": "可建立其他执行环境或修改宿主配置，请按需授权。",
+		"localBotToolUnsupportedPlatform": "当前设备平台不支援此工具，授权后仍可能无法执行。",
 		"localBotUnverified": "尚未验证；已保留选择",
 		"localBotOptionsLoading": "正在加载專案目录…",
 		"localBotNoOptions": "没有匹配选项",

@@ -19,6 +19,176 @@ import activate, {
 } from "../../plugins/qq/index.mjs";
 
 describe("QQ 运行归属行为", () => {
+	it.each([true, false])(
+		"two peers sharing c1 isolate concurrent QQ and web rounds (sessionId=%s)",
+		async (withSessionId) => {
+			let round = 0;
+			const identities = new Map<string, any>();
+			const chat = vi.fn(async (req: any) => {
+				const identity = identities.get(req.accountId) || {
+					conversationId: "c1",
+					clientId: `plugin:qq:${req.accountId}`,
+					...(withSessionId ? { sessionId: `session:${req.accountId}` } : {}),
+				};
+				identities.set(req.accountId, identity);
+				return { ...identity, runId: `run:${req.accountId}:${round}` };
+			});
+			const bridge = new QqBotBridge({ host: { chat }, getConfig: () => ({}) });
+			const reply = vi.fn(async () => {});
+			bridge.replyMessage = reply;
+			const peers = ["a", "b"];
+			try {
+				for (round = 0; round < 2; round++) {
+					await Promise.all(
+						peers.map((peer) => bridge.driveAuthor(peer, `question:${round}:${peer}`, { userOpenid: peer })),
+					);
+					expect(bridge.pendingRuns.size).toBe(2);
+					expect([...bridge.pendingRuns.keys()].sort()).toEqual(["peer:a:0", "peer:b:0"]);
+					const receipts = await Promise.all(chat.mock.results.slice(-2).map((result) => result.value));
+					await Promise.all(
+						receipts.map((identity, index) =>
+							bridge.handleRunEvent({
+								...identity,
+								type: "message",
+								message: { role: "assistant", content: `answer:${round}:${peers[index]}` },
+							}),
+						),
+					);
+					await Promise.all(
+						receipts.reverse().map((identity) => bridge.handleRunEvent({ ...identity, type: "run_end" })),
+					);
+					expect(bridge.pendingRuns.size).toBe(0);
+					expect(bridge.runIdIndex.size).toBe(0);
+				}
+				expect(chat.mock.calls.slice(2).map(([req]) => req.conversationId)).toEqual(["c1", "c1"]);
+				const routes = [...identities.values()];
+				await Promise.all(routes.map((identity) => bridge.handleRunEvent({ ...identity, type: "run_start" })));
+				expect(bridge.pendingRuns.size).toBe(2);
+				await Promise.all(
+					routes.map((identity, index) =>
+						bridge.handleRunEvent({
+							...identity,
+							type: "message",
+							message: { role: "assistant", content: `web:${peers[index]}` },
+						}),
+					),
+				);
+				await Promise.all(routes.map((identity) => bridge.handleRunEvent({ ...identity, type: "run_end" })));
+				expect(reply.mock.calls.map((call: any[]) => [call[0].userOpenid, call[1]]).sort()).toEqual(
+					[
+						["a", "answer:0:a"],
+						["a", "answer:1:a"],
+						["a", "web:a"],
+						["b", "answer:0:b"],
+						["b", "answer:1:b"],
+						["b", "web:b"],
+					].sort(),
+				);
+				expect(bridge.getRecentChats()).toHaveLength(2);
+				expect(bridge.pendingRuns.size).toBe(0);
+			} finally {
+				await bridge.stop();
+			}
+		},
+	);
+
+	it("reset revokes a web round without runId without aborting a reused c1", async () => {
+		const identity = { conversationId: "c1", clientId: "plugin:qq:reset", sessionId: "reset-session" };
+		const abortRun = vi.fn(async () => ({ ok: true }));
+		const bridge = new QqBotBridge({
+			host: { chat: vi.fn(async () => ({ ...identity, runId: "initial" })), abortRun },
+			getConfig: () => ({}),
+		});
+		const reply = vi.fn(async () => {});
+		bridge.replyMessage = reply;
+		try {
+			await bridge.driveAuthor("u", "hello", { userOpenid: "u" });
+			await bridge.handleRunEvent({ ...identity, runId: "initial", type: "run_end" });
+			reply.mockClear();
+			const web = { ...identity, clientId: "browser" };
+			await bridge.handleRunEvent({ ...web, type: "run_start" });
+			expect(bridge.pendingRuns.size).toBe(1);
+			await bridge.handleRunEvent({ ...web, type: "message", message: { role: "assistant", content: "stale" } });
+			expect(await bridge.resetAuthorSession("u", {}, {})).toBe(true);
+			expect(abortRun).not.toHaveBeenCalled();
+			expect(bridge.peerSessionSeq.get("u")).toBe(1);
+			await bridge.handleRunEvent({ ...web, type: "run_end" });
+			await bridge.handleRunEvent({ ...web, type: "run_start" });
+			expect(bridge.pendingRuns.size).toBe(0);
+			expect(reply).not.toHaveBeenCalled();
+		} finally {
+			await bridge.stop();
+		}
+	});
+	it("sessionId survives browser ownership changes; unknown run IDs and duplicate ends cannot deliver", async () => {
+		const storage = { set: vi.fn(async () => {}) };
+		const cfg = { appId: "account-a" };
+		const bridge = new QqBotBridge({
+			host: {
+				storage,
+				chat: vi.fn(async () => ({ conversationId: "c1", clientId: "plugin:qq:x", sessionId: "s1", runId: "r1" })),
+			},
+			getConfig: () => cfg,
+		});
+		bridge.replyMessage = vi.fn(async () => {});
+		await bridge.driveAuthor("u", "hello", { groupOpenid: "group-a" });
+		await bridge.handleRunEvent({ type: "run_end", conversationId: "c1", runId: "r1" });
+		vi.mocked(bridge.replyMessage).mockClear();
+		const identity = { conversationId: "renamed", clientId: "browser", sessionId: "s1" };
+		await bridge.handleRunEvent({ ...identity, type: "run_start", runId: "unknown" });
+		await bridge.handleRunEvent({
+			...identity,
+			type: "message",
+			runId: "unknown",
+			message: { role: "assistant", content: "wrong" },
+		});
+		await bridge.handleRunEvent({ ...identity, type: "run_end", runId: "unknown" });
+		expect(bridge.replyMessage).not.toHaveBeenCalled();
+		await bridge.handleRunEvent({ ...identity, type: "run_start" });
+		await bridge.handleRunEvent({
+			...identity,
+			type: "message",
+			message: { role: "assistant", content: "tool preface" },
+		});
+		await bridge.handleRunEvent({
+			...identity,
+			type: "message",
+			message: { role: "assistant", stopReason: "toolUse", content: [{ type: "toolCall", name: "read" }] },
+		});
+		await bridge.handleRunEvent({
+			...identity,
+			type: "message",
+			message: { role: "assistant", content: "final answer" },
+		});
+		await bridge.handleRunEvent({ ...identity, type: "run_end" });
+		await bridge.handleRunEvent({ ...identity, type: "run_end" });
+		expect(bridge.replyMessage).toHaveBeenCalledTimes(1);
+		expect(vi.mocked(bridge.replyMessage).mock.calls[0][1]).toBe("final answer");
+		await bridge.routeSave;
+		expect(storage.set).toHaveBeenCalledWith(
+			"sessionRoutes",
+			expect.objectContaining({
+				routes: expect.arrayContaining([["session:s1", expect.objectContaining({ authorId: "u" })]]),
+			}),
+		);
+		await bridge.resetAuthorSession("u", {}, cfg);
+		await bridge.handleRunEvent({ ...identity, type: "run_start" });
+		expect(bridge.pendingRuns.size).toBe(0);
+		await bridge.stop();
+	});
+
+	it("routes fail closed across accounts, group scopes, and ambiguous owners", () => {
+		const cfg = { appId: "a", useSandbox: false };
+		const bridge = new QqBotBridge({ host: {}, getConfig: () => cfg });
+		const a = bridge.sessionPeer("u", { groupOpenid: "a" });
+		const b = bridge.sessionPeer("u", { groupOpenid: "b" });
+		const route = bridge.bindSessionRoute({ sessionId: "shared" }, a, { groupOpenid: "a" });
+		expect(a).not.toBe(b);
+		expect(bridge.bindSessionRoute({ sessionId: "shared" }, b, { groupOpenid: "b" })).toBeNull();
+		expect(bridge.validSessionRoute(bridge.sessionRoutes.get("session:shared"))).toBe(false);
+		cfg.appId = "b";
+		expect(bridge.validSessionRoute(route)).toBe(false);
+	});
 	it("回执前事件按稳定 runId 重放，跨群不串话并用真实 ID 续聊", async () => {
 		let bridge: any;
 		const chat = vi.fn(async (req: any) => {
@@ -108,7 +278,7 @@ describe("QQ 运行归属行为", () => {
 		const chat = vi.fn(async (req: any) => {
 			const id = contexts.has(req.conversationId) ? req.conversationId : `canonical-${contexts.size}`;
 			contexts.set(id, [...(contexts.get(id) || []), req.text]);
-			return { conversationId: id };
+			return { conversationId: id, clientId: "plugin:qq:reset", sessionId: `session-${id}` };
 		});
 		const cfg = { bindActive, workspace: process.cwd() };
 		const bridge = new QqBotBridge({
@@ -126,18 +296,26 @@ describe("QQ 运行归属行为", () => {
 				},
 				"C2C_MESSAGE_CREATE",
 			);
-		const finish = () => bridge.handleRunEvent({ type: "run_end", conversationId: `canonical-${contexts.size - 1}` });
+		const finish = () =>
+			bridge.handleRunEvent({
+				type: "run_end",
+				conversationId: `canonical-${contexts.size - 1}`,
+				clientId: "plugin:qq:reset",
+				sessionId: `session-canonical-${contexts.size - 1}`,
+			});
 		try {
 			await inbound("旧上下文");
 			await finish();
-			expect(bridge.conversationBindings.get("canonical-0").replyTarget).toMatchObject({ msgId: "reset-1" });
-			bridge.webRunTexts.set("canonical-0", "旧网页输出");
+			const oldKey = [...bridge.conversationBindings.keys()][0];
+			expect(oldKey).toMatch(/^peer:.*:0$/);
+			expect(bridge.conversationBindings.get(oldKey).replyTarget).toMatchObject({ msgId: "reset-1" });
+			bridge.webRunTexts.set(oldKey, "旧网页输出");
 			bridge.conversationBindings.set("other", { authorId: "other", replyTarget: {} });
 			bridge.userModels.set("u", "old-model");
 			bridge.userThinkingLevels.set("u", "low");
 			await inbound(command);
-			expect(bridge.conversationBindings.has("canonical-0")).toBe(false);
-			expect(bridge.webRunTexts.has("canonical-0")).toBe(false);
+			expect(bridge.conversationBindings.has(oldKey)).toBe(false);
+			expect(bridge.webRunTexts.has(oldKey)).toBe(false);
 			expect(bridge.conversationBindings.has("other")).toBe(true);
 			if (command.includes("新提示Ａ")) {
 				expect(chat.mock.calls.at(-1)![0].text).toBe("新提示Ａ");
@@ -256,7 +434,7 @@ describe("QQ 运行归属行为", () => {
 				expect(bridge.runIdIndex.has("old-run")).toBe(false);
 				expect(bridge.inFlightConvs.size).toBe(0);
 				expect(bridge.earlyRunEvents.size).toBe(0);
-				expect(bridge.pendingRuns.size).toBe(action === "reset" ? 2 : 0);
+				expect(bridge.pendingRuns.size).toBe(action === "reset" ? 1 : 0);
 				expect(vi.mocked(bridge.replyMessage).mock.calls.some((call: any[]) => String(call[1]).includes("stale"))).toBe(
 					false,
 				);
@@ -299,24 +477,25 @@ describe("QQ 运行归属行为", () => {
 				}
 			});
 			bridge.replyMessage = reply;
-			bridge.conversationBindings.set("old", { authorId: "u", replyTarget: target });
-			if (webSync) bridge.webRunTexts.set("old", text);
-			else bridge.pendingRuns.set("old", { authorId: "u", replyTarget: target, accumulatedText: text });
-			const delivery = bridge.handleRunEvent({ type: "run_end", conversationId: "old" });
+			const identity = { conversationId: "old", clientId: "plugin:qq:chunks", sessionId: "chunk-session" };
+			const key = webSync ? "session:chunk-session" : "peer:u:0";
+			bridge.conversationBindings.set(key, { authorId: "u", replyTarget: target });
+			if (webSync) {
+				bridge.bindSessionRoute(identity, "u", target);
+				await bridge.handleRunEvent({ ...identity, type: "run_start" });
+			} else bridge.pendingRuns.set(key, { ...identity, authorId: "u", replyTarget: target });
+			await bridge.handleRunEvent({ ...identity, type: "message", message: { role: "assistant", content: text } });
+			const delivery = bridge.handleRunEvent({ ...identity, type: "run_end" });
 			try {
 				await sending;
 				if (action === "stop") await bridge.stop();
-				else if (action === "rebind") bridge.conversationBindings.set("old", { authorId: "u", replyTarget: target });
+				else if (action === "rebind") bridge.bindSessionRoute(identity, "u", { msgId: "new-target" });
 				else if (action !== "continue")
 					await bridge.handleSlashCommand(action, { authorId: "u", replyTarget: {}, cfg });
 				release();
 				await delivery;
 				const sent = reply.mock.calls.filter(([t]) => t === target);
-				expect(sent.length).toBe(
-					action === "continue"
-						? chunkMarkdownText(webSync ? `💻 [来自电脑网页端同步]\n${text.trim()}` : text.trim(), 3000).length
-						: 1,
-				);
+				expect(sent.length).toBe(action === "continue" ? chunkMarkdownText(text.trim(), 3000).length : 1);
 				expect(bridge.status.messagesReplied).toBe(action === "continue" ? 1 : 0);
 				expect(bridge.status.lastReplyAt === null).toBe(action !== "continue");
 			} finally {
@@ -478,7 +657,9 @@ describe("QqBotBridge 双工逻辑测试", () => {
 		vi.stubGlobal("fetch", fetchMock);
 
 		let runHandler: ((ev: any) => void) | null = null;
-		const chatSpy = vi.fn().mockResolvedValue({ conversationId: "conv_qq_1" });
+		const chatSpy = vi
+			.fn()
+			.mockResolvedValue({ conversationId: "conv_qq_1", clientId: "plugin:qq:markdown", sessionId: "qq-markdown" });
 
 		const bridge = new QqBotBridge({
 			host: {
@@ -513,9 +694,11 @@ describe("QqBotBridge 双工逻辑测试", () => {
 			}),
 		);
 
-		const convId = chatSpy.mock.calls[0][0].conversationId;
+		const convId = "conv_qq_1";
+		const identity = { clientId: "plugin:qq:markdown", sessionId: "qq-markdown" };
 
 		runHandler!({
+			...identity,
 			conversationId: convId,
 			type: "message",
 			message: {
@@ -524,10 +707,7 @@ describe("QqBotBridge 双工逻辑测试", () => {
 			},
 		});
 
-		await runHandler!({
-			conversationId: convId,
-			type: "run_end",
-		});
+		await runHandler!({ ...identity, conversationId: convId, type: "run_end" });
 
 		expect(fetchMock).toHaveBeenCalledWith(
 			expect.stringContaining("/channels/c_123/messages"),
@@ -543,7 +723,9 @@ describe("QqBotBridge 双工逻辑测试", () => {
 	it("长回复按 3000 字分块后，replyMessage 调用时的 msg_seq 严格从 1 递增", async () => {
 		const replySpy = vi.fn().mockResolvedValue({});
 		let runHandler: ((ev: any) => void) | null = null;
-		const chatSpy = vi.fn().mockResolvedValue({ conversationId: "conv_qq_long" });
+		const chatSpy = vi
+			.fn()
+			.mockResolvedValue({ conversationId: "conv_qq_long", clientId: "plugin:qq:long", sessionId: "qq-long" });
 
 		const fetchMock = vi.fn().mockResolvedValue({
 			ok: true,
@@ -579,11 +761,13 @@ describe("QqBotBridge 双工逻辑测试", () => {
 			"AT_MESSAGE_CREATE",
 		);
 
-		const convId = chatSpy.mock.calls[0][0].conversationId;
+		const convId = "conv_qq_long";
+		const identity = { clientId: "plugin:qq:long", sessionId: "qq-long" };
 
 		// 构造超过 3000 字的长回复，使其切为至少 2 块
 		const longReply = "A".repeat(3500);
 		runHandler!({
+			...identity,
 			conversationId: convId,
 			type: "message",
 			message: {
@@ -592,10 +776,7 @@ describe("QqBotBridge 双工逻辑测试", () => {
 			},
 		});
 
-		await runHandler!({
-			conversationId: convId,
-			type: "run_end",
-		});
+		await runHandler!({ ...identity, conversationId: convId, type: "run_end" });
 
 		expect(replySpy).toHaveBeenCalledTimes(2);
 		expect(replySpy.mock.calls[0][2]).toBe(1);
@@ -873,7 +1054,8 @@ describe("QqBotBridge 双工逻辑测试", () => {
 		vi.stubGlobal("fetch", fetchMock);
 
 		let runHandler: ((ev: any) => void) | null = null;
-		const chatSpy = vi.fn().mockResolvedValue({ conversationId: "conv_qq_sync" });
+		const identity = { conversationId: "conv_qq_sync", clientId: "plugin:qq:sync", sessionId: "qq-sync" };
+		const chatSpy = vi.fn().mockResolvedValue(identity);
 
 		const bridge = new QqBotBridge({
 			host: {
@@ -904,18 +1086,17 @@ describe("QqBotBridge 双工逻辑测试", () => {
 		);
 
 		// 第一轮 run 完成，从 pendingRuns 中出队
-		await runHandler!({
-			conversationId: "conv_qq_sync",
-			type: "run_end",
-		});
+		await runHandler!({ ...identity, type: "run_end" });
 
 		const chats = bridge.getRecentChats();
 		expect(chats.length).toBeGreaterThan(0);
 		expect(chats[0].lastUserText).toBe("同步测试提问");
 
-		// 2. 此时会话已建立绑定。模拟电脑网页端在该会话中发起了新对话（非 pendingRuns 来源）
-		runHandler!({
-			conversationId: "conv_qq_sync",
+		// 2. 网页端沿稳定 session 续聊，先显式开始新一轮。
+		const webIdentity = { ...identity, clientId: "browser:sync" };
+		await runHandler!({ ...webIdentity, type: "run_start" });
+		await runHandler!({
+			...webIdentity,
 			type: "message",
 			message: {
 				role: "assistant",
@@ -923,16 +1104,13 @@ describe("QqBotBridge 双工逻辑测试", () => {
 			},
 		});
 
-		await runHandler!({
-			conversationId: "conv_qq_sync",
-			type: "run_end",
-		});
+		await runHandler!({ ...webIdentity, type: "run_end" });
 
-		// 3. 验证触发了向 QQ 频道的推送，且内容带有电脑端同步标识
+		// 3. 验证最终正文同步至原 QQ 频道。
 		expect(fetchMock).toHaveBeenCalledWith(
 			expect.stringContaining("/channels/c_sync_1/messages"),
 			expect.objectContaining({
-				body: expect.stringContaining("来自电脑网页端同步"),
+				body: expect.stringContaining("这是电脑网页端生成的回答内容"),
 			}),
 		);
 

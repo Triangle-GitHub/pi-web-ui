@@ -236,6 +236,7 @@ describe("wechat-ilink: 完整入站、隔离与无竞态回包（issue #345）"
 			runHandler!({
 				type: "message",
 				conversationId: targetConvId,
+				clientId: `plugin:wechat-ilink:${req.accountId}`,
 				at: Date.now(),
 				message: {
 					role: "assistant",
@@ -251,6 +252,7 @@ describe("wechat-ilink: 完整入站、隔离与无竞态回包（issue #345）"
 			runHandler!({
 				type: "run_end",
 				conversationId: targetConvId,
+				clientId: `plugin:wechat-ilink:${req.accountId}`,
 				at: Date.now(),
 			});
 
@@ -935,7 +937,7 @@ describe("wechat-ilink: 斜杠快捷指令 (Slash Commands)", () => {
 		}
 	});
 
-	it("bindActive 连发两条指令时，先前那一轮已产出的正文不会丢（run_end 只来一次）", async () => {
+	it("bindActive 连发两条指令时只回传末条正文（run_end 只来一次）", async () => {
 		// 实测反馈（issue #770）：投递到网页活跃会话模式下来回聊几句后就没回包了。
 		// 连发场景下宿主把第二条消息 steer 进**同一个**在跑的 run（run_end 只来一次，runId
 		// 是最新的那条）；旧实现在投递第二条前用 dropRunByConv 把该会话的登记与已累积正文
@@ -1065,7 +1067,7 @@ describe("wechat-ilink: 斜杠快捷指令 (Slash Commands)", () => {
 				expect(sentMessages.length).toBe(1);
 			});
 			// 两轮正文都在：先前那一轮的产出绝不能被新消息清掉
-			expect(sentMessages[0]).toContain("答复第一条");
+			expect(sentMessages[0]).not.toContain("答复第一条");
 			expect(sentMessages[0]).toContain("答复第二条");
 
 			cleanup?.();
@@ -1266,6 +1268,154 @@ describe("wechat-ilink: 回执与入站边界行为", () => {
 			},
 		};
 	}
+	it("网页续聊跨 owner 迁移后依 sessionId 回传，重复结束只发送一次", async () => {
+		const h = await runInbound([msg({ context_token: "ctx-a" })], () => ({
+			conversationId: "c1",
+			clientId: "wx-owner",
+			sessionId: "sdk-a",
+			runId: "wx-run",
+		}));
+		try {
+			await vi.waitFor(() => expect(h.chat).toHaveBeenCalledOnce());
+			await Promise.resolve();
+			h.emit({ type: "run_end", runId: "wx-run", sessionId: "sdk-a", clientId: "wx-owner", conversationId: "c1" });
+			await vi.waitFor(() => expect(h.replies).toHaveLength(1));
+			const ev = { sessionId: "sdk-a", clientId: "web-owner", conversationId: "c7" };
+			h.emit({ ...ev, type: "run_start" });
+			h.emit({
+				...ev,
+				type: "message",
+				message: { role: "assistant", content: [{ type: "text", text: "网页继续的回答" }] },
+			});
+			h.emit({ ...ev, type: "run_end" });
+			h.emit({ ...ev, type: "run_end" });
+			await vi.waitFor(() => expect(h.replies).toHaveLength(2));
+			expect(h.replies[1]).toBe("网页继续的回答");
+		} finally {
+			h.close();
+		}
+	});
+	it("旧宿主只按完整 owner 匹配，禁止纯 c1 或不同 session 认领", async () => {
+		const h = await runInbound([msg()], () => ({ conversationId: "c1", clientId: "owner", runId: "first" }));
+		try {
+			await vi.waitFor(() => expect(h.chat).toHaveBeenCalledOnce());
+			await Promise.resolve();
+			h.emit({ type: "run_end", runId: "first", clientId: "owner", conversationId: "c1" });
+			await vi.waitFor(() => expect(h.replies).toHaveLength(1));
+			for (const ev of [
+				{ conversationId: "c1" },
+				{ clientId: "other", conversationId: "c1" },
+				{ clientId: "owner", conversationId: "c1", sessionId: "unknown" },
+			])
+				h.emit({ ...ev, type: "run_end", runId: "foreign" });
+			expect(h.replies).toHaveLength(1);
+			h.emit({ type: "run_start", clientId: "owner", conversationId: "c1" });
+			h.emit({ type: "run_end", clientId: "owner", conversationId: "c1" });
+			await vi.waitFor(() => expect(h.replies).toHaveLength(2));
+		} finally {
+			h.close();
+		}
+	});
+	it("/new 使旧 session 路由失效，dispose 后迟到事件无副作用", async () => {
+		const h = await runInbound([msg()], () => ({
+			conversationId: "c1",
+			clientId: "owner",
+			sessionId: "sdk-old",
+			runId: "first",
+		}));
+		try {
+			await vi.waitFor(() => expect(h.chat).toHaveBeenCalledOnce());
+			await Promise.resolve();
+			h.emit({ type: "run_end", runId: "first" });
+			await h.enqueue([msg({ item_list: [{ type: 1, text_item: { text: "/new" } }] })]);
+			await vi.waitFor(() => expect(h.storage.get("peerSessionSeq")).toEqual({ "same-user": 1 }));
+			const count = h.replies.length;
+			h.emit({ type: "run_end", sessionId: "sdk-old", clientId: "owner", conversationId: "c1", runId: "late" });
+			expect(h.replies).toHaveLength(count);
+			h.close();
+			h.emit({ type: "run_end", sessionId: "sdk-old", runId: "disposed" });
+			expect(h.replies).toHaveLength(count);
+		} finally {
+			h.close();
+		}
+	});
+	it.each([false, true])("工具前言不作为最终正文（有 final=%s）", async (hasFinal) => {
+		const h = await runInbound([msg()], (_req, emit) => {
+			const ev = { runId: "early-final", clientId: "owner", conversationId: "c1", sessionId: "sdk-final" };
+			emit({
+				...ev,
+				type: "message",
+				message: {
+					role: "assistant",
+					stopReason: "toolUse",
+					content: [
+						{ type: "text", text: "工具前言" },
+						{ type: "toolCall", name: "read" },
+					],
+				},
+			});
+			if (hasFinal)
+				emit({ ...ev, type: "message", message: { role: "assistant", content: [{ type: "text", text: "最终回答" }] } });
+			emit({ ...ev, type: "run_end" });
+			return ev;
+		});
+		try {
+			await vi.waitFor(() => expect(h.replies).toHaveLength(1));
+			expect(h.replies[0]).toBe(hasFinal ? "最终回答" : "任务完成（无文本输出）。");
+		} finally {
+			h.close();
+		}
+	});
+	it("bindActive 多 peer 共用会话后网页轮次不猜收件人", async () => {
+		let calls = 0;
+		const h = await runInbound(
+			[msg(), msg({ from_user_id: "other-user" })],
+			() => ({
+				conversationId: "shared",
+				clientId: "web",
+				sessionId: "sdk-shared",
+				runId: `wx-${++calls}`,
+			}),
+			{ bindActive: true },
+		);
+		try {
+			await vi.waitFor(() => expect(h.chat).toHaveBeenCalledTimes(2));
+			await Promise.resolve();
+			h.emit({ type: "run_end", runId: "wx-2", sessionId: "sdk-shared" });
+			const count = h.replies.length;
+			const ev = { sessionId: "sdk-shared", clientId: "web", conversationId: "shared" };
+			h.emit({ ...ev, type: "run_start" });
+			h.emit({ ...ev, type: "run_end" });
+			expect(h.replies).toHaveLength(count);
+		} finally {
+			h.close();
+		}
+	});
+	it("已有精确插件 account 会话可在 reload 后恢复网页回复路由", async () => {
+		const storage = new Map<string, unknown>([
+			["peerCtx", { "same-user": "ctx-old" }],
+			["allowedPeers", ["same-user"]],
+		]);
+		const h = await runInbound([], undefined, { storage });
+		try {
+			const ev = {
+				sessionId: "existing-sdk",
+				clientId: `plugin:wechat-ilink:${peerAccountId("same-user")}`,
+				conversationId: "c1",
+			};
+			h.emit({ ...ev, type: "run_start" });
+			h.emit({ ...ev, type: "message", message: { role: "assistant", content: [{ type: "text", text: "已有会话" }] } });
+			h.emit({ ...ev, type: "run_end" });
+			await vi.waitFor(() => expect(h.replies).toEqual(["已有会话"]));
+			expect(storage.get("sessionRoutes")).toEqual(
+				expect.arrayContaining([
+					["session:existing-sdk", expect.objectContaining({ to: "same-user", ctx: "ctx-old" })],
+				]),
+			);
+		} finally {
+			h.close();
+		}
+	});
 	const msg = (extra = {}) => ({
 		message_type: 1,
 		from_user_id: "same-user",

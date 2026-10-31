@@ -27,6 +27,7 @@ type Options = {
 	cwd: string;
 	defaultCwd: string;
 	defaultModel?: string;
+	defaultTools?: string[];
 	models: ModelInfo[];
 	tools: BotCatalogEntry[];
 	skills: BotCatalogEntry[];
@@ -90,7 +91,9 @@ export function LocalBots({
 	const baseCwd = useRef("");
 	const drawer = useRef<HTMLDialogElement>(null);
 	const drawerOpen = draft !== null;
+	const toolsInitialized = useRef(false);
 	useEffect(() => {
+		toolsInitialized.current = false;
 		if (!drawerOpen) return;
 		const panel = drawer.current;
 		const previousFocus = document.activeElement as HTMLElement | null;
@@ -138,7 +141,17 @@ export function LocalBots({
 					throw new Error(t("localBotOptionsInvalid"));
 				baseCwd.current = data.defaultCwd;
 				setOptions(data);
-				if (!cwd) setDraft((old) => (old && !old.cwd ? { ...old, cwd: data.cwd } : old));
+				const initializeTools = !toolsInitialized.current;
+				toolsInitialized.current = true;
+				setDraft((old) =>
+					old
+						? {
+								...old,
+								...(!old.cwd ? { cwd: data.cwd } : {}),
+								...(initializeTools && !old.id ? { tools: [...(data.defaultTools ?? [])] } : {}),
+							}
+						: old,
+				);
 			})
 			.catch((cause) => {
 				if (!current.signal.aborted) setOptionsError(String(cause));
@@ -478,7 +491,10 @@ export function LocalBots({
 													selected={draft[key]}
 													disabled={busy}
 													pending={loading || !!optionsError}
-													onChange={(ids) => setDraft({ ...draft, [key]: ids })}
+													onChange={(ids) => {
+														if (key === "tools") toolsInitialized.current = true;
+														setDraft({ ...draft, [key]: ids });
+													}}
 												/>
 											</div>
 										))}

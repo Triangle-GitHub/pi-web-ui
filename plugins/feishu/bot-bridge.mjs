@@ -8,6 +8,7 @@
  */
 
 import { createHash } from "node:crypto";
+import { routes } from "./session-routes.mjs";
 import { chunkMarkdownText } from "./markdown-chunks.mjs";
 import { runtime, scopeKey, inboundResources, receiveAttachments, parseCommand } from "./runtime.mjs";
 
@@ -105,6 +106,8 @@ export class FeishuBotBridge {
 
 		// Active runs tracking: conversationId -> run context
 		this.pendingRuns = new Map();
+		this.sessionRoutes = new Map();
+		Object.assign(this, routes);
 		// Early arriving runs (microtask edge case protection)
 		this.earlyRuns = new Map();
 		// host.chat 回执的稳定 runId -> pendingRuns 的 key（对话被过户 / 撞 id 改名后
@@ -177,6 +180,7 @@ export class FeishuBotBridge {
 		this.generation = (this.generation || 0) + 1;
 		this.pendingRuns.clear();
 		this.earlyRuns.clear();
+		await this.routeSave;
 		this.status.enabled = false;
 		this.status.connected = false;
 		this.status.state = "idle";
@@ -391,7 +395,8 @@ export class FeishuBotBridge {
 		if (!openId) return;
 		const threadId = msg.thread_id || msg.root_id || "";
 		const scope = scopeKey(openId, chatId, threadId);
-		const ctx = { messageId, openId, chatId, cfg, scope, replyInThread: Boolean(threadId) };
+		this.syncRouteAccount();
+		const ctx = { messageId, openId, chatId, threadId, cfg, scope, replyInThread: Boolean(threadId) };
 		try {
 			const inboundText = extractInboundText(msg.content, msg.message_type);
 			// Strip only actual Feishu mention placeholders so command prompts keep literal @text.
@@ -430,6 +435,7 @@ export class FeishuBotBridge {
 
 	/** 把一次运行累积的文本分块回发到飞书（run_end，或「回执前已结束」的补发）。 */
 	async deliverReply(run) {
+		this.syncRouteAccount();
 		const cfg = run.cfg || this.getConfig();
 		const rawText = run.accumulatedText || "";
 		const cleanText = stripInternalMarkers(rawText);

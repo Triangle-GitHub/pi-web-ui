@@ -70,6 +70,12 @@ export interface MarkerStateForSettings {
 	markers: import("./protocol.js").UiMarkerInfo[];
 }
 
+/** Reuse one port per conversation; callbacks must capture its runtime, not active. */
+export interface SettingsRuntimeTarget {
+	isStreaming: () => boolean;
+	reloadSession: () => Promise<void>;
+}
+
 export interface SettingsHost {
 	clientId: string;
 	stateStore: ClientStateStore;
@@ -135,6 +141,7 @@ export class SettingsService {
 	private knownExtensions = new Map<string, UiExtensionInfo>();
 	/** 流式中改了需要 reload 的设置 → agent_end 后延迟应用（防拆毁运行中 run）。 */
 	private pendingReload = false;
+	private readonly pendingRuntimeReloads = new Set<SettingsRuntimeTarget>();
 	private unsubscribeSettings?: () => void;
 	private sharedVersion = 0;
 	private sharedQueue = Promise.resolve();
@@ -178,6 +185,7 @@ export class SettingsService {
 		this.unsubscribeSettings?.();
 		this.unsubscribeSettings = undefined;
 		this.pendingReload = false;
+		this.pendingRuntimeReloads.clear();
 	}
 
 	/** Apply a durable commit without saving it again. Serialize reloads; ignore stale deliveries. */
@@ -273,17 +281,20 @@ export class SettingsService {
 		return false;
 	}
 
-	hasPendingReload(): boolean {
-		return this.pendingReload;
+	hasPendingReload(runtimeTarget?: SettingsRuntimeTarget): boolean {
+		return runtimeTarget ? this.pendingRuntimeReloads.has(runtimeTarget) : this.pendingReload;
 	}
 
-	setPendingReload(v: boolean): void {
-		this.pendingReload = v;
+	setPendingReload(v: boolean, runtimeTarget?: SettingsRuntimeTarget): void {
+		if (runtimeTarget) {
+			if (v) this.pendingRuntimeReloads.add(runtimeTarget);
+			else this.pendingRuntimeReloads.delete(runtimeTarget);
+		} else this.pendingReload = v;
 	}
 
-	consumePendingReload(): boolean {
-		const v = this.pendingReload;
-		this.pendingReload = false;
+	consumePendingReload(runtimeTarget?: SettingsRuntimeTarget): boolean {
+		const v = this.hasPendingReload(runtimeTarget);
+		this.setPendingReload(false, runtimeTarget);
 		return v;
 	}
 
@@ -1112,7 +1123,7 @@ export class SettingsService {
 	}
 
 	/** Replace the current settings with the named preset and apply it. */
-	async applyPreset(name: string): Promise<void> {
+	async applyPreset(name: string, runtimeTarget?: SettingsRuntimeTarget): Promise<void> {
 		this.settings = this.current;
 		this.presets = this.host.stateStore.getPresets(this.host.clientId);
 		const p = this.presets.find((x) => x.name === name);
@@ -1169,7 +1180,7 @@ export class SettingsService {
 		if ((this.settings.showForkedParentSessions ?? false) !== prevShowForked) {
 			this.host.onSessionsFilterChanged?.();
 		}
-		await this.applyRuntime(true);
+		await this.applyRuntime(true, runtimeTarget);
 	}
 
 	/** Remove a named preset. */
@@ -1365,10 +1376,10 @@ export class SettingsService {
 	 * overrides read this.settings at call time, so a reload re-applies them.
 	 * Reloading mid-stream would tear down the in-flight run — defer instead.
 	 */
-	async applyRuntime(throwOnError = false): Promise<void> {
+	async applyRuntime(throwOnError = false, runtimeTarget?: SettingsRuntimeTarget): Promise<void> {
 		if (this.disposed || this.host.isDisposed()) return;
-		if (this.host.isStreaming()) {
-			this.pendingReload = true;
+		if ((runtimeTarget ?? this.host).isStreaming()) {
+			this.setPendingReload(true, runtimeTarget);
 			this.host.emit({
 				type: "notice",
 				level: "info",
@@ -1377,14 +1388,14 @@ export class SettingsService {
 			});
 			return;
 		}
-		await this.applyReload(throwOnError);
+		await this.applyReload(throwOnError, runtimeTarget);
 	}
 
 	/** session.reload() + refresh the slash-command catalog + push state. */
-	private async applyReload(throwOnError = false): Promise<void> {
+	private async applyReload(throwOnError = false, runtimeTarget?: SettingsRuntimeTarget): Promise<void> {
 		if (this.disposed || this.host.isDisposed()) return;
-		if (this.host.isStreaming()) {
-			this.pendingReload = true;
+		if ((runtimeTarget ?? this.host).isStreaming()) {
+			this.setPendingReload(true, runtimeTarget);
 			this.host.emit({
 				type: "notice",
 				level: "info",
@@ -1394,7 +1405,7 @@ export class SettingsService {
 			return;
 		}
 		try {
-			await this.host.reloadSession();
+			await (runtimeTarget ?? this.host).reloadSession();
 			if (this.disposed || this.host.isDisposed()) return;
 			this.refreshResources();
 			this.host.flushSnapshot();

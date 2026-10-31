@@ -64,6 +64,7 @@ interface LeftPanelProps {
 	sessions: SessionSummary[];
 	projects: ProjectSummary[];
 	activeConversationId: string;
+	sharedConversationOwner?: string;
 	activeGroupId?: string | null;
 	panelSend: (
 		msg:
@@ -84,6 +85,7 @@ interface LeftPanelProps {
 			| { type: "pin_conversation"; id: string; pinned: boolean }
 			| { type: "pin_session"; path: string; pinned: boolean }
 			| { type: "take_over_conversation"; owner: string; id: string }
+			| { type: "open_shared_conversation"; owner: string; id: string }
 			| { type: "peek_elsewhere_question"; owner: string; id: string }
 			| { type: "make_dir"; path: string; setAsCwd?: boolean },
 	) => boolean;
@@ -274,6 +276,7 @@ export const LeftPanel = memo(function LeftPanel({
 	sessions,
 	projects,
 	activeConversationId,
+	sharedConversationOwner,
 	activeGroupId,
 	panelSend,
 	active,
@@ -454,7 +457,12 @@ export const LeftPanel = memo(function LeftPanel({
 				// 过户：只在「另一处」行出现（无 owner/convId 的旧条目与定时任务 scheduler 条目隐藏；插件会话支持过户）。
 				if (entry.id === "host:conv-takeover") {
 					const isScheduler = Boolean(target.pseudo && target.owner?.startsWith("scheduler:"));
-					return isElsewhere && takeId && target.owner && !isScheduler ? entry : { ...entry, hidden: true };
+					const isShared = elsewhere.some(
+						(w) => w.owner === target.owner && w.convId === takeId && w.independent === false,
+					);
+					return isElsewhere && takeId && target.owner && !isScheduler && !isShared
+						? entry
+						: { ...entry, hidden: true };
 				}
 				// 关闭类是本会话口径，「另一处」行不适用。
 				if (isElsewhere && (entry.id === "host:conv-dismiss-subagents" || entry.id === "host:conv-force-dismiss"))
@@ -523,7 +531,7 @@ export const LeftPanel = memo(function LeftPanel({
 				onHostAction: (entry, tgt) => hostActionRef.current(entry, tgt),
 			});
 		},
-		[uiContextSession, conversations, finishedSubagentCount, t, capabilities.conversationRef],
+		[uiContextSession, conversations, elsewhere, finishedSubagentCount, t, capabilities.conversationRef],
 	);
 
 	/** host 内置条目的分派：作用范围（scopeId）来自打开菜单时记下的 target。
@@ -746,6 +754,7 @@ export const LeftPanel = memo(function LeftPanel({
 		convId?: string;
 		hasQuestion?: boolean;
 		pseudo?: boolean;
+		independent?: boolean;
 		/** 持有方页面已断开（标签页/浏览器关了），只剩服务端残留会话：行仍可过户。 */
 		ownerOffline?: boolean;
 	};
@@ -774,17 +783,26 @@ export const LeftPanel = memo(function LeftPanel({
 		const seenKeys = new Set<string>();
 
 		for (const w of elsewhere) {
-			if (w.sessionFile && localFiles.has(w.sessionFile)) continue;
-			if (localCwdTitles.has(`${w.cwd}\0${w.title}`)) continue;
+			if (!w.convId && w.independent !== false) {
+				if (w.sessionFile && localFiles.has(w.sessionFile)) continue;
+				if (localCwdTitles.has(`${w.cwd}\0${w.title}`)) continue;
+			}
 
-			const key = w.sessionFile ? `file:${w.sessionFile}` : `title:${w.cwd}\0${w.title}`;
+			const key = w.convId
+				? `conv:${w.owner}:${w.convId}`
+				: w.sessionFile
+					? `file:${w.sessionFile}`
+					: `title:${w.cwd}\0${w.title}`;
 			if (seenKeys.has(key)) continue;
 			seenKeys.add(key);
 
 			filteredElsewhere.push({
-				id: w.sessionFile
-					? `elsewhere:${w.cwd}:${w.sessionFile}`
-					: `elsewhere:${w.cwd}:${w.title}${w.owner ? `:${w.owner}` : ""}`,
+				id:
+					w.convId && w.owner
+						? `elsewhere:${w.owner}:${w.convId}`
+						: w.sessionFile
+							? `elsewhere:${w.owner}:${w.cwd}:${w.sessionFile}`
+							: `elsewhere:${w.cwd}:${w.title}${w.owner ? `:${w.owner}` : ""}`,
 				title: w.title,
 				cwd: w.cwd,
 				messageCount: 0,
@@ -792,6 +810,7 @@ export const LeftPanel = memo(function LeftPanel({
 				isSubagent: false as const,
 				elsewhere: true as const,
 				pseudo: Boolean(w.pseudo),
+				independent: w.independent,
 				ownerOffline: Boolean(w.ownerOffline),
 				sessionFile: w.sessionFile,
 				// 过户目标定位（无则沿用旧行为：只读行，无过户入口）。
@@ -1206,15 +1225,19 @@ export const LeftPanel = memo(function LeftPanel({
 														// 定时任务（scheduler:）不支持过户；插件通道（如微信 plugin:）支持点击接管查看完整对话流并实时同步。
 														const isScheduler =
 															isPseudo && typeof elseOwner === "string" && elseOwner.startsWith("scheduler:");
-														const canTakeover = Boolean(elseOwner && elseConvId) && !isScheduler;
-														const confirming = confirmTakeover === c.id;
-														const tooltip = confirming
-															? t("takeoverConfirm")
-															: isScheduler
-																? `${t("elsewherePseudoTip")}\n${c.cwd}`
-																: isPseudo
-																	? `点击直接在电脑端打开此对话\n${c.cwd}`
-																	: `${t(isOffline ? "elsewhereOfflineTip" : "elsewhereTip")}\n${c.cwd}`;
+														const isShared = (c as RowConv).independent === false;
+														const canTakeover = Boolean(elseOwner && elseConvId) && (isShared || !isScheduler);
+														const active = sharedConversationOwner === elseOwner && activeConversationId === elseConvId;
+														const confirming = !isShared && confirmTakeover === c.id;
+														const tooltip = isShared
+															? c.cwd
+															: confirming
+																? t("takeoverConfirm")
+																: isScheduler
+																	? `${t("elsewherePseudoTip")}\n${c.cwd}`
+																	: isPseudo
+																		? `点击直接在电脑端打开此对话\n${c.cwd}`
+																		: `${t(isOffline ? "elsewhereOfflineTip" : "elsewhereTip")}\n${c.cwd}`;
 														return (
 															<div
 																className="lp-row"
@@ -1231,15 +1254,23 @@ export const LeftPanel = memo(function LeftPanel({
 																	})
 																}
 															>
-																{/* 「另一处」行本体：插件伪客户端（如微信/QQ）点击直接打开过户；真实多端保留两段确认防误触 */}
+																{/* 共享会话直接查看；独立会话沿用过户交互。 */}
 																<button
 																	type="button"
-																	className={`session-item elsewhere-item${c.isStreaming || hasStreaming ? " is-running" : ""}${canTakeover ? "" : " elsewhere-static"}${confirming ? " confirm" : ""}`}
+																	className={`session-item elsewhere-item${active ? " active" : ""}${c.isStreaming || hasStreaming ? " is-running" : ""}${canTakeover ? "" : " elsewhere-static"}${confirming ? " confirm" : ""}`}
 																	title={tooltip}
 																	tabIndex={canTakeover ? 0 : -1}
 																	onClick={
 																		canTakeover
 																			? () => {
+																					if (isShared) {
+																						panelSend({
+																							type: "open_shared_conversation",
+																							owner: elseOwner as string,
+																							id: elseConvId as string,
+																						});
+																						return;
+																					}
 																					if (isPseudo) {
 																						panelSend({
 																							type: "take_over_conversation",
@@ -1267,9 +1298,11 @@ export const LeftPanel = memo(function LeftPanel({
 																	</span>
 																	<span className="session-info">
 																		<span className="session-title">
-																			<span className="elsewhere-badge">
-																				{isPseudo ? t("elsewherePseudoBadge") : t("elsewhereBadge")}
-																			</span>
+																			{!isShared && (
+																				<span className="elsewhere-badge">
+																					{isPseudo ? t("elsewherePseudoBadge") : t("elsewhereBadge")}
+																				</span>
+																			)}
 																			{isOffline && (
 																				<span className="elsewhere-badge offline" title={t("elsewhereOfflineTip")}>
 																					{t("elsewhereOfflineBadge")}
@@ -1324,7 +1357,7 @@ export const LeftPanel = memo(function LeftPanel({
 															</div>
 														);
 													}
-													const active = activeConversationId === c.id;
+													const active = !sharedConversationOwner && activeConversationId === c.id;
 													return (
 														<div
 															className={`lp-row${depth > 0 ? " lp-sub" : ""}${hasKids ? " lp-has-kids" : ""}`}

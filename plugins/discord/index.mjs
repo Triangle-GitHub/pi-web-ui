@@ -152,6 +152,8 @@ export class DiscordBotBridge {
 	}
 
 	async stop() {
+		this.revokeRuns();
+		await this.routeSave?.catch(() => {});
 		this.running = false;
 		this.status.enabled = false;
 		this.status.connected = false;
@@ -343,6 +345,8 @@ export default async function activate(host) {
 		log: (lvl, msg) => host.log?.(lvl, msg),
 	});
 
+	await botBridge.restoreRoutes();
+
 	if (localConfig.botEnabled && localConfig.botToken) {
 		botBridge.start().catch((err) => {
 			host.log?.("warn", `Discord bot auto-start note: ${err.message}`);
@@ -427,7 +431,12 @@ export default async function activate(host) {
 				case "save_config": {
 					const incoming = msg.config || {};
 					const secrets = (await host.secrets?.getAll?.()) || {};
+					const previousToken = localConfig.botToken;
 					localConfig = mergeSavedSecrets(incoming, localConfig, secrets);
+					if (previousToken !== localConfig.botToken) {
+						botBridge.revokeRoutes();
+						await botBridge.saveRoutes();
+					}
 
 					if (host.secrets) {
 						if (localConfig.botToken) {

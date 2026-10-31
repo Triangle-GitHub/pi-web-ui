@@ -42,7 +42,7 @@ describe("switchConversation 性能与快速切换优化 (#switch-conv-perf)", (
 
 	it("switchSession 在跨项目打开历史会话时也会调用 unwatchGit", () => {
 		const src = readFileSync(join(__dirname, "../../server/agent-service.ts"), "utf-8");
-		const switchSessionStart = src.indexOf("async switchSession(path: string, sessionId?: string): Promise<void> {");
+		const switchSessionStart = src.indexOf("async switchSession(path: string,");
 		expect(switchSessionStart).toBeGreaterThan(0);
 		const targetCwdIdx = src.indexOf("this.cwd = targetCwd;", switchSessionStart);
 		expect(targetCwdIdx).toBeGreaterThan(switchSessionStart);

@@ -12,6 +12,11 @@ function parseCommand(text) {
 
 function appendAssistant(run, message, budget = OUTPUT_BYTES) {
 	const content = message.content;
+	if (Array.isArray(content) && content.some((part) => part.type === "toolCall" || part.type === "tool_call")) {
+		run.text = "";
+		run.truncated = false;
+		return;
+	}
 	const text =
 		(typeof content === "string"
 			? content
@@ -20,9 +25,9 @@ function appendAssistant(run, message, budget = OUTPUT_BYTES) {
 					.map((p) => p.text)
 					.join("\n")) + "\n";
 	const bytes = Buffer.from(text);
-	const remaining = Math.max(0, Math.min(OUTPUT_BYTES - Buffer.byteLength(run.text), budget));
-	run.text += bytes.subarray(0, remaining).toString("utf8");
-	if (bytes.length > remaining) run.truncated = true;
+	const remaining = Math.max(0, Math.min(OUTPUT_BYTES, budget));
+	run.text = bytes.subarray(0, remaining).toString("utf8");
+	run.truncated = bytes.length > remaining;
 }
 const THINKING = ["off", "minimal", "low", "medium", "high", "xhigh"];
 
@@ -53,15 +58,111 @@ export function installChannelBehavior(Bridge, platform, api, extract, chunk, st
 				throw error;
 			}
 		},
+		revokeRuns() {
+			this.sendGeneration = (this.sendGeneration || 0) + 1;
+			for (const run of [
+				...(this.ownedRuns?.values() || []),
+				...(this.webRuns?.values() || []),
+				...(this.dispatches || []),
+			]) {
+				run.cancelled = true;
+				run.state.busy = false;
+				run.state.downloadController?.abort();
+			}
+			this.ownedRuns?.clear();
+			this.webRuns?.clear();
+			this.dispatches?.clear();
+		},
+		revokeRoutes() {
+			this.revokeRuns();
+			for (const state of this.channelStates?.values() || []) state.cancelled = true;
+			this.channelStates?.clear();
+			this.sessionRoutes?.clear();
+		},
+		accountFingerprint() {
+			return createHash("sha256")
+				.update(String(this.getConfig()?.botToken || ""))
+				.digest("hex");
+		},
+		async restoreRoutes() {
+			const saved = await this.host.storage?.get("sessionRoutes");
+			if (saved?.account !== this.accountFingerprint()) {
+				this.revokeRoutes();
+				await this.saveRoutes();
+				return;
+			}
+			this.channelStates = new Map((saved.states || []).map(([key, state]) => [key, { ...state, busy: false }]));
+			this.sessionRoutes = new Map(saved.routes || []);
+		},
+		async saveRoutes() {
+			const saved = JSON.parse(
+				JSON.stringify({
+					account: this.accountFingerprint(),
+					states: [...(this.channelStates || [])].map(([key, s]) => [
+						key,
+						{
+							key,
+							account: s.account,
+							epoch: s.epoch,
+							conversationId: s.conversationId,
+							cwd: s.cwd,
+							model: s.model,
+							thinkingLevel: s.thinkingLevel,
+						},
+					]),
+					routes: [...(this.sessionRoutes || [])].filter(([key]) => key.startsWith("session:")),
+				}),
+			);
+			this.routeSave = (this.routeSave || Promise.resolve())
+				.catch(() => {})
+				.then(() => this.host.storage?.set("sessionRoutes", saved));
+			try {
+				await this.routeSave;
+			} catch (error) {
+				this.status.lastError = `Route save failed: ${error.message}`;
+				this.host.notify?.("error", this.status.lastError);
+				throw error;
+			}
+		},
+		sessionKey(identity) {
+			return identity.sessionId
+				? `session:${identity.sessionId}`
+				: identity.clientId && identity.conversationId
+					? `owner:${JSON.stringify([identity.clientId, identity.conversationId])}`
+					: "";
+		},
+		validRoute(binding) {
+			const state = this.channelStates?.get(binding?.key);
+			return state && !state.cancelled && state.epoch === binding.epoch && state.account === this.accountFingerprint();
+		},
+		async bindRoute(identity, run) {
+			if (run.cancelled || run.state.cancelled || run.state.account !== this.accountFingerprint()) return;
+			const key = this.sessionKey(identity);
+			if (!key) return;
+			this.sessionRoutes ??= new Map();
+			const previous = this.sessionRoutes.get(key);
+			if (previous?.ambiguous || (this.validRoute(previous) && previous.key !== run.state.key)) {
+				this.sessionRoutes.set(key, { ambiguous: true });
+			} else this.sessionRoutes.set(key, { key: run.state.key, epoch: run.state.epoch, route: run.route });
+			await this.saveRoutes();
+		},
 		stateFor(route) {
 			this.channelStates ??= new Map();
 			const key = JSON.stringify([route.userId, route.channelId, route.sessionThread ?? route.threadTs ?? ""]);
+			const previous = this.channelStates.get(key);
+			if (previous && previous.account !== this.accountFingerprint()) this.resetState(route);
 			if (!this.channelStates.has(key))
-				this.channelStates.set(key, { key, conversationId: `${platform}_${randomUUID()}`, epoch: randomUUID() });
+				this.channelStates.set(key, {
+					key,
+					account: this.accountFingerprint(),
+					conversationId: `${platform}_${randomUUID()}`,
+					epoch: randomUUID(),
+				});
 			return this.channelStates.get(key);
 		},
 		resetState(route) {
-			const old = this.stateFor(route);
+			const key = JSON.stringify([route.userId, route.channelId, route.sessionThread ?? route.threadTs ?? ""]);
+			const old = this.channelStates?.get(key) || this.stateFor(route);
 			old.cancelled = true;
 			old.downloadController?.abort();
 			if (old.runId) {
@@ -75,6 +176,7 @@ export function installChannelBehavior(Bridge, platform, api, extract, chunk, st
 			}
 			const state = {
 				key: old.key,
+				account: this.accountFingerprint(),
 				conversationId: `${platform}_${randomUUID()}`,
 				epoch: randomUUID(),
 				cwd: old.cwd,
@@ -82,6 +184,8 @@ export function installChannelBehavior(Bridge, platform, api, extract, chunk, st
 				thinkingLevel: old.thinkingLevel,
 			};
 			this.channelStates.set(old.key, state);
+			for (const [key, binding] of this.sessionRoutes || [])
+				if (binding.key === old.key) this.sessionRoutes.delete(key);
 			return state;
 		},
 		async handleSlashCommand(text, route) {
@@ -101,8 +205,10 @@ export function installChannelBehavior(Bridge, platform, api, extract, chunk, st
 						answer = "Download cancelled; no model dispatch.";
 						break;
 					}
-					const result = await this.host.abortRun(state.runId || state.conversationId);
-					answer = result?.ok ? "Stop requested." : `Stop failed: ${result?.error || "no active run"}`;
+					const result = state.runId ? await this.host.abortRun(state.runId) : null;
+					answer = result?.ok
+						? "Stop requested."
+						: `Stop failed: ${result?.error || "no stable runId; stop this run in the web conversation"}`;
 					break;
 				}
 				case "/new":
@@ -110,6 +216,7 @@ export function installChannelBehavior(Bridge, platform, api, extract, chunk, st
 				case "/reset":
 					{
 						const fresh = this.resetState(route);
+						await this.saveRoutes();
 						if (arg) return { prompt: arg, state: fresh };
 					}
 					answer = "Started a fresh conversation (history retained).";
@@ -120,9 +227,7 @@ export function installChannelBehavior(Bridge, platform, api, extract, chunk, st
 							answer = "Run active. Stop and wait before changing model.";
 							break;
 						}
-						state.model = arg.toLowerCase() === "default" ? undefined : arg;
-						state.epoch = randomUUID();
-						state.conversationId = `${platform}_${randomUUID()}`;
+						this.resetState(route).model = arg.toLowerCase() === "default" ? undefined : arg;
 					}
 					answer = `Model: ${state.model || cfg.model || "host default"}${arg ? "; applied on next message, host validates availability." : ""}`;
 					break;
@@ -137,9 +242,7 @@ export function installChannelBehavior(Bridge, platform, api, extract, chunk, st
 							answer = "Run active. Stop and wait before changing thinking level.";
 							break;
 						}
-						state.thinkingLevel = level === "default" ? undefined : level;
-						state.epoch = randomUUID();
-						state.conversationId = `${platform}_${randomUUID()}`;
+						this.resetState(route).thinkingLevel = level === "default" ? undefined : level;
 					}
 					answer = `Thinking: ${state.thinkingLevel || cfg.thinkingLevel || "host default"}; applied on next message.`;
 					break;
@@ -161,6 +264,7 @@ export function installChannelBehavior(Bridge, platform, api, extract, chunk, st
 				default:
 					answer = `Unknown command: ${command}. Use /help.`;
 			}
+			await this.saveRoutes();
 			await this.reply(route, answer);
 			return true;
 		},
@@ -262,6 +366,7 @@ export function installChannelBehavior(Bridge, platform, api, extract, chunk, st
 				const run = { route, state, text: "", events: new Map(), truncated: false };
 				this.dispatches.add(run);
 				try {
+					await this.saveRoutes();
 					const result = await this.host.chat({
 						text: text || "Inspect the attached images.",
 						...(attachments.length ? { attachments } : {}),
@@ -274,7 +379,7 @@ export function installChannelBehavior(Bridge, platform, api, extract, chunk, st
 						model: state.model || cfg.model || undefined,
 						thinkingLevel: state.thinkingLevel || cfg.thinkingLevel || undefined,
 					});
-					if (state.cancelled) {
+					if (state.cancelled || run.cancelled || state.account !== this.accountFingerprint()) {
 						if (result?.runId) await this.host.abortRun(result.runId);
 						return;
 					}
@@ -284,6 +389,7 @@ export function installChannelBehavior(Bridge, platform, api, extract, chunk, st
 					run.runId = result.runId;
 					state.runId = result.runId;
 					this.ownedRuns.set(result.runId, run);
+					await this.bindRoute(result, run);
 					this.dispatches.delete(run);
 					const early = run.events.get(result.runId);
 					if (early) {
@@ -306,9 +412,21 @@ export function installChannelBehavior(Bridge, platform, api, extract, chunk, st
 			}
 		},
 		async handleRunEvent(ev) {
-			if (!ev.runId) return;
-			const run = this.ownedRuns?.get(ev.runId);
-			if (!run) {
+			this.completedRuns ??= new Set();
+			if (ev.runId && this.completedRuns.has(ev.runId)) return;
+			this.webRuns ??= new Map();
+			const key = this.sessionKey(ev);
+			let run = ev.runId ? this.ownedRuns?.get(ev.runId) : this.webRuns.get(key);
+			if (!ev.runId && !run && ev.type === "run_start" && key) {
+				const binding = this.sessionRoutes?.get(key);
+				if (!this.validRoute(binding)) return;
+				const state = this.channelStates.get(binding.key);
+				if (state.busy) return;
+				state.busy = true;
+				run = { state, route: binding.route, text: "", truncated: false, web: true };
+				this.webRuns.set(key, run);
+			}
+			if (!run && ev.runId) {
 				for (const pending of this.dispatches || []) {
 					if (ev.type !== "run_end" && !(ev.type === "message" && ev.message?.role === "assistant")) continue;
 					let early = pending.events.get(ev.runId);
@@ -318,23 +436,43 @@ export function installChannelBehavior(Bridge, platform, api, extract, chunk, st
 					}
 					if (ev.type === "run_end") early.end = ev;
 					else {
-						const used = [...pending.events.values()].reduce((sum, item) => sum + Buffer.byteLength(item.text), 0);
+						if (pending.events.size > 64) pending.events.delete(pending.events.keys().next().value);
+						const used =
+							[...pending.events.values()].reduce((sum, item) => sum + Buffer.byteLength(item.text), 0) -
+							Buffer.byteLength(early.text);
 						appendAssistant(early, ev.message, Math.max(0, OUTPUT_BYTES - used));
 					}
 				}
 				return;
 			}
-			if (run.state.cancelled || run.state.runId !== ev.runId) return;
+			if (
+				!run ||
+				run.state.cancelled ||
+				run.state.account !== this.accountFingerprint() ||
+				(!run.web && run.state.runId !== ev.runId)
+			)
+				return;
 			if (ev.type === "message" && ev.message?.role === "assistant") {
 				appendAssistant(run, ev.message);
 			}
 			if (ev.type === "run_end") {
-				this.ownedRuns.delete(ev.runId);
+				if (run.web) this.webRuns.delete(key);
+				else {
+					this.ownedRuns.delete(ev.runId);
+					this.completedRuns.add(ev.runId);
+					while (this.completedRuns.size > 500) this.completedRuns.delete(this.completedRuns.values().next().value);
+				}
 				run.state.busy = false;
 				if (run.state.runId === ev.runId) run.state.runId = undefined;
 				const epoch = run.state.epoch;
+				const generation = this.sendGeneration || 0;
 				const canSend = () =>
-					!run.state.cancelled && run.state.epoch === epoch && this.stateFor(run.route) === run.state;
+					generation === (this.sendGeneration || 0) &&
+					!run.cancelled &&
+					!run.state.cancelled &&
+					run.state.account === this.accountFingerprint() &&
+					run.state.epoch === epoch &&
+					this.stateFor(run.route) === run.state;
 				await this.reply(
 					run.route,
 					[

@@ -45,13 +45,19 @@
 
 命令均在通道本地处理：`/help`、`/new [prompt]`、`/clear [prompt]`、`/reset [prompt]`、`/status`、`/stop`（别名 `/abort`）、`/model [provider/id|default]`、`/thinking [off|minimal|low|medium|high|xhigh|default]`、`/cwd [绝对路径|default]`（别名 `/workspace`）。命令名兼容大小写、全角字母和全角斜杠；思考强度与 default 不区分大小写。重置后的 prompt 直接作为新会话输入，保留内部空白及字面 `/stop`、`@文本` 等内容，不再解析为命令。未知命令直接反馈，不送模型。
 
-会话按发送人、聊天和 thread 隔离。新建、清空及切换目录均递增账号 epoch，确保宿主建立全新上下文；旧历史保留。`/new`、`/clear`、`/reset` 及模型、思考强度、目录 setter 均立即重置当前作用域并请求停止旧运行，下载、表情反馈和回执等待中的旧消息不再投递或恢复旧绑定；其他聊天和 thread 不受影响。模型列表验证完成前发生的重置会使该 setter 失效，避免迟到验证覆盖新上下文。default 清除该项覆盖并恢复插件配置默认值。目录只做绝对路径检查，存在性与访问限制由宿主在下一次投递时验证。模型从宿主列表校验，模型与思考强度在下一次请求真实传递，最终支持情况由宿主验证。偏好与 epoch 仅保存在插件运行内存，重载后不保留。
+会话按发送人、聊天和 thread 隔离。新建、清空及切换目录均递增账号 epoch，确保宿主建立全新上下文；旧历史保留。`/new`、`/clear`、`/reset` 及模型、思考强度、目录 setter 均立即重置当前作用域并请求停止旧运行，下载、表情反馈和回执等待中的旧消息不再投递或恢复旧绑定；其他聊天和 thread 不受影响。模型列表验证完成前发生的重置会使该 setter 失效，避免迟到验证覆盖新上下文。default 清除该项覆盖并恢复插件配置默认值。目录只做绝对路径检查，存在性与访问限制由宿主在下一次投递时验证。模型从宿主列表校验，模型与思考强度在下一次请求真实传递，最终支持情况由宿主验证。偏好只保存在运行内存；epoch 与稳定 session 路由持久化，重载后仍保留。
 
 机器人下载图片（包括富文本内图片）、文件、语音及视频，向 `host.chat({text, attachments})` 投递真实字节。图片使用 `imageData`，其他文件使用 `fileData`，由宿主持久化；需要支持该附件契约的新版宿主。图片最多 8 张，每个图片或 fileData 附件最多 10MiB；同一消息的 imageData 与 fileData 共用累计 20MiB 预算，按 Base64 编码前的原始字节数计算。图片支持 PNG/JPEG/GIF/WebP，以文件头检查格式；完整像素解码由宿主/模型完成。资源权限不足、下载失败、不支持的格式均明确反馈。通道不自带 ASR、音频转码或视频解码；音视频作为文件交给模型工具处理，不能保证内容理解，收到时明确告知限制。
 
 AI 工具 `feishu` 的 `send/reply` 支持 `msg_type=image|audio|file|media` 与 `file_path`，读取真实本地文件、上传飞书后发送；音频仅 Opus、视频仅 MP4，须提供真实毫秒 `duration`。其他格式可用 `file` 发送。文件读受宿主 fs 授权限制（插件新增 fs 权限），单文件最多 10MiB。媒体发送通过 AI 工具执行；工作台输入框仍为文本/卡片，Webhook 不支持媒体。助手输出的任意路径不会自动上传，须调用工具发送。
 
 回执必须含真实 `conversationId/runId`，事件只按稳定 runId 关联，支持早到消息/结束事件和过户改名。分块全部回复原消息并保持 thread。停止命令旁路处理，下载中的任务取消派发，等待回执的任务在收到回执后调用宿主 abortRun；不会伪称已中止尚无回执的宿主运行。运行错误、空结果和回信失败均尝试文字反馈；飞书完全不可用时只能记录错误，无持久重试队列。
+
+## 0.3.2 持续会话与网页续聊
+
+同一发送人、聊天及 thread 持续使用原会话；宿主返回稳定 `sessionId` 后，插件持久化应用账号指纹、scope、epoch 与原消息/thread 目的地。网页在该 session 主动续聊时，最终助手候选会回复原消息并保持 thread；工具前言不会与最终答复拼接。原请求严格按 runId 关联，未知 runId、仅有 `c1` 的事件不会认领路由；旧宿主仅在同时提供完整 clientId/conversationId 时支持本次加载内的网页续聊。
+
+`/new` 等重置撤销当前 scope 路由并持久化新 epoch，应用凭据/平台变更撤销全部旧路由。普通停止与插件重载不重置 session；只恢复稳定 sessionId 路由，不恢复未完成运行或重发旧答复。网页无 runId 的任务无法精准调用 abortRun 时，命令明确提示从网页停止，不猜测 canonical conversationId。发送继续使用现有飞书消息回复 API；失败保留状态错误并尝试文字提示，无持久发送重试队列。路由持久化失败也会显示最近错误。
 
 ## 配置
 
@@ -89,6 +95,7 @@ pi-web-ui uninstall feishu
 
 ## 回归测试
 
+- `tests/unit/feishu-session-routes.test.ts`：两 scope 同 c1 并发、网页回传、重复/未知事件、重置、重载与账号变更
 - `tests/unit/feishu-runtime.test.ts`：命令、epoch、旁路停止、真实媒体附件、上传、稳定 runId 与跨群/thread 隔离行为测试
 - `tests/unit/feishu-features.test.ts`：纯函数单元测试（消息解析、卡片生成、Webhook HMAC 签名、URL 保护与格式转换）
 - `tests/unit/feishu-secrets.test.ts`：敏感凭证加密持久化与脱敏测试

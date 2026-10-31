@@ -40,6 +40,22 @@ function makeTap(total: number, windowSize = DEFAULT_HISTORY_WINDOW) {
 	return { tap, out, full };
 }
 
+describe("shared execution owner isolation", () => {
+	it("discards cached local IDs when switching between owners", () => {
+		const { tap, out, full } = makeTap(6, 2);
+		tap.setScope("owner-a");
+		tap.accept(snapshot("c1", full));
+		expect(tap.loadEarlier({ conversationId: "c1", all: true })).toBe(true);
+		tap.setScope("owner-b");
+		expect(tap.loadEarlier({ conversationId: "c1", all: true })).toBe(false);
+		tap.accept(snapshot("c1", [msg("other-owner")]));
+		const last = out.at(-1);
+		expect(last?.type === "snapshot" && last.state.messages.map((m) => m.id)).toEqual(["other-owner"]);
+		tap.setScope("owner-a");
+		expect(tap.loadEarlier({ conversationId: "c1", all: true })).toBe(false);
+	});
+});
+
 describe("readMessageWindowConfig", () => {
 	it("缺省 300 条；off/0/false/no 关闭；非法值回落默认", () => {
 		expect(readMessageWindowConfig({} as NodeJS.ProcessEnv).windowSize).toBe(DEFAULT_HISTORY_WINDOW);

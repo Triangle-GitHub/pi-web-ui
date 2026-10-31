@@ -779,6 +779,7 @@ export class GoalService {
 			maxRounds?: number;
 			locked?: boolean;
 		},
+		target?: GoalConversation,
 	): Promise<void> {
 		if (this.host.quiesceBlocked()) return;
 		if (!this.goalEnabled()) {
@@ -796,8 +797,9 @@ export class GoalService {
 		// The wizard and its progress cards belong to the conversation that
 		// launched it. If the user switches away, do not later set a goal on the
 		// new active conversation while the wizard is still finishing.
-		const wizardConversationId = this.host.activeConvId();
-		const wizardConversation = this.host.activeConv();
+		const wizardConversation = target ?? this.host.activeConv();
+		if (this.host.getConv(wizardConversation.id) !== wizardConversation) return;
+		const wizardConversationId = wizardConversation.id;
 		const wizardGeneration = wizardConversation.goalGeneration;
 		// Human-readable name for notices that must say WHICH conversation the survey
 		// belongs to (issue #292: the user is expected to switch away mid-survey).
@@ -1345,14 +1347,19 @@ export class GoalService {
 	/** Persist goal/review preference defaults (model, rounds cap, locked) without
 	 *  touching the active goal — so changes in the goal bar are remembered across
 	 *  reloads. maxRounds 0 = unlimited. Emits goal_status so the UI stays synced. */
-	async setGoalPrefs(opts?: {
-		reviewModel?: string;
-		maxRounds?: number;
-		locked?: boolean;
-		execModel?: string;
-	}): Promise<void> {
+	async setGoalPrefs(
+		opts?: {
+			reviewModel?: string;
+			maxRounds?: number;
+			locked?: boolean;
+			execModel?: string;
+		},
+		target?: GoalConversation,
+	): Promise<void> {
 		if (!this.goalEnabled()) return;
-		const goal = this.host.activeConv().goal;
+		const conv = target ?? this.host.activeConv();
+		if (this.host.getConv(conv.id) !== conv) return;
+		const goal = conv.goal;
 		if (opts?.reviewModel !== undefined) goal.reviewModel = opts?.reviewModel || null;
 		if (typeof opts?.maxRounds === "number") {
 			const mr = Math.round(opts.maxRounds);

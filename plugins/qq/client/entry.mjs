@@ -319,8 +319,8 @@ export default {
 			if (b.state === "connected") {
 				statusBadge.textContent = "🟢 在线";
 				statusBadge.style.color = "var(--green, #22c55e)";
-				metricState.textContent = "🟢 已连接 (在线)";
-				metricState.style.color = "var(--green, #22c55e)";
+				metricState.textContent = b.lastError ? `🔴 投递失败: ${b.lastError}` : "🟢 已连接 (在线)";
+				metricState.style.color = b.lastError ? "var(--red, #ef4444)" : "var(--green, #22c55e)";
 			} else if (b.state === "connecting") {
 				statusBadge.textContent = "🟡 连接中";
 				statusBadge.style.color = "var(--amber, #eab308)";
@@ -461,7 +461,7 @@ export default {
 					btn.textContent = "打开中...";
 					try {
 						if (bridge?.sessions?.open) {
-							await bridge.sessions.open(item.conversationId);
+							await bridge.sessions.open(item.openId || item.conversationId);
 						}
 						bridge?.setView?.("chat");
 					} finally {

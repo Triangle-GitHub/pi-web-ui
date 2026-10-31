@@ -37,7 +37,7 @@ const options = {
 	],
 	tools: [
 		{ id: "read", name: "Read files", description: "Inspect files" },
-		{ id: "edit", name: "Edit files" },
+		{ id: "edit", name: "Edit files", warning: "high_privilege" },
 	],
 	skills: [{ id: "docx", name: "Word documents", path: "D:/skills/docx/SKILL.md" }],
 	mcpServers: [{ id: "github", name: "GitHub", tools: [], status: "not_loaded", scope: "global" }],
@@ -149,10 +149,29 @@ it("saves catalog selections and inherited model while reporting local success o
 	expect(posted(fetcher).model).toBeUndefined();
 	expect(host.querySelector('[role="status"]')?.textContent).toContain("Saved locally, but Hub sync failed");
 });
+it("initializes new Bot tools from current settings once and preserves edits across reloads", async () => {
+	const fetcher = await mount([], true, async () => response({ ...options, defaultTools: ["read"] }));
+	await click("New Bot");
+	await input("Name", "Helper");
+	const tools = host.querySelector(".dc-bot-catalog")!;
+	expect((tools.querySelector("input[type=checkbox]") as HTMLInputElement).checked).toBe(true);
+	await click("Clear", tools);
+	await click("Reload catalogs");
+	expect((tools.querySelector("input[type=checkbox]") as HTMLInputElement).checked).toBe(false);
+	await save();
+	expect(posted(fetcher).tools).toEqual([]);
+});
+it("preserves existing Bot tools when current settings differ", async () => {
+	const fetcher = await mount([bot], true, async () => response({ ...options, defaultTools: ["read"] }));
+	await click("Helper");
+	await save();
+	expect(posted(fetcher).tools).toEqual([]);
+});
 it("preserves unknown IDs, supports searchable catalogs and select all/clear", async () => {
 	const fetcher = await mount([{ ...bot, tools: ["legacy"], skills: ["old-skill"] }]);
 	await click("Helper");
 	expect(host.textContent).toContain("Unavailable in this project");
+	expect(host.textContent).toContain(en.localBotToolHighPrivilege);
 	const tools = host.querySelector(".dc-bot-catalog")!;
 	await setInput(tools.querySelector('input[type="search"]')!, "Inspect");
 	expect(tools.textContent).toContain("Read files");

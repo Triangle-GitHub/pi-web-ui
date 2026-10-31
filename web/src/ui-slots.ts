@@ -729,6 +729,16 @@ export const BUILTIN_UI_ITEMS: BuiltinUiItem[] = [
 		order: 24,
 	},
 
+	{
+		id: "host:msg-delete",
+		slot: "message.actions",
+		labelKey: "delete",
+		icon: "trash",
+		kind: "action",
+		order: 30,
+		hidden: true,
+	},
+
 	// ---- 输入框动作区（ChatInput.tsx 的 .composer-tools；顺序与可见性全部数据驱动） ----
 	// 权重给插件默认位（100）让路：无 order 的插件动作按 100 落在上传(10)之后、
 	// 模板(110)之前 —— 与旧硬编码顺序（上传 → 插件start → 模板 → 模型 → 思考）一致，
@@ -1446,6 +1456,17 @@ export const BUILTIN_UI_ITEMS: BuiltinUiItem[] = [
 		context: "message",
 		order: 23,
 		group: "action",
+	},
+
+	{
+		id: "host:msg-ctx-delete",
+		slot: "contextmenu.message",
+		labelKey: "delete",
+		icon: "trash",
+		kind: "action",
+		context: "message",
+		order: 30,
+		group: "danger",
 	},
 
 	// ---- 工具调用卡片的工具名右键菜单（contextmenu.toolcall，渲染与分派见 ToolCallBlock.tsx）----
