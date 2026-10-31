@@ -119,12 +119,25 @@ describe("fork-free executable lookup patch", () => {
 		expect(twice.status).toBe("already");
 		expect(twice.code).toBe(once.code);
 
-		const unknown = patchExecutableLookupSource("function findExecutableOnPath() { return null; }", "shell");
+		const unknown = patchExecutableLookupSource("export function unrelated() {}", "shell");
 		expect(unknown).toMatchObject({ status: "unsupported" });
-		expect(unknown.code).toBe("function findExecutableOnPath() { return null; }");
+		expect(unknown.code).toBe("export function unrelated() {}");
 
-		const moved = patchExecutableLookupSource(SHELL_SOURCE.replace("which", "whichx"), "shell");
+		// Rewritten but still forking: refuse rather than patch half-way.
+		const moved = patchExecutableLookupSource(SHELL_SOURCE.replace("Use 'which'", "Use 'whichx'"), "shell");
 		expect(moved.status).toBe("unsupported");
+
+		// A lookup that is already fork-free (an earlier local patch or upstream itself)
+		// is a no-op, not a warning.
+		const alreadyForkFree = SHELL_SOURCE.replace(
+			/    \/\/ Unix: Use 'which'[\s\S]*?\n    }\n    catch \{\n        \/\/ Ignore errors\n    \}/,
+			"    // resolved from PATH by someone else",
+		);
+		expect(alreadyForkFree).not.toContain('spawnSync("which"');
+		expect(patchExecutableLookupSource(alreadyForkFree, "shell")).toEqual({
+			code: alreadyForkFree,
+			status: "already",
+		});
 	});
 
 	it("matches the loaded URL of either SDK copy but nothing else", () => {

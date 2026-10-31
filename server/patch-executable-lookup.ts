@@ -103,7 +103,16 @@ export function patchExecutableLookupSource(
 	const replacement = target === "shell" ? SHELL_LOOKUP_NEW : TOOLS_LOOKUP_NEW;
 	// Exact, single occurrence: a moved or rewritten lookup must fail loudly, never
 	// half-apply, because the alternative is a silently hanging server.
-	if (source.split(old).length !== 2) return { code: source, status: "unsupported" };
+	if (source.split(old).length !== 2) {
+		// Someone already removed the child-process lookup (an older local patch, or
+		// upstream): nothing to do, and definitely not a warning.
+		const [anchor, probe] =
+			target === "shell"
+				? ["function findExecutableOnPath", 'spawnSync("which"']
+				: ["function commandExists", 'spawnSync(cmd, ["--version"]'];
+		const forkFree = source.includes(anchor) && !source.includes(probe);
+		return { code: source, status: forkFree ? "already" : "unsupported" };
+	}
 	return { code: `${source.replace(old, replacement)}\n${SENTINEL}\n`, status: "patched" };
 }
 
