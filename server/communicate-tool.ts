@@ -1,5 +1,6 @@
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { Value } from "typebox/value";
 import type { CommunicationAction, CommunicationArgs, CommunicationResult } from "./conversation-communication.js";
 
 export interface CommunicateToolHost {
@@ -31,7 +32,36 @@ export function makeCommunicateTool(host: CommunicateToolHost): ToolDefinition {
 		optionsMap: Type.Optional(Type.Record(Type.String(), options)),
 	});
 	const target = Type.String({ minLength: 1, description: "parent, root, or a stable execution ID" });
-	const parameters = Type.Union([
+	const questions = Type.Array(question, { minItems: 1, maxItems: 3 });
+	const message = Type.String({ description: "Message to send (nonempty for send), or optional context for request" });
+	const timeoutSeconds = Type.Number({ minimum: 0, maximum: 86400 });
+	const requestId = Type.String({ minLength: 1 });
+	const answers = Type.Array(
+		Type.Object({
+			id: Type.String(),
+			selected: Type.Array(Type.String()),
+			custom: Type.Optional(Type.String()),
+		}),
+		{ minItems: 1, maxItems: 3 },
+	);
+	// Providers need root properties; action-specific requirements are enforced at execution.
+	const parameters = Type.Object({
+		action: Type.Union(
+			[
+				Type.Literal("read"),
+				Type.Literal("send"),
+				Type.Literal("request"),
+				Type.Literal("reply"),
+				Type.Literal("escalate"),
+			],
+			{
+				description:
+					"read: inbox; send: requires to/message; request: to/questions; reply: requestId/answers; escalate: requestId",
+			},
+		),
+		...Type.Partial(Type.Object({ to: target, message, questions, timeoutSeconds, requestId, answers })).properties,
+	});
+	const actionParameters = Type.Union([
 		Type.Object({ action: Type.Literal("read") }),
 		Type.Object({
 			action: Type.Literal("send"),
@@ -41,25 +71,18 @@ export function makeCommunicateTool(host: CommunicateToolHost): ToolDefinition {
 		Type.Object({
 			action: Type.Literal("request"),
 			to: target,
-			questions: Type.Array(question, { minItems: 1, maxItems: 3 }),
-			message: Type.Optional(Type.String({ description: "Optional context for the questions" })),
-			timeoutSeconds: Type.Optional(Type.Number({ minimum: 0, maximum: 86400 })),
+			questions,
+			message: Type.Optional(message),
+			timeoutSeconds: Type.Optional(timeoutSeconds),
 		}),
 		Type.Object({
 			action: Type.Literal("reply"),
-			requestId: Type.String({ minLength: 1 }),
-			answers: Type.Array(
-				Type.Object({
-					id: Type.String(),
-					selected: Type.Array(Type.String()),
-					custom: Type.Optional(Type.String()),
-				}),
-				{ minItems: 1, maxItems: 3 },
-			),
+			requestId,
+			answers,
 		}),
 		Type.Object({
 			action: Type.Literal("escalate"),
-			requestId: Type.String({ minLength: 1 }),
+			requestId,
 		}),
 	]);
 	return {
@@ -78,6 +101,15 @@ export function makeCommunicateTool(host: CommunicateToolHost): ToolDefinition {
 		],
 		parameters,
 		execute: async (_id: string, params: unknown, signal?: AbortSignal) => {
+			// Adapters may call execute directly, bypassing SDK argument validation.
+			for (const schema of [parameters, actionParameters]) {
+				const errors = Value.Errors(schema, params);
+				if (errors.length) {
+					throw new Error(
+						`Invalid communicate arguments: ${errors.map((error) => `${error.instancePath || "/"}: ${error.message}`).join("; ")}`,
+					);
+				}
+			}
 			const { action, ...args } = params as CommunicationArgs & { action: CommunicationAction };
 			const result = await host.communicate(action, args, signal);
 			// Host results are bounded by the service; guard adapters too (wire details <=64KB).
