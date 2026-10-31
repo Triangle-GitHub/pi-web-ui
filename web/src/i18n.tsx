@@ -291,6 +291,7 @@ export const zh = {
 
 	/* left panel */
 	recentProjects: "最近项目",
+	leftPanelGroups: "群组",
 	runningConversations: "运行的对话",
 	elsewhereBadge: "另一处",
 	elsewherePseudoBadge: "无头任务",
@@ -2971,6 +2972,7 @@ export const en: Record<keyof typeof zh, string> = {
 
 	/* left panel */
 	recentProjects: "Recent projects",
+	leftPanelGroups: "Groups",
 	runningConversations: "Running chats",
 	elsewhereBadge: "Elsewhere",
 	elsewherePseudoBadge: "Background task",

@@ -10,7 +10,16 @@
 
 ## [Unreleased]
 
-暂无未发布内容。
+### Added
+
+- **左栏群组分区可在布局页隐藏 / 调序**：左侧栏「群组」分区登记为第 4 个宿主分区（`host:lp-groups`），与项目 / 运行 / 历史同一套规则 —— 设置 → 界面布局里可勾选隐藏 / ↑↓ 调序 / 换图标，插件 arrange 可隐藏不能挪走；旧快照仍兑底常显。
+
+<!-- auto-i18n:start -->
+### i18n
+
+- 前端新增 key（16）：`leftPanelGroups`、`questionAutoSubmitLast`、`questionPickSubmits`、`worktreeViewTitle`、`worktreeEntryTip`、`worktreeBackToChat`、`worktreeRefresh`、`worktreeViewHint`、`worktreeEmpty`、`worktreeDetached`、`worktreeCurrent`、`worktreeMain`、`worktreeHasChanges`、`worktreeClean`、`worktreeSwitch`、`worktreeManage`
+- 前端删除 key（12）：`worktreeBannerActiveTitle`、`worktreeBannerActiveDesc`、`worktreeBannerUncleanedTitle`、`worktreeBannerUncleanedDesc`、`worktreeActionSwitchMainTip`、`worktreeActionSwitchTo`、`worktreeActionSwitchToTip`、`worktreeActionRemoveTip`、`worktreeActionCollapse`、`worktreeActionMore`、`worktreeActionDismiss`、`worktreeActionDismissTip`
+<!-- auto-i18n:end -->
 
 ## [0.114.3] — 2026-10-31
 

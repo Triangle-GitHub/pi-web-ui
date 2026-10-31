@@ -262,6 +262,7 @@
 		"slashCopyFailed": "복사에 실패했어요. 직접 복사해 주세요",
 		"slashCopyEmpty": "복사할 수 있는 어시스턴트 답변이 아직 없어요",
 		"recentProjects": "최근 프로젝트",
+		"leftPanelGroups": "Groups",
 		"runningConversations": "실행 중인 대화",
 		"elsewhereBadge": "다른 곳",
 		"elsewherePseudoBadge": "백그라운드",
