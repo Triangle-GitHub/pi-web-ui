@@ -3128,13 +3128,26 @@ export class ClientSession {
 	};
 
 	/** schedule_* 工具的数据宿主：全局调度存储＋创建时刻 live 的 cwd/活动对话。 */
-	private scheduleToolHost(): ScheduleToolHost {
-		return createScheduleToolHost({
+	private scheduleToolHost(anchor?: { session?: AgentSession }): ScheduleToolHost {
+		const source = () => {
+			const home = anchor?.session ? this.toolConversationHome(anchor.session) : undefined;
+			if (!home) throw new Error("Scheduled-task source session is no longer available");
+			return home;
+		};
+		const host = createScheduleToolHost({
 			getSchedulerStore: () => this.schedulerStore,
 			getCwd: () => this.cwd,
 			getActiveId: () => this.activeId,
 			getConversation: (id) => this.convs.get(id),
 		});
+		if (anchor) {
+			host.store = () => source().client.schedulerStore;
+			host.executionSource = () => {
+				const { conv } = source();
+				return { cwd: conv.cwd, conversationId: conv.id, sessionFile: conv.session.sessionFile ?? "" };
+			};
+		}
+		return host;
 	}
 
 	/** conversation_read 工具的数据宿主 */
@@ -4510,7 +4523,7 @@ export class ClientSession {
 						// 发起对话（ownerId，无则活动对话），到期 steer 语义唤醒它；子代理
 						// 会话同样注册（owner 即真正派发的父对话）。开关走统一工具 tab。
 						// DSH 引擎无 customTool 注册面，不接。
-						makeScheduleTool(this.scheduleToolHost(), ownerId, () => this.getLang()),
+						makeScheduleTool(this.scheduleToolHost(bridgeAnchor), ownerId, () => this.getLang()),
 						// 持久代码求值沙箱（eval）：开关走统一工具 tab（ActiveSet 门控，默认关）。
 						// ownerId 绑定当前会话；DSH 引擎无 customTool 注册面，不接。
 						makeEvalTool({
@@ -15100,11 +15113,38 @@ export class ClientSession {
 			if (!current()) return;
 			const manager = session.sessionManager;
 			const baseEntryId = findTurnBaseEntryId(manager, entryId);
-			if (baseEntryId) manager.branch(baseEntryId);
-			else manager.resetLeaf();
-			// Persist the explicit selection: calibration must not resurrect the
-			// abandoned, longer history when this same JSONL file is reopened.
-			manager.appendCustomEntry("pi-web-ui:reask", { version: 1 });
+			const commitReask = () => {
+				const previousLeaf = manager.getLeafId();
+				try {
+					if (baseEntryId) manager.branch(baseEntryId);
+					else manager.resetLeaf();
+					manager.appendCustomEntry("pi-web-ui:reask", { version: 1 });
+				} catch (err) {
+					// SDK append mutates indexes before writing; discard an uncommitted marker too.
+					if (sessionFile) manager.setSessionFile(sessionFile);
+					if (previousLeaf) manager.branch(previousLeaf);
+					else manager.resetLeaf();
+					throw err;
+				}
+			};
+			// Cancel only tasks proven to originate in the suffix being discarded.
+			// Persist cancellation first: a failed scheduler write must leave its transcript visible.
+			if (this.schedulerStore && sessionFile) {
+				const discardedCalls = new Set<string>();
+				const branch = manager.getBranch();
+				const baseIndex = baseEntryId ? branch.findIndex((entry) => entry.id === baseEntryId) : -1;
+				if (baseEntryId && baseIndex < 0) throw new Error("Reask base is no longer on the current branch");
+				for (const entry of branch.slice(baseIndex + 1)) {
+					if (entry.type !== "message" || entry.message.role !== "assistant") continue;
+					for (const block of entry.message.content) {
+						if (block.type === "toolCall" && block.name === "schedule") discardedCalls.add(block.id);
+					}
+				}
+				this.schedulerStore.cancelUnstartedFromCalls(sessionFile, discardedCalls, commitReask);
+			} else {
+				// Persist the selection so calibration cannot resurrect abandoned history.
+				commitReask();
+			}
 			session.agent.state.messages = manager.buildSessionContext().messages;
 			// reload() refreshes resources; it does not replace the manager/leaf.
 			await session.reload();
