@@ -64,6 +64,7 @@ import { showBanner, dismissBanner, dismissBannersWhere } from "./banner-notice"
 import { ensurePluginViewLoaded } from "./plugin-loader";
 import {
 	registerAttachmentSink,
+	registerSessionSwitchSink,
 	insertTextAtCursor,
 	removeMentionFromComposer,
 	focusComposer,
@@ -457,6 +458,13 @@ export function App() {
 	);
 	const [activeGroupId, setActiveGroupId] = useState<string | null>(null);
 	const [deviceGroupCreateOpen, setDeviceGroupCreateOpen] = useState(false);
+	useEffect(() => {
+		registerSessionSwitchSink(() => {
+			setActiveGroupId(null);
+			setView("chat");
+		});
+		return () => registerSessionSwitchSink(null);
+	}, []);
 	useEffect(() => {
 		const open = (event: Event) => {
 			const detail = (event as CustomEvent).detail;
@@ -1759,11 +1767,6 @@ export function App() {
 			// drawer opens and immediately snaps shut.
 			if (!msg.type.startsWith("list_") && !msg.type.startsWith("get_")) {
 				setDrawer(null);
-			}
-			if (msg.type === "new_chat" || msg.type === "switch_conversation" || msg.type === "switch_session") {
-				setActiveGroupId(null);
-				setView((prev) => (prev !== "chat" ? "chat" : prev));
-				focusComposer();
 			}
 			return send(msg);
 		},

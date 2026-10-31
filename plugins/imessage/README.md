@@ -10,9 +10,9 @@
 
 ## 命令
 
-支持 `/help`、`/new`、`/clear`、`/status`、`/stop`（`/abort`）、`/model [provider/id]`、`/thinking [off|minimal|low|medium|high|xhigh]`、`/cwd [目录]`。`/workspace` 为兼容别名。未知命令及无效参数直接反馈，不送模型。
+支持 `/help`、`/new [prompt]`、`/clear [prompt]`、`/reset [prompt]`、`/status`、`/stop`（`/abort`）、`/model [provider/id|default]`、`/thinking [off|minimal|low|medium|high|xhigh|default]`、`/cwd [目录|default]`。`/workspace` 为目录命令兼容别名。命令 token 支持大小写、全角字母和全角斜杠；`default` 与思考强度忽略大小写。未知命令及无效参数直接反馈，不送模型。
 
-`/new` 与 `/clear` 创建新上下文，不删除历史；运行中须先停止并等待结束再切换。模型、思考强度和工作目录按发送者与群聊/thread 隔离，设置在下一次运行生效；宿主拒绝模型/目录会反馈启动失败。会话关联使用宿主真实 conversationId 和稳定 runId，支持早于 chat 回执到达的结束事件及会话过户。
+`/new`、`/clear`、`/reset` 创建新上下文，不删除历史；携带 prompt 时立即在新会话执行其字面正文，保留换行与空格，正文 `/stop` 等不会再次解析为命令。设置模型、思考强度或目录也会轮换账号、解绑旧会话，`default` 恢复配置默认值。无参数的设置命令只查询当前值。控制命令立即处理，使重置前尚未启动的准备请求、排队消息及迟到启动回执失效；异步目录验证迟到不能覆盖后来的重置。重置与 model/thinking setter 在任务运行中也会立即解绑旧任务并请求停止；停止失败会明确反馈，旧任务回复不再关联新会话。`/cwd`、`/workspace` 在已启动任务运行中须先停止并等待结束再切换。模型、思考强度和工作目录按发送者与群聊/thread 隔离；宿主拒绝模型/目录会反馈启动失败。会话关联使用宿主真实 conversationId 和稳定 runId，支持早于 chat 回执到达的结束事件及会话过户。
 
 ## 媒体
 

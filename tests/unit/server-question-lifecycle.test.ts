@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ClientSession } from "../../server/agent-service.js";
+import { conversationIdentity } from "../../server/conversation-identity.js";
 import { PendingQuestion } from "../../server/pending-question.js";
 import { makeAskUserQuestionTool } from "../../server/ask-user-question-tool.js";
 import type { UiQuestion } from "../../server/protocol.js";
@@ -199,7 +200,9 @@ describe("server question ownership and lifetime", () => {
 		cs.registerQuestion(request);
 		expect(cs.answerConsult("stranger", "child", request.id, []).ok).toBe(false);
 		expect(cs.resolveQuestion(request.id, [])).toBe(false);
-		expect(cs.getPendingConsults("parent")).toEqual([{ runId: "child", requestId: request.id, questions }]);
+		expect(cs.getPendingConsults("parent")).toEqual([
+			{ runId: conversationIdentity(cs.convs.get("child")), requestId: request.id, questions },
+		]);
 		expect(cs.answerConsult("parent", "child", request.id).ok).toBe(true);
 		expect(request.audience).toBe("user");
 		expect(cs.answerConsult("parent", "child", request.id, []).ok).toBe(false);

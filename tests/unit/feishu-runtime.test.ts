@@ -44,6 +44,252 @@ function setup() {
 }
 
 describe("Feishu runtime contracts", () => {
+	it.each(["/new", "/reset", "/model p/m", "/thinking HIGH", "/stop"])(
+		"%s stops stale reply chunks after an in-flight send",
+		async (command) => {
+			const { bridge, host, inbound, reply } = setup();
+			host.chat.mockResolvedValueOnce({ conversationId: "old", runId: "old-run" });
+			await inbound();
+			await bridge.handleRunEvent({
+				type: "message",
+				runId: "old-run",
+				message: { role: "assistant", content: "x".repeat(9000) },
+			});
+			let finishSend!: (value: any) => void;
+			reply.mockImplementationOnce(
+				() =>
+					new Promise((resolve) => {
+						finishSend = resolve;
+					}),
+			);
+			const delivery = bridge.handleRunEvent({ type: "run_end", runId: "old-run" });
+			expect(reply).toHaveBeenCalledTimes(1);
+			await inbound(command);
+			finishSend({ success: true });
+			await delivery;
+			expect(reply.mock.calls.filter(([, message]) => message.title === "AI 助手回复")).toHaveLength(1);
+			expect(bridge.status.messagesReplied).toBe(0);
+		},
+	);
+
+	it.each(["/new", "/CLEAR", "/reset", "／ＮＥＷ", "／ｃｌｅａｒ", "/ＲＥＳＥＴ"])(
+		"%s executes its literal prompt in a fresh context",
+		async (command) => {
+			const { host, inbound } = setup();
+			host.chat.mockResolvedValueOnce({ conversationId: "old", runId: "old-run" });
+			await inbound();
+			host.chat.mockResolvedValueOnce({ conversationId: "new", runId: "new-run" });
+			const prompt = "/stop  @literal\n／ＮＥＷ keep  spaces";
+			await inbound(`${command} ${prompt}`);
+			expect(host.chat).toHaveBeenCalledTimes(2);
+			expect(host.chat.mock.calls[1][0].text).toBe(prompt);
+			expect(host.chat.mock.calls[1][0]).not.toHaveProperty("conversationId");
+			expect(host.chat.mock.calls[1][0].accountId).not.toBe(host.chat.mock.calls[0][0].accountId);
+			expect(host.abortRun).toHaveBeenCalledExactlyOnceWith("old-run");
+		},
+	);
+
+	it.each([
+		"/model p/m",
+		"/MODEL DEFAULT",
+		"/thinking HIGH",
+		"/THINKING DEFAULT",
+		`/cwd ${nextWorkspace}`,
+		`/ＷＯＲＫＳＰＡＣＥ ${nextWorkspace}`,
+		"／ＣＷＤ DEFAULT",
+		"/workspace DEFAULT",
+	])("%s rotates active and in-flight contexts", async (command) => {
+		const { host, inbound, bridge } = setup();
+		let finish!: (value: any) => void;
+		host.chat.mockImplementationOnce(
+			() =>
+				new Promise((resolve) => {
+					finish = resolve;
+				}),
+		);
+		const old = inbound("old");
+		await vi.waitFor(() => expect(host.chat).toHaveBeenCalledTimes(1));
+		await inbound(command);
+		host.chat.mockResolvedValueOnce({ conversationId: "new", runId: "new-run" });
+		await inbound("new");
+		finish({ conversationId: "old", runId: "old-run" });
+		await old;
+		expect(host.abortRun).toHaveBeenCalledWith("old-run");
+		expect(host.chat.mock.calls[1][0]).not.toHaveProperty("conversationId");
+		expect(host.chat.mock.calls[1][0].accountId).not.toBe(host.chat.mock.calls[0][0].accountId);
+		expect([...bridge.userConversations.values()]).toEqual(["new"]);
+		if (command === "/thinking HIGH") expect(host.chat.mock.calls[1][0].thinkingLevel).toBe("high");
+	});
+
+	it("stop during reset abort waits cancels its pending literal prompt", async () => {
+		const { host, inbound } = setup();
+		host.chat.mockResolvedValueOnce({ conversationId: "old", runId: "old-run" });
+		await inbound();
+		let finishAbort!: (value: any) => void;
+		host.abortRun.mockImplementationOnce(
+			() =>
+				new Promise((resolve) => {
+					finishAbort = resolve;
+				}),
+		);
+		const resetting = inbound("/reset never execute");
+		await vi.waitFor(() => expect(host.abortRun).toHaveBeenCalled());
+		await inbound("/stop");
+		finishAbort({ ok: true });
+		await resetting;
+		expect(host.chat).toHaveBeenCalledTimes(1);
+	});
+
+	it("DEFAULT restores configured defaults and delayed model validation cannot override reset", async () => {
+		const { host, inbound, bridge } = setup();
+		bridge.getConfig = () => ({
+			groupResponseMode: "all",
+			model: "configured/model",
+			thinkingLevel: "low",
+			workspace: projectWorkspace,
+		});
+		await inbound("/model p/m");
+		await inbound("/thinking HIGH");
+		await inbound(`/workspace ${nextWorkspace}`);
+		await inbound("/model DEFAULT");
+		await inbound("/thinking DEFAULT");
+		await inbound("/workspace DEFAULT");
+		let finishModels!: (value: any) => void;
+		host.models.list.mockImplementationOnce(
+			() =>
+				new Promise((resolve) => {
+					finishModels = resolve;
+				}),
+		);
+		const setter = inbound("/model p/m");
+		await vi.waitFor(() => expect(host.models.list).toHaveBeenCalledTimes(2));
+		host.chat.mockResolvedValueOnce({ conversationId: "fresh", runId: "fresh-run" });
+		await inbound("/reset literal");
+		finishModels([{ provider: "p", id: "m" }]);
+		await setter;
+		expect(host.chat.mock.calls[0][0]).toMatchObject({
+			text: "literal",
+			model: "configured/model",
+			thinkingLevel: "low",
+			cwd: projectWorkspace,
+		});
+		expect([...bridge.userConversations.values()]).toEqual(["fresh"]);
+		expect([...bridge.pendingRuns.keys()]).toEqual(["fresh-run"]);
+		expect([...(bridge as any).preferences.values()]).toEqual([{}]);
+	});
+
+	it.each(["/new", "/clear", "/NeW", "/CLEAR"])(
+		"%s detaches active runs and preserves account identity through the next dispatch",
+		async (command) => {
+			const { bridge, host, inbound } = setup();
+			host.chat.mockResolvedValueOnce({ conversationId: "old", runId: "old-run" });
+			await inbound();
+			const first = host.chat.mock.calls[0][0];
+			await inbound(command);
+			expect(host.abortRun).toHaveBeenCalledWith("old-run");
+			await bridge.handleRunEvent({
+				type: "message",
+				runId: "old-run",
+				conversationId: "old-moved",
+				message: { role: "assistant", content: "stale" },
+			});
+			await bridge.handleRunEvent({ type: "run_end", runId: "old-run", conversationId: "old-moved" });
+			host.chat.mockResolvedValueOnce({ conversationId: "fresh", runId: "fresh-run" });
+			await inbound();
+			const fresh = host.chat.mock.calls[1][0];
+			expect(fresh).not.toHaveProperty("conversationId");
+			expect(fresh.accountId).toMatch(/^[A-Za-z0-9_-]{1,64}$/);
+			expect(fresh.accountId).not.toBe(first.accountId);
+			await bridge.handleRunEvent({ type: "run_end", runId: "fresh-run" });
+			host.chat.mockResolvedValueOnce({ conversationId: "fresh", runId: "next-run" });
+			await inbound();
+			expect(host.chat.mock.calls[2][0]).toMatchObject({ accountId: fresh.accountId, conversationId: "fresh" });
+		},
+	);
+
+	it.each(["/new", "/clear"])("%s cancels downloads and messages waiting for reactions", async (command) => {
+		const { bridge, host, inbound, download } = setup();
+		let finishDownload!: (value: any) => void;
+		download.mockImplementationOnce(
+			() =>
+				new Promise((resolve) => {
+					finishDownload = resolve;
+				}),
+		);
+		const media = inbound("", "group-a", "", "image", { image_key: "key" });
+		await inbound(command);
+		finishDownload({ data: Buffer.from("image"), mimeType: "image/png" });
+		await media;
+		expect(host.chat).not.toHaveBeenCalled();
+		let finishReaction!: () => void;
+		bridge.reactMessage = vi.fn().mockImplementationOnce(
+			() =>
+				new Promise<void>((resolve) => {
+					finishReaction = resolve;
+				}),
+		);
+		const waiting = inbound("stale");
+		await vi.waitFor(() => expect(bridge.reactMessage).toHaveBeenCalled());
+		await inbound(command);
+		finishReaction();
+		await waiting;
+		expect(host.chat).not.toHaveBeenCalled();
+	});
+
+	it.each(["/new", "/clear"])(
+		"%s releases unresolved dispatch without allowing its late receipt to overwrite the new run",
+		async (command) => {
+			const { bridge, host, inbound } = setup();
+			let finishOld!: (value: any) => void;
+			let finishNew!: (value: any) => void;
+			host.chat.mockImplementationOnce(
+				() =>
+					new Promise((resolve) => {
+						finishOld = resolve;
+					}),
+			);
+			const old = inbound("old");
+			await vi.waitFor(() => expect(host.chat).toHaveBeenCalledTimes(1));
+			await inbound(command);
+			host.chat.mockImplementationOnce(
+				() =>
+					new Promise((resolve) => {
+						finishNew = resolve;
+					}),
+			);
+			const fresh = inbound("new");
+			await vi.waitFor(() => expect(host.chat).toHaveBeenCalledTimes(2));
+			finishOld({ conversationId: "old", runId: "old-run" });
+			await old;
+			expect(host.abortRun).toHaveBeenCalledWith("old-run");
+			await inbound("busy");
+			expect(host.chat).toHaveBeenCalledTimes(2);
+			finishNew({ conversationId: "new", runId: "new-run" });
+			await fresh;
+			expect([...bridge.userConversations.values()]).toEqual(["new"]);
+			expect([...bridge.pendingRuns.keys()]).toEqual(["new-run"]);
+			expect(host.chat.mock.calls[1][0].accountId).not.toBe(host.chat.mock.calls[0][0].accountId);
+			expect(host.chat.mock.calls[1][0]).not.toHaveProperty("conversationId");
+		},
+	);
+
+	it("reset keeps other threads active and reports failed aborts without restoring the old binding", async () => {
+		const { bridge, host, inbound, reply } = setup();
+		host.chat.mockResolvedValueOnce({ conversationId: "old", runId: "old-run" });
+		host.chat.mockResolvedValueOnce({ conversationId: "other", runId: "other-run" });
+		await inbound("one", "group-a", "one");
+		await inbound("two", "group-a", "two");
+		host.abortRun.mockResolvedValueOnce({ ok: false });
+		await inbound("/clear", "group-a", "one");
+		expect(reply.mock.calls.at(-1)?.[1].text).toContain("旧任务停止失败");
+		expect(host.abortRun).toHaveBeenCalledExactlyOnceWith("old-run");
+		expect([...bridge.pendingRuns.keys()]).toEqual(["other-run"]);
+		expect([...bridge.userConversations.values()]).toEqual(["other"]);
+		host.chat.mockResolvedValueOnce({ conversationId: "fresh", runId: "fresh-run" });
+		await inbound("fresh", "group-a", "one");
+		expect(host.chat.mock.calls[2][0]).not.toHaveProperty("conversationId");
+	});
+
 	it("new, clear and cwd rotate account epochs rather than reusing host context", async () => {
 		const { bridge, host, inbound } = setup();
 		let n = 0;

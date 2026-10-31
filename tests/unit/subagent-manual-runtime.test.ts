@@ -15,7 +15,7 @@ function harness() {
 		communicationPending: () => false,
 		allSubagentSessions: () => [],
 		subagentOwnerOf: () => owner,
-		subagentCurrentId: (id: string) => id,
+		subagentCurrentId: proto.subagentCurrentId,
 		conversationStreaming: proto.conversationStreaming,
 		assertSubagentWorktreeAdmission: proto.assertSubagentWorktreeAdmission,
 		subagentWorktreeHasHolders: proto.subagentWorktreeHasHolders,
@@ -32,6 +32,7 @@ function harness() {
 		flushSnapshot: vi.fn(),
 		finalizeSubagentWorktree: vi.fn(),
 	};
+	Object.setPrototypeOf(owner, ClientSession.prototype);
 	return owner;
 }
 function child(owner: any, id: string, parentId: string, manual = true): any {
@@ -130,6 +131,7 @@ describe("manual task runtime", () => {
 		const owner = harness();
 		const remote = harness();
 		owner.allSubagentSessions = () => [remote];
+		remote.allSubagentSessions = () => [owner];
 		const a = child(owner, "a", "root");
 		const b = child(remote, "b", "a");
 		b.session.isStreaming = true;

@@ -337,9 +337,11 @@
 		--on-stop-red-hover: var(--on-stop-red);
 		--search-active-fg: #1a1d26;
 		--switch-knob: #ffffff;
-		--switch-bg-off: var(--bg-elev2);
-		--switch-border-off: var(--border-soft);
-		--switch-bg-on: var(--green);
+		--switch-bg-off: #424754;
+		--switch-border-off: #8791a3;
+		--switch-bg-on: var(--accent);
+		--switch-border-on: var(--switch-bg-on);
+		--switch-knob-on: var(--accent-contrast);
 		--bg-elev3: rgba(255, 255, 255, 0.06);
 		/* 凹陷内容面：「比所在底板低一层」的区域（右栏扩展 widgets 区、附件/技能卡正文）。
 	   深色主题=黑色低透压在面板上；浅色主题=极低透黑（见 make-light-theme.mjs 的
@@ -3190,10 +3192,10 @@
 		height: 19px;
 		margin: 0;
 		border-radius: 20px;
-		background: var(--border);
 		cursor: pointer;
 		position: relative;
 		flex: none;
+		box-sizing: border-box;
 	}
 	.dc-bot-enabled input[role="switch"]::after {
 		content: "";
@@ -3203,20 +3205,13 @@
 		width: 13px;
 		height: 13px;
 		border-radius: 50%;
-		background: var(--text);
 		transition: transform 150ms;
 	}
-	.dc-bot-enabled input[role="switch"]:checked {
-		background: var(--accent);
-	}
+
 	.dc-bot-enabled input[role="switch"]:checked::after {
-		transform: translateX(13px);
-		background: var(--accent-contrast, #fff);
+		transform: translateX(12px);
 	}
-	.dc-bot-enabled input[role="switch"]:focus-visible {
-		outline: 2px solid var(--accent);
-		outline-offset: 3px;
-	}
+
 	@media (max-width: 900px) {
 		.dc-bot-workspace.is-editing {
 			grid-template-columns: minmax(0, 1fr);
@@ -4383,24 +4378,18 @@
 		width: 34px;
 		height: 20px;
 		padding: 2px;
-		border: 1px solid var(--border);
 		border-radius: 99px;
-		background: var(--bg-elev2);
+		box-sizing: border-box;
 		cursor: pointer;
 	}
 	.dc-toggle-thumb {
 		width: 14px;
 		height: 14px;
 		border-radius: 50%;
-		background: var(--text-dim);
 		transition: transform 0.15s;
 	}
-	.dc-toggle.is-on {
-		background: var(--accent);
-		border-color: var(--accent);
-	}
+
 	.dc-toggle.is-on .dc-toggle-thumb {
-		background: var(--accent-contrast, #fff);
 		transform: translateX(13px);
 	}
 	.dc-permission-state {
@@ -21252,15 +21241,41 @@
 		cursor: not-allowed;
 	}
 
-	/* Switch */
+	/* Shared switch appearance. Pages own geometry; themes own every state color. */
+	:is(.set-switch, .plugin-mgr-switch, .dc-toggle, .dc-bot-enabled input[role="switch"]) {
+		background: var(--switch-bg-off);
+		border: 1px solid var(--switch-border-off);
+		box-shadow: none;
+	}
+	:is(.set-switch, .plugin-mgr-switch, .dc-toggle, .dc-bot-enabled input[role="switch"]):focus-visible {
+		outline: 2px solid var(--switch-border-on);
+		outline-offset: 3px;
+	}
+	:is(.set-switch.on, .plugin-mgr-switch.on, .dc-toggle.is-on, .dc-bot-enabled input[role="switch"]:checked) {
+		background: var(--switch-bg-on);
+		border-color: var(--switch-border-on);
+		box-shadow: none;
+	}
+	:is(.set-switch-knob, .plugin-mgr-switch-thumb, .dc-toggle-thumb),
+	.dc-bot-enabled input[role="switch"]::after {
+		background: var(--switch-knob);
+	}
+	.set-switch.on .set-switch-knob,
+	.plugin-mgr-switch.on .plugin-mgr-switch-thumb,
+	.dc-toggle.is-on .dc-toggle-thumb,
+	.dc-bot-enabled input[role="switch"]:checked::after {
+		background: var(--switch-knob-on);
+	}
+
+	/* Switch geometry */
 	.set-switch {
 		flex: none;
 		position: relative;
 		width: 36px;
 		height: 20px;
-		border: 1px solid var(--switch-border-off, var(--border-soft));
+
 		border-radius: 999px;
-		background: var(--switch-bg-off, var(--bg-elev2));
+
 		cursor: pointer;
 		transition:
 			background 0.18s ease,
@@ -21269,14 +21284,6 @@
 		padding: 0;
 		box-sizing: border-box;
 	}
-	.set-switch:hover {
-		border-color: var(--border);
-	}
-	.set-switch.on {
-		background: var(--switch-bg-on, var(--green));
-		border-color: transparent;
-		box-shadow: 0 0 6px var(--green-soft, rgba(16, 185, 129, 0.25));
-	}
 	.set-switch-knob {
 		position: absolute;
 		top: 2px;
@@ -21284,7 +21291,7 @@
 		width: 14px;
 		height: 14px;
 		border-radius: 50%;
-		background: var(--switch-knob, #ffffff);
+
 		box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
 		transition: left 0.18s cubic-bezier(0.16, 1, 0.3, 1);
 	}
@@ -22299,7 +22306,7 @@
 		color: var(--accent);
 	}
 
-	/* 启用/停用 Toggle Switch 开关：使用状态绿，无论在任何深浅或纯白 accent 主题下均有绝对高反差 */
+	/* Plugin switch geometry; appearance comes from the shared theme contract. */
 	.plugin-mgr-toggle-wrap {
 		display: flex;
 		align-items: center;
@@ -22310,29 +22317,16 @@
 		width: 40px;
 		height: 22px;
 		border-radius: 11px;
-		background: var(--bg-elev, #1c202a);
-		border: 1px solid var(--border);
+
 		cursor: pointer;
 		padding: 0;
 		transition:
 			background 0.2s cubic-bezier(0.4, 0, 0.2, 1),
 			border-color 0.2s;
-		box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.25);
-		outline: none;
+
 		flex: none;
 	}
-	.plugin-mgr-switch:hover {
-		border-color: var(--text-dim);
-	}
-	.plugin-mgr-switch:focus-visible {
-		outline: 2px solid var(--accent);
-		outline-offset: 1px;
-	}
-	.plugin-mgr-switch.on {
-		background: var(--green, #10b981);
-		border-color: var(--green, #10b981);
-		box-shadow: 0 0 8px color-mix(in srgb, var(--green, #10b981) 40%, transparent);
-	}
+
 	.plugin-mgr-switch:disabled {
 		cursor: not-allowed;
 		opacity: 0.35;
@@ -22344,7 +22338,6 @@
 		width: 16px;
 		height: 16px;
 		border-radius: 50%;
-		background: #ffffff;
 		box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
 		transition: transform 0.2s cubic-bezier(0.4, 0, 0.2, 1);
 	}

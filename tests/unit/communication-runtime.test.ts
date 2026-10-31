@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ClientSession } from "../../server/agent-service.js";
+import { withSubagentOwner, makeSubagentTools } from "../../server/subagents.js";
+import { conversationIdentity, bindConversationParent } from "../../server/conversation-identity.js";
 
 const questions = [{ id: "choice", question: "Proceed?" }];
 const answers = [{ id: "choice", selected: ["yes"] }];
@@ -10,6 +12,7 @@ function holder(id: string) {
 		clientId: id,
 		cwd: "/project",
 		disposed: false,
+		getLang: () => "en",
 		convs: new Map(),
 		pendingQuestions: new Map(),
 		pendingPageCalls: new Map(),
@@ -43,7 +46,11 @@ function endpoint(owner: any, id: string, parentId?: string) {
 		cwd: "/project",
 		parentId,
 		title: id,
-		session: { isStreaming: false, sendUserMessage: vi.fn().mockResolvedValue(undefined) },
+		session: {
+			isStreaming: false,
+			getLastAssistantText: () => "",
+			sendUserMessage: vi.fn().mockResolvedValue(undefined),
+		},
 		terminals: { killAll: vi.fn() },
 		runtime: { dispose: vi.fn().mockResolvedValue(undefined) },
 	};
@@ -184,7 +191,7 @@ describe("ClientSession communication runtime", () => {
 		await Promise.resolve();
 		const request = [...a.pendingQuestions.values()][0];
 		expect(a.getPendingConsults(target.id)).toEqual([
-			expect.objectContaining({ runId: from.id, requestId: request.id }),
+			expect.objectContaining({ runId: conversationIdentity(from), requestId: request.id }),
 		]);
 		await expect(c.communicate(other.id, "reply", { requestId: request.id, answers })).rejects.toThrow(
 			"Only the request receiver",
@@ -272,10 +279,10 @@ describe("ClientSession communication runtime", () => {
 			target = endpoint(b, "target");
 		a.findConversationHome = (session: unknown) =>
 			session === moved.session ? { session: b, convId: moved.id } : undefined;
-		b.subagentOwnerOf = (id: string) => (b.convs.has(id) ? b : a);
 		await a.communicateFromSession({ session: moved.session }, "send", { to: target.id, message: "current owner" });
 		expect(target.session.sendUserMessage).toHaveBeenCalledOnce();
 		expect(stale.session.sendUserMessage).not.toHaveBeenCalled();
+		bindConversationParent(moved, target);
 		const legacy = a.communicationBoundSubagentHost({ session: moved.session });
 		await legacy.handoffSubagent(stale.id, target.id, "legacy current owner");
 		expect(target.session.sendUserMessage).toHaveBeenCalledTimes(2);
@@ -343,6 +350,37 @@ describe("ClientSession communication runtime", () => {
 		expect(() => bound.spawnSubagent("task", "probe", "/project")).toThrow("no longer available");
 		expect(b.spawnSubagentViaHost).toHaveBeenCalledOnce();
 	});
+	it("keeps a verified local spawn parent when another client's global alias resolves its id elsewhere", async () => {
+		const a = holder("a"),
+			b = holder("b");
+		const parent = endpoint(b, "c2");
+		endpoint(b, "c3"); // An unrelated local conversation matches the foreign alias.
+		endpoint(a, "c3");
+		b.subagentTemplates = new Map();
+		b.findConversationHome = (session: unknown) =>
+			session === parent.session ? { session: b, convId: parent.id } : undefined;
+		b.findSubagentOwner = vi.fn(() => ({ session: a, convId: "c3" }));
+		b.spawnSubagentConversation = vi.fn().mockResolvedValue("child");
+		const bound = b.communicationBoundSubagentHost({ session: parent.session });
+		await expect(bound.spawnSubagent("task", "implement", "/project")).resolves.toBe("child");
+		expect(b.spawnSubagentConversation.mock.calls[0][5]).toBe("c2");
+		expect(b.findSubagentOwner).not.toHaveBeenCalled();
+	});
+	it("resolves a moved spawn parent by stable identity and rejects its obsolete display id", async () => {
+		const a = holder("a");
+		const parent = endpoint(a, "c2");
+		const address = conversationIdentity(parent);
+		a.convs.delete(parent.id);
+		parent.id = "c3";
+		a.convs.set(parent.id, parent);
+		a.subagentTemplates = new Map();
+		a.spawnSubagentConversation = vi.fn().mockResolvedValue("child");
+		await a.spawnSubagentViaHost("task", "implement", "/project", undefined, null, address, false);
+		expect(a.spawnSubagentConversation.mock.calls[0][5]).toBe("c3");
+		await expect(a.spawnSubagentViaHost("task", "implement", "/project", undefined, null, "c2", false)).rejects.toThrow(
+			"unavailable",
+		);
+	});
 	it("stopping idle manual task cancels its request and inbox without interrupting descendants", async () => {
 		const a = holder("a"),
 			b = holder("b");
@@ -364,6 +402,251 @@ describe("ClientSession communication runtime", () => {
 		expect(a.interruptRun).not.toHaveBeenCalled();
 		expect(nested.session.isStreaming).toBe(true);
 		expect(a.scheduleSubagentCompletionNotice).toHaveBeenCalledWith(from);
+	});
+	it("does not deliver a completed child's result to another chat sharing its project", async () => {
+		const a = holder("a");
+		const unrelated = endpoint(a, "c3");
+		const child = endpoint(a, "sa-completed", "c2");
+		child.session.getLastAssistantText = () => "private task result";
+		a.pendingSubagentNotices.set("c2", { subagents: new Set([child]) });
+		await a.flushSubagentCompletionNotice("c2");
+		expect(unrelated.session.sendUserMessage).not.toHaveBeenCalled();
+		expect(child.subagentDoneNotified).toBe(true);
+		expect(a.emit).toHaveBeenCalledWith(expect.objectContaining({ type: "notice", level: "info" }));
+	});
+	it("delivers completion to a renamed parent through its current holder", async () => {
+		const a = holder("a"),
+			b = holder("b");
+		const parent = endpoint(b, "c4");
+		const unrelated = endpoint(b, "c2"); // The destination already owns the old id.
+		const child = endpoint(a, "sa-completed", "c2");
+		child.session.getLastAssistantText = () => "task result";
+		bindConversationParent(child, parent);
+		const address = conversationIdentity(parent);
+		a.pendingSubagentNotices.set(address, { subagents: new Set([child]) });
+		await a.flushSubagentCompletionNotice(address);
+		expect(parent.session.sendUserMessage).toHaveBeenCalledOnce();
+		expect(parent.session.sendUserMessage.mock.calls[0][0]).toContain("task result");
+		expect(unrelated.session.sendUserMessage).not.toHaveBeenCalled();
+		expect(child.subagentDoneNotified).toBe(true);
+	});
+	it("keeps parent, root and project identity across rename, conflicting ids and repeated holder moves", async () => {
+		const a = holder("a"),
+			b = holder("b"),
+			c = holder("c");
+		const parent = endpoint(a, "c2"),
+			worker = endpoint(a, "worker", parent.id);
+		bindConversationParent(worker, parent);
+		const address = conversationIdentity(parent);
+		a.convs.delete(parent.id);
+		parent.id = "c3";
+		b.convs.set(parent.id, parent);
+		const replacement = endpoint(a, "c2");
+		replacement.cwd = "/other-project";
+		endpoint(b, "c2");
+		expect(a.resolveCommunicationTarget(worker.id, "parent")).toBe(parent);
+		expect(a.resolveCommunicationTarget(worker.id, "root")).toBe(parent);
+		expect(a.communicationProject(worker)).toBe(a.communicationProject(parent));
+		b.convs.delete(parent.id);
+		parent.id = "c8";
+		c.convs.set(parent.id, parent);
+		expect(a.resolveExecution(address)?.conv).toBe(parent);
+		expect(a.resolveCommunicationTarget(worker.id, "parent")).toBe(parent);
+		worker.session.getLastAssistantText = () => "only for original parent";
+		a.pendingSubagentNotices.set(address, { subagents: new Set([worker]) });
+		await a.flushSubagentCompletionNotice(address);
+		expect(parent.session.sendUserMessage).toHaveBeenCalledOnce();
+		expect(replacement.session.sendUserMessage).not.toHaveBeenCalled();
+	});
+	it("never reattaches a closed parent to a replacement reusing the same id", async () => {
+		const a = holder("a");
+		const parent = endpoint(a, "c2"),
+			worker = endpoint(a, "worker", parent.id);
+		bindConversationParent(worker, parent);
+		const address = conversationIdentity(parent);
+		a.convs.delete(parent.id);
+		const replacement = endpoint(a, "c2");
+		expect(a.resolveCommunicationTarget(worker.id, "parent")).toBeUndefined();
+		expect(a.resolveExecution(address)).toBeUndefined();
+		worker.session.getLastAssistantText = () => "old result";
+		a.pendingSubagentNotices.set(address, { subagents: new Set([worker]) });
+		await a.flushSubagentCompletionNotice(address);
+		expect(replacement.session.sendUserMessage).not.toHaveBeenCalled();
+	});
+	it("rejects ambiguous bare ids and resolves stable addresses to the exact endpoint", () => {
+		const a = holder("a"),
+			b = holder("b"),
+			c = holder("c");
+		const one = endpoint(b, "c2"),
+			two = endpoint(c, "c2");
+		expect(a.resolveExecution("c2")).toBeUndefined();
+		expect(a.resolveExecution(conversationIdentity(one))?.conv).toBe(one);
+		expect(a.resolveExecution(conversationIdentity(two))?.conv).toBe(two);
+	});
+	it("does not count children of another client's same-named parent as task dependencies", () => {
+		const a = holder("a"),
+			b = holder("b");
+		const parent = endpoint(a, "c2"),
+			foreign = endpoint(b, "c2");
+		const worker = endpoint(b, "worker", foreign.id);
+		bindConversationParent(worker, foreign);
+		worker.session.isStreaming = true;
+		parent.notifyOnDone = foreign.notifyOnDone = "manual";
+		expect(a.subagentTaskPending(parent)).toBe(false);
+		expect(b.subagentTaskPending(foreign)).toBe(true);
+	});
+	it("uses the same stable caller identity for handoff validation and runtime routing", async () => {
+		const a = holder("a");
+		const sender = endpoint(a, "c2"),
+			target = endpoint(a, "c3");
+		a.findConversationHome = (session: unknown) =>
+			session === sender.session ? { session: a, convId: sender.id } : undefined;
+		a.subagentHost = { getSubagent: (id: string) => a.subagentSnapshotAnywhere(id) };
+		const anchor = { session: sender.session };
+		const bound = withSubagentOwner(a.communicationBoundSubagentHost(anchor), sender.id, () =>
+			a.requireSubagentOwner(anchor, sender.id),
+		);
+		const [tool] = makeSubagentTools(
+			bound,
+			() => "en",
+			() => conversationIdentity(sender),
+		);
+		await tool.execute!(
+			"handoff",
+			{ action: "handoff", toRunId: target.id, payload: "review this" } as never,
+			undefined,
+			undefined,
+			{} as never,
+		);
+		expect(target.session.sendUserMessage).toHaveBeenCalledOnce();
+		expect(target.session.sendUserMessage.mock.calls[0][0]).toContain("review this");
+	});
+	it("routes all runtime-bound lookup and controls through the current holder after takeover", async () => {
+		const a = holder("a"),
+			b = holder("b");
+		const caller = endpoint(a, "c1"),
+			stale = endpoint(a, "c2"),
+			target = endpoint(b, "c2");
+		let home = { session: a, convId: caller.id };
+		a.findConversationHome = () => home;
+		const controls = (owner: any) => ({
+			getSubagent: vi.fn((id: string) => owner.subagentSnapshotAnywhere(id)),
+			listSubagents: vi.fn(() => []),
+			steerSubagent: vi.fn(),
+			stopSubagent: vi.fn(),
+			dismissSubagent: vi.fn(),
+			markSubagentsConsumed: vi.fn(),
+			finalizeSubagentWorktree: vi.fn(),
+		});
+		a.subagentHost = controls(a);
+		b.subagentHost = controls(b);
+		const bound = a.communicationBoundSubagentHost({ session: caller.session });
+		a.convs.delete(caller.id);
+		caller.id = "c4";
+		b.convs.set(caller.id, caller);
+		home = { session: b, convId: caller.id };
+		expect(bound.getSubagent("c2")?.executionId).toBe(conversationIdentity(target));
+		expect(bound.getSubagent("c2")?.executionId).not.toBe(conversationIdentity(stale));
+		await bound.steerSubagent("c2", "revise");
+		await bound.stopSubagent("c2");
+		await bound.dismissSubagent("c2");
+		bound.listSubagents();
+		bound.markSubagentsConsumed(["c2"]);
+		await bound.finalizeSubagentWorktree("c2");
+		for (const name of [
+			"getSubagent",
+			"listSubagents",
+			"steerSubagent",
+			"stopSubagent",
+			"dismissSubagent",
+			"markSubagentsConsumed",
+			"finalizeSubagentWorktree",
+		]) {
+			expect(b.subagentHost[name]).toHaveBeenCalled();
+			expect(a.subagentHost[name]).not.toHaveBeenCalled();
+		}
+	});
+	it("takeover reserves all incoming ids and rewrites display parents only once", () => {
+		const a = holder("a");
+		a.convSeq = 0;
+		endpoint(a, "c1");
+		const parent: any = {
+			id: "c1",
+			isSubagent: false,
+			terminals: { rebindEmit: vi.fn() },
+			session: { subscribe: vi.fn() },
+			toolStartTimes: new Map(),
+			toolWatchdogs: new Map(),
+		};
+		const child: any = { ...parent, id: "c2", parentId: "c1", isSubagent: true };
+		bindConversationParent(child, parent);
+		const parentAddress = conversationIdentity(parent);
+		const id = a.insertTakeoverConvs({ convs: [parent, child], questions: [], pageCalls: [], approvals: [] });
+		expect(id).toBe("c3");
+		expect(child.id).toBe("c2");
+		expect(child.parentId).toBe(parent.id);
+		expect(a.parentExecution(child)?.conv).toBe(parent);
+		expect(conversationIdentity(parent)).toBe(parentAddress);
+	});
+	it("returns a stable consult source so compatibility answer survives child rename and source-id collision", async () => {
+		const a = holder("a"),
+			b = holder("b");
+		const parent = endpoint(a, "parent"),
+			worker = endpoint(a, "worker", parent.id);
+		bindConversationParent(worker, parent);
+		a.convs.delete(worker.id);
+		worker.id = "c3";
+		b.convs.set(worker.id, worker);
+		endpoint(a, "c3");
+		worker.isSubagent = true;
+		const pending = b.consultParent(conversationIdentity(worker), questions);
+		await Promise.resolve();
+		const request = a.getPendingConsults(conversationIdentity(parent))[0];
+		expect(request.runId).toBe(conversationIdentity(worker));
+		await a.answerConsult(conversationIdentity(parent), request.runId, request.requestId, answers);
+		expect(await pending).toEqual(answers);
+	});
+	it("does not project a foreign parent into local UI or force-dismiss its child by a reused display id", async () => {
+		const a = holder("a"),
+			b = holder("b");
+		const local = endpoint(a, "c2"),
+			parent = endpoint(b, "c2"),
+			worker = endpoint(a, "worker", parent.id);
+		worker.isSubagent = true;
+		bindConversationParent(worker, parent);
+		expect(a.localParentId(worker)).toBeUndefined();
+		local.listed = true;
+		a.forceDismissConversation = vi.fn();
+		await a.dismissConversation(local.id, false, true);
+		expect(a.forceDismissConversation).toHaveBeenCalledWith(local, [], expect.any(Function));
+	});
+	it("force-close never removes a replacement while awaiting a migrated child's stop", async () => {
+		const a = holder("a"),
+			b = holder("b");
+		const parent = endpoint(a, "parent"),
+			worker = endpoint(a, "worker", parent.id);
+		bindConversationParent(worker, parent);
+		worker.session.isStreaming = true;
+		let finish!: () => void;
+		a.subagentHost = {
+			stopSubagent: vi.fn(
+				() =>
+					new Promise<void>((resolve) => {
+						finish = resolve;
+					}),
+			),
+		};
+		a.removeConversation = vi.fn((id: string) => a.convs.delete(id));
+		const closing = a.forceDismissConversation(parent, [worker], (conv: any) => conv.session.isStreaming);
+		a.convs.delete(worker.id);
+		worker.id = "c3";
+		b.convs.set(worker.id, worker);
+		const replacement = endpoint(a, "c3");
+		finish();
+		await closing;
+		expect(a.convs.get("c3")).toBe(replacement);
+		expect(a.removeConversation).not.toHaveBeenCalledWith("c3");
+		expect(b.convs.get(worker.id)).toBe(worker);
 	});
 	it("closing receiver escalates request to user on surviving sender holder", async () => {
 		const a = holder("a"),

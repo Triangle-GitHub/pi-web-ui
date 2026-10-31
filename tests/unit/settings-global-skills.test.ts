@@ -6,6 +6,7 @@ import { ClientStateStore } from "../../server/client-state.js";
 import { SettingsService, type SettingsHost } from "../../server/settings-service.js";
 import { SubagentTemplatesStore } from "../../server/subagent-templates.js";
 import type { ServerMessage } from "../../server/protocol.js";
+import * as skillDiscovery from "../../server/skill-discovery.js";
 
 vi.mock("node:os", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("node:os")>();
@@ -82,35 +83,69 @@ describe("global .agents/skills settings (issue #669)", () => {
 		store.saveSettings("test-client", { disabledSkills: [], reviewDisabledSkills: [] });
 		const reload = vi.fn(async () => {});
 		const svc = makeService({ filterDiskSkills: () => [], reloadSession: reload });
-		svc.push();
-		svc.push();
+		svc.refreshResources();
+		svc.refreshResources();
 		expect(reload).not.toHaveBeenCalled();
 		const state = emitted.filter((msg) => msg.type === "settings_state").at(-1);
 		expect(state?.settings.skills.some((skill) => skill.name === skillName)).toBe(false);
 	});
 
-	it("reports a failed discovery reload through the normal settings error path", async () => {
+	it("does not reload or notify for disabled disk skills across settings pushes", () => {
 		installSkill();
-		const error = vi.spyOn(console, "error").mockImplementation(() => {});
-		try {
-			const reload = vi.fn(async () => {
-				throw new Error("discovery reload failed");
-			});
-			const svc = makeService({ reloadSession: reload });
-			svc.push();
-			await vi.waitFor(() =>
-				expect(emitted).toContainEqual(
-					expect.objectContaining({
-						type: "notice",
-						level: "error",
-						textEn: "Failed to apply settings: discovery reload failed",
-					}),
-				),
-			);
-			expect(reload).toHaveBeenCalledTimes(1);
-		} finally {
-			error.mockRestore();
-		}
+		const reload = vi.fn(async () => {});
+		const svc = makeService({
+			reloadSession: reload,
+			filterDiskSkills: (skills) => skills.filter((skill) => skill.name === skillName),
+		});
+		svc.refreshResources();
+		svc.refreshResources();
+		expect(reload).not.toHaveBeenCalled();
+		expect(emitted.filter((msg) => msg.type === "notice")).toEqual([]);
+	});
+
+	it("discovers enabled disk skills without reloading or notifying", () => {
+		installSkill();
+		store.saveSettings("test-client", { disabledSkills: [] });
+		const reload = vi.fn(async () => {});
+		const svc = makeService({ reloadSession: reload });
+		svc.refreshResources();
+		expect(reload).not.toHaveBeenCalled();
+		expect(emitted.filter((msg) => msg.type === "notice")).toEqual([]);
+		const state = emitted.filter((msg) => msg.type === "settings_state").at(-1);
+		expect(state?.settings.skills).toContainEqual(expect.objectContaining({ name: skillName }));
+	});
+
+	it("ordinary state pushes do not discover, save preferences, or reload", () => {
+		installSkill();
+		const filter = vi.fn((skills) => skills);
+		const reload = vi.fn(async () => {});
+		const save = vi.spyOn(store, "saveSettings");
+		const discover = vi.spyOn(skillDiscovery, "discoverDiskSkills");
+		const svc = makeService({ filterDiskSkills: filter, reloadSession: reload });
+		svc.push();
+		svc.push();
+		expect(filter).not.toHaveBeenCalled();
+		expect(discover).not.toHaveBeenCalled();
+		discover.mockRestore();
+		expect(save).not.toHaveBeenCalled();
+		expect(reload).not.toHaveBeenCalled();
+		expect(emitted.filter((msg) => msg.type === "notice")).toEqual([]);
+		expect(svc.current.disabledSkills).toEqual([skillName]);
+	});
+
+	it("does not carry a discovered project catalog into another project", () => {
+		const base = join(cwd, ".agents", "skills", "project-only");
+		mkdirSync(base, { recursive: true });
+		writeFileSync(join(base, "SKILL.md"), "---\nname: project-only\ndescription: Project skill\n---\nBody");
+		const svc = makeService();
+		svc.refreshResources();
+		let state = emitted.filter((msg) => msg.type === "settings_state").at(-1);
+		expect(state?.settings.skills.some((skill) => skill.name === "project-only")).toBe(true);
+		cwd = join(dir, "another-project");
+		mkdirSync(cwd, { recursive: true });
+		svc.push();
+		state = emitted.filter((msg) => msg.type === "settings_state").at(-1);
+		expect(state?.settings.skills.some((skill) => skill.name === "project-only")).toBe(false);
 	});
 
 	it("does not discover skills or start reloads after disposal", () => {
@@ -119,7 +154,7 @@ describe("global .agents/skills settings (issue #669)", () => {
 		const reload = vi.fn(async () => {});
 		const svc = makeService({ filterDiskSkills: filter, reloadSession: reload });
 		svc.dispose();
-		svc.push();
+		svc.refreshResources();
 		expect(filter).not.toHaveBeenCalled();
 		expect(reload).not.toHaveBeenCalled();
 		expect(emitted).toEqual([]);
@@ -141,8 +176,8 @@ describe("global .agents/skills settings (issue #669)", () => {
 		});
 		// Construct again to read the updated persisted settings.
 		const updated = makeService();
-		updated.push();
-		updated.push();
+		updated.refreshResources();
+		updated.refreshResources();
 		expect(updated.current.disabledSkills).toEqual([skillName]);
 		expect(updated.current.reviewDisabledSkills).toEqual([skillName]);
 		expect(updated.current.skillsFullText).toEqual([skillName]);
@@ -159,15 +194,28 @@ describe("global .agents/skills settings (issue #669)", () => {
 		vi.stubEnv("HOME", undefined);
 		installSkill();
 		const svc = makeService();
-		svc.push();
+		svc.refreshResources();
 		expect(svc.current.disabledSkills).toEqual([skillName]);
 		expect(svc.current.reviewDisabledSkills).toEqual([skillName]);
 		expect(svc.current.skillsFullText).toEqual([skillName]);
 	});
 
+	it("prunes a deleted disabled skill from a previously discovered catalog", () => {
+		installSkill();
+		const svc = makeService();
+		svc.refreshResources();
+		rmSync(join(home, ".agents", "skills", skillName), { recursive: true });
+		svc.refreshResources();
+		expect(svc.current.disabledSkills).toEqual([]);
+		expect(svc.current.reviewDisabledSkills).toEqual([]);
+		expect(svc.current.skillsFullText).toEqual([]);
+		const state = emitted.filter((msg) => msg.type === "settings_state").at(-1);
+		expect(state?.settings.skills.some((skill) => skill.name === skillName)).toBe(false);
+	});
+
 	it("still prunes settings for a skill that no longer exists", () => {
 		const svc = makeService();
-		svc.push();
+		svc.refreshResources();
 		expect(svc.current.disabledSkills).toEqual([]);
 		expect(svc.current.reviewDisabledSkills).toEqual([]);
 		expect(svc.current.skillsFullText).toEqual([]);
@@ -180,7 +228,7 @@ describe("global .agents/skills settings (issue #669)", () => {
 	it("dynamically discovers external newly-installed skills on disk even if loader hasn't reloaded", () => {
 		const svc = makeService();
 		// Initial push: no disk skills
-		svc.push();
+		svc.refreshResources();
 		let state = emitted.filter((msg) => msg.type === "settings_state").at(-1);
 		expect(state?.settings.skills.some((s: any) => s.name === "newly-installed")).toBe(false);
 
@@ -190,7 +238,7 @@ describe("global .agents/skills settings (issue #669)", () => {
 		writeFileSync(join(base, "SKILL.md"), `---\nname: newly-installed\ndescription: Dynamically installed\n---\nBody`);
 
 		// Next push: should immediately discover and include the new skill
-		svc.push();
+		svc.refreshResources();
 		state = emitted.filter((msg) => msg.type === "settings_state").at(-1);
 		expect(state?.settings.skills.some((s: any) => s.name === "newly-installed")).toBe(true);
 	});

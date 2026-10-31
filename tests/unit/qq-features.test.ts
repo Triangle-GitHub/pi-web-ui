@@ -9,6 +9,7 @@ import { describe, expect, it, vi } from "vitest";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { chunkMarkdownText } from "../../plugins/qq/markdown-chunks.mjs";
 import activate, {
 	checkCwdValid,
 	extractQqText,
@@ -66,6 +67,265 @@ describe("QQ 运行归属行为", () => {
 		expect(chat.mock.calls[1][0].conversationId).not.toBe("real-1");
 		await bridge.stop();
 	});
+
+	it.each(
+		[false, true].flatMap((bindActive) =>
+			[
+				"/reset",
+				"／ｒｅｓｅｔ",
+				"/model default",
+				"/model test-model",
+				"/4 default",
+				"4 test-model",
+				"／４ test-model",
+				"/thinking default",
+				"/thinking high",
+				"/5 default",
+				"5 high",
+				"／５ high",
+				"/new",
+				"/clear",
+				"/2",
+				"2",
+				"2/new",
+				"/2/new",
+				"／ｎｅｗ",
+				"／ｃｌｅａｒ",
+				"／２",
+				"２／ｎｅｗ",
+				"/new 新提示Ａ",
+				"2 新提示Ａ",
+				"／２ 新提示Ａ",
+				"/cwd default",
+				"/workspace reset",
+				`/cwd ${process.cwd()}`,
+				`/workspace ${process.cwd()}`,
+				`／１ ${process.cwd()}`,
+			].map((command) => ({ bindActive, command })),
+		),
+	)("$command creates and keeps a new context (bindActive=$bindActive)", async ({ bindActive, command }) => {
+		const contexts = new Map<string, string[]>();
+		const chat = vi.fn(async (req: any) => {
+			const id = contexts.has(req.conversationId) ? req.conversationId : `canonical-${contexts.size}`;
+			contexts.set(id, [...(contexts.get(id) || []), req.text]);
+			return { conversationId: id };
+		});
+		const cfg = { bindActive, workspace: process.cwd() };
+		const bridge = new QqBotBridge({
+			host: { chat, getActiveConversation: () => ({ conversationId: "canonical-0" }) },
+			getConfig: () => cfg,
+		});
+		bridge.replyMessage = vi.fn().mockResolvedValue(undefined);
+		let msg = 0;
+		const inbound = (content: string) =>
+			bridge.onInboundMessage(
+				{
+					id: `reset-${++msg}`,
+					author: { id: "u" },
+					content,
+				},
+				"C2C_MESSAGE_CREATE",
+			);
+		const finish = () => bridge.handleRunEvent({ type: "run_end", conversationId: `canonical-${contexts.size - 1}` });
+		try {
+			await inbound("旧上下文");
+			await finish();
+			expect(bridge.conversationBindings.get("canonical-0").replyTarget).toMatchObject({ msgId: "reset-1" });
+			bridge.webRunTexts.set("canonical-0", "旧网页输出");
+			bridge.conversationBindings.set("other", { authorId: "other", replyTarget: {} });
+			bridge.userModels.set("u", "old-model");
+			bridge.userThinkingLevels.set("u", "low");
+			await inbound(command);
+			expect(bridge.conversationBindings.has("canonical-0")).toBe(false);
+			expect(bridge.webRunTexts.has("canonical-0")).toBe(false);
+			expect(bridge.conversationBindings.has("other")).toBe(true);
+			if (command.includes("新提示Ａ")) {
+				expect(chat.mock.calls.at(-1)![0].text).toBe("新提示Ａ");
+				await finish();
+			} else {
+				await inbound("新上下文");
+				await finish();
+			}
+			expect(contexts.get("canonical-1")).toEqual([command.includes("新提示Ａ") ? "新提示Ａ" : "新上下文"]);
+			expect(chat.mock.calls.at(-1)![0].accountId).not.toBe(chat.mock.calls[0][0].accountId);
+			expect(chat.mock.calls.at(-1)![0].cwd).toBe(process.cwd());
+			if (/model|\/4|^4|４/.test(command)) {
+				expect(chat.mock.calls.at(-1)![0].model).toBe(command.includes("default") ? undefined : "test-model");
+			}
+			if (/thinking|\/5|^5|５/.test(command)) {
+				expect(chat.mock.calls.at(-1)![0].thinkingLevel).toBe(command.includes("default") ? undefined : "high");
+			}
+			await inbound("继续");
+			expect(chat.mock.calls.at(-1)![0].conversationId).toBe("canonical-1");
+			expect(contexts.get("canonical-0")).toEqual(["旧上下文"]);
+			expect(contexts.get("canonical-1")!.at(-1)).toBe("继续");
+		} finally {
+			await bridge.stop();
+		}
+	});
+
+	it.each([
+		"/new",
+		"/clear",
+		"/reset",
+		"/cwd default",
+		`/workspace ${process.cwd()}`,
+		"/model default",
+		"/4 test-model",
+		"/thinking default",
+		"/5 high",
+	])("%s preserves workspace and bindings when abort fails", async (command) => {
+		const bridge = new QqBotBridge({
+			host: { abortRun: vi.fn().mockResolvedValue({ ok: false }) },
+			getConfig: () => ({}),
+		});
+		bridge.replyMessage = vi.fn().mockResolvedValue(undefined);
+		bridge.userWorkspaces.set("u", "old-workspace");
+		bridge.userActiveConvs.set("u", "old");
+		bridge.conversationBindings.set("old", { authorId: "u", replyTarget: {} });
+		bridge.pendingRuns.set("old", { authorId: "u", runId: "running" });
+		await bridge.handleSlashCommand(command, { authorId: "u", replyTarget: {}, cfg: {} });
+		expect(bridge.userWorkspaces.get("u")).toBe("old-workspace");
+		expect(bridge.peerSessionSeq.has("u")).toBe(false);
+		expect(bridge.userActiveConvs.get("u")).toBe("old");
+		expect(bridge.conversationBindings.has("old")).toBe(true);
+		expect(bridge.pendingRuns.has("old")).toBe(true);
+	});
+
+	it("status reports the peer's actual isolated mode after reset", async () => {
+		const cfg = { bindActive: true };
+		const bridge = new QqBotBridge({ host: {}, getConfig: () => cfg });
+		bridge.replyMessage = vi.fn().mockResolvedValue(undefined);
+		const command = (text: string, authorId = "u") =>
+			bridge.handleSlashCommand(text, { authorId, replyTarget: {}, cfg });
+		await command("/status");
+		expect(vi.mocked(bridge.replyMessage).mock.calls.at(-1)![1]).toContain("投递到网页活跃会话");
+		await command("/reset");
+		await command("/status");
+		expect(vi.mocked(bridge.replyMessage).mock.calls.at(-1)![1]).toContain("独立无头会话");
+		await command("/status", "other");
+		expect(vi.mocked(bridge.replyMessage).mock.calls.at(-1)![1]).toContain("投递到网页活跃会话");
+	});
+
+	it.each(["reset", "stop", "abort"].flatMap((action) => [false, true].map((reject) => ({ action, reject }))))(
+		"late chat receipt cannot resurrect state after $action (reject=$reject)",
+		async ({ action, reject }) => {
+			let receipt!: (value: any) => void;
+			let failReceipt!: (reason: Error) => void;
+			const chat = vi
+				.fn()
+				.mockImplementationOnce(
+					() =>
+						new Promise((resolve, rejectReceipt) => {
+							receipt = resolve;
+							failReceipt = rejectReceipt;
+						}),
+				)
+				.mockResolvedValue({ conversationId: "new-context", runId: "new-run" });
+			const cfg = { bindActive: true };
+			const bridge = new QqBotBridge({
+				host: {
+					chat,
+					abortRun: vi.fn().mockResolvedValue({ ok: true }),
+					getActiveConversation: () => ({ conversationId: "web-old" }),
+				},
+				getConfig: () => cfg,
+			});
+			bridge.replyMessage = vi.fn().mockResolvedValue(undefined);
+			try {
+				const dispatch = bridge.driveAuthor("u", "old", {});
+				await bridge.handleRunEvent({
+					type: "message",
+					conversationId: "old-canonical",
+					runId: "old-run",
+					message: { role: "assistant", content: "stale" },
+				});
+				if (action === "stop") await bridge.stop();
+				else
+					await bridge.handleSlashCommand(action === "reset" ? "/reset" : "/stop", {
+						authorId: "u",
+						replyTarget: {},
+						cfg,
+					});
+				if (action === "reset") await bridge.driveAuthor("u", "fresh", {});
+				if (reject) failReceipt(new Error("late failure"));
+				else receipt({ conversationId: "old-canonical", runId: "old-run" });
+				await dispatch;
+				expect(bridge.userActiveConvs.get("u")).toBe(action === "reset" ? "new-context" : undefined);
+				expect(bridge.conversationBindings.has("old-canonical")).toBe(false);
+				expect(bridge.runIdIndex.has("old-run")).toBe(false);
+				expect(bridge.inFlightConvs.size).toBe(0);
+				expect(bridge.earlyRunEvents.size).toBe(0);
+				expect(bridge.pendingRuns.size).toBe(action === "reset" ? 2 : 0);
+				expect(vi.mocked(bridge.replyMessage).mock.calls.some((call: any[]) => String(call[1]).includes("stale"))).toBe(
+					false,
+				);
+				if (action === "stop") {
+					expect(bridge.conversationBindings.size).toBe(0);
+					expect(bridge.status.state).toBe("idle");
+				}
+			} finally {
+				await bridge.stop();
+			}
+		},
+	);
+
+	it.each(
+		[false, true].flatMap((webSync) =>
+			["/reset", "/4 test-model", "/5 high", "stop", "continue", ...(webSync ? ["rebind"] : [])].map((action) => ({
+				webSync,
+				action,
+			})),
+		),
+	)(
+		"chunk delivery webSync=$webSync stops stale output after $action during first send",
+		async ({ webSync, action }) => {
+			const cfg = { bindActive: true };
+			const bridge = new QqBotBridge({ host: {}, getConfig: () => cfg });
+			let release!: () => void;
+			let started!: () => void;
+			const sending = new Promise<void>((resolve) => {
+				started = resolve;
+			});
+			const blocked = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			const target = { msgId: "old-target" };
+			const text = "旧输出段落\n".repeat(1500);
+			const reply = vi.fn(async (replyTarget: any) => {
+				if (replyTarget === target && reply.mock.calls.filter(([t]) => t === target).length === 1) {
+					started();
+					await blocked;
+				}
+			});
+			bridge.replyMessage = reply;
+			bridge.conversationBindings.set("old", { authorId: "u", replyTarget: target });
+			if (webSync) bridge.webRunTexts.set("old", text);
+			else bridge.pendingRuns.set("old", { authorId: "u", replyTarget: target, accumulatedText: text });
+			const delivery = bridge.handleRunEvent({ type: "run_end", conversationId: "old" });
+			try {
+				await sending;
+				if (action === "stop") await bridge.stop();
+				else if (action === "rebind") bridge.conversationBindings.set("old", { authorId: "u", replyTarget: target });
+				else if (action !== "continue")
+					await bridge.handleSlashCommand(action, { authorId: "u", replyTarget: {}, cfg });
+				release();
+				await delivery;
+				const sent = reply.mock.calls.filter(([t]) => t === target);
+				expect(sent.length).toBe(
+					action === "continue"
+						? chunkMarkdownText(webSync ? `💻 [来自电脑网页端同步]\n${text.trim()}` : text.trim(), 3000).length
+						: 1,
+				);
+				expect(bridge.status.messagesReplied).toBe(action === "continue" ? 1 : 0);
+				expect(bridge.status.lastReplyAt === null).toBe(action !== "continue");
+			} finally {
+				release();
+				await delivery;
+				await bridge.stop();
+			}
+		},
+	);
 
 	it("/stop 在附件下载前执行", async () => {
 		const bridge = new QqBotBridge({ host: {}, getConfig: () => ({}) });

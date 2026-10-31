@@ -23,10 +23,11 @@ const THINKING = ["off", "minimal", "low", "medium", "high", "xhigh"];
 export function installChannelBehavior(Bridge, platform, api, extract, chunk, strip) {
 	const discord = platform === "discord";
 	Object.assign(Bridge.prototype, {
-		async reply(route, text) {
+		async reply(route, text, isCurrent = () => true) {
 			const cfg = this.getConfig();
 			try {
 				for (const part of chunk(text, discord ? 1900 : 3800)) {
+					if (!isCurrent()) return;
 					if (discord)
 						await api(cfg.botToken, "POST", `/channels/${route.channelId}/messages`, {
 							content: part,
@@ -55,13 +56,19 @@ export function installChannelBehavior(Bridge, platform, api, extract, chunk, st
 		async handleSlashCommand(text, route) {
 			const state = this.stateFor(route);
 			const cfg = this.getConfig();
-			const [command] = text.trim().split(/\s+/);
-			const arg = text.slice(command.length).trim();
+			text = text.trim().replace(/^／/, "/");
+			const [command] = text.split(/\s+/);
+			let arg = text.slice(command.length).trim();
+			if (
+				command.toLowerCase() === "/thinking" ||
+				(command.toLowerCase() === "/model" && arg.toLowerCase() === "default")
+			)
+				arg = arg.toLowerCase();
 			let answer;
 			switch (command.toLowerCase()) {
 				case "/help":
 					answer =
-						"/help /new /clear /status /stop (/abort) /model [provider/id|default] /thinking [off|minimal|low|medium|high|xhigh|default] /cwd [absolute path]. Commands are plain messages; mention the bot in channels. Settings apply to the next message.";
+						"/help /new /clear (/reset) /status /stop (/abort) /model [provider/id|default] /thinking [off|minimal|low|medium|high|xhigh|default] /cwd [absolute path] (/workspace). Commands are plain messages; mention the bot in channels. Settings apply to the next message.";
 					break;
 				case "/stop":
 				case "/abort": {
@@ -76,12 +83,14 @@ export function installChannelBehavior(Bridge, platform, api, extract, chunk, st
 				}
 				case "/new":
 				case "/clear":
+				case "/reset":
 					if (state.busy) {
 						answer = "Run active. Use /stop and wait before resetting.";
 						break;
 					}
 					state.conversationId = `${platform}_${randomUUID()}`;
 					state.epoch = randomUUID();
+					if (arg) return { prompt: arg, epoch: state.epoch };
 					answer = "Started a fresh conversation (history retained).";
 					break;
 				case "/model":
@@ -101,7 +110,15 @@ export function installChannelBehavior(Bridge, platform, api, extract, chunk, st
 						answer = `Invalid thinking level. Use ${THINKING.join(", ")} or default.`;
 						break;
 					}
-					if (arg) state.thinkingLevel = arg === "default" ? undefined : arg;
+					if (arg) {
+						if (state.busy) {
+							answer = "Run active. Stop and wait before changing thinking level.";
+							break;
+						}
+						state.thinkingLevel = arg === "default" ? undefined : arg;
+						state.epoch = randomUUID();
+						state.conversationId = `${platform}_${randomUUID()}`;
+					}
 					answer = `Thinking: ${state.thinkingLevel || cfg.thinkingLevel || "host default"}; applied on next message.`;
 					break;
 				case "/cwd":
@@ -112,8 +129,10 @@ export function installChannelBehavior(Bridge, platform, api, extract, chunk, st
 							break;
 						}
 						if (!isAbsolute(arg)) throw new Error("Workspace must be an absolute path");
+						const epoch = state.epoch;
 						const dir = await this.host.fs.statPath(arg);
 						if (dir.type !== "dir") throw new Error("Workspace must be an accessible directory");
+						if (state.busy || state.epoch !== epoch) throw new Error("Session changed; retry workspace command");
 						state.epoch = randomUUID();
 						state.cwd = arg;
 						state.conversationId = `${platform}_${randomUUID()}`;
@@ -168,9 +187,11 @@ export function installChannelBehavior(Bridge, platform, api, extract, chunk, st
 			const state = this.stateFor(route);
 			let acquired = false;
 			try {
-				if (text.startsWith("/")) {
-					await this.handleSlashCommand(text, route);
-					return;
+				if (/^[/／]/.test(text)) {
+					const command = await this.handleSlashCommand(text, route);
+					if (!command?.prompt) return;
+					if (command.epoch !== state.epoch) throw new Error("Session changed; retry reset prompt");
+					text = command.prompt;
 				}
 				if (state.busy) {
 					await this.reply(route, "Run active. Wait or use /stop.");
@@ -220,7 +241,7 @@ export function installChannelBehavior(Bridge, platform, api, extract, chunk, st
 				this.status.lastMessageAt = Date.now();
 				this.dispatches ??= new Set();
 				this.ownedRuns ??= new Map();
-				const run = { route, state, text: "", events: new Map(), truncated: false };
+				const run = { route, state, epoch: state.epoch, text: "", events: new Map(), truncated: false };
 				this.dispatches.add(run);
 				try {
 					const result = await this.host.chat({
@@ -237,6 +258,7 @@ export function installChannelBehavior(Bridge, platform, api, extract, chunk, st
 					});
 					if (result?.ok === false || !result?.conversationId || !result?.runId)
 						throw new Error(result?.error || "Host did not return conversationId and stable runId");
+					if (state.epoch !== run.epoch) return;
 					state.conversationId = result.conversationId;
 					run.runId = result.runId;
 					state.runId = result.runId;
@@ -280,6 +302,10 @@ export function installChannelBehavior(Bridge, platform, api, extract, chunk, st
 				}
 				return;
 			}
+			if (run.epoch !== run.state.epoch) {
+				this.ownedRuns.delete(ev.runId);
+				return;
+			}
 			if (ev.type === "message" && ev.message?.role === "assistant") {
 				appendAssistant(run, ev.message);
 			}
@@ -300,6 +326,7 @@ export function installChannelBehavior(Bridge, platform, api, extract, chunk, st
 					]
 						.filter(Boolean)
 						.join("\n\n") || "Task completed (no text output).",
+					() => run.epoch === run.state.epoch,
 				);
 				this.status.messagesReplied++;
 				this.status.lastReplyAt = Date.now();

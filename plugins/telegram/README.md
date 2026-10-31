@@ -7,12 +7,12 @@ Private chats accept messages directly. In groups, mention `@yourbot`, use `/com
 Commands:
 
 - `/help` (`/start`): list commands.
-- `/new`, `/clear`: stop this peer's active runs and start a fresh conversation on the next message. Stored history is not deleted; peer preferences remain.
+- `/new [prompt]`, `/clear [prompt]`, `/reset [prompt]`: invalidate this peer's active runs, downloads and queued messages immediately. An optional prompt starts in the new conversation. Stored history is not deleted; peer preferences remain. Commands accept case-insensitive ASCII/fullwidth spelling and an optional `@bot` suffix.
 - `/status`: show this peer's conversation, running count and preferences.
 - `/stop`, `/abort`: stop only this peer's active runs.
 - `/model [provider/id]`: show available models or select one from the host model catalog.
 - `/thinking [off|minimal|low|medium|high|xhigh]`: inspect or change thinking effort.
-- `/cwd [absolute path]`: inspect or change workspace. The directory must exist; filesystem roots, the home root and common system directories are rejected. The host applies its own additional workspace validation.
+- `/cwd [absolute path]`, `/workspace [absolute path]`: inspect or change workspace. The directory must exist; filesystem roots, the home root and common system directories are rejected. The host applies its own additional workspace validation.
 
 Preference changes require stopping active runs first and start a fresh conversation. Unknown slash commands return help and never reach the model. Dispatch, attachment download, validation and agent failures are reported in chat. Reply delivery failures are recorded in plugin status/logs.
 

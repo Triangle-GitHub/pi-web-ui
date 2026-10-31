@@ -81,7 +81,7 @@ describe("upload settings exposed to clients", () => {
 				} as unknown as SettingsHost,
 				{ list: () => [] } as any,
 			);
-			svc.push(false);
+			svc.push();
 			const states = seen.filter((m) => m.type === "settings_state");
 			expect(states).toHaveLength(1);
 			expect(states[0].settings).toMatchObject({ ...defaults, ...settings });

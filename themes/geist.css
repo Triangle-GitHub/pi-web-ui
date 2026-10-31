@@ -70,6 +70,12 @@
 	--on-amber: #ffffff;
 	--on-send-blue-hover: #ffffff;
 	--on-stop-red-hover: #ffffff;
+	--switch-knob: #343b48;
+	--switch-bg-off: #d0d7de;
+	--switch-border-off: #687282;
+	--switch-bg-on: #0070f3;
+	--switch-border-on: #0070f3;
+	--switch-knob-on: #ffffff;
 	--control-fg: #444444;
 	--control-bg: #fafafa;
 	--control-border: #eaeaea;

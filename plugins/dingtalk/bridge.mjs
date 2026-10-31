@@ -10,7 +10,7 @@ const strip = (text) =>
 		.replace(/\[\[[A-Za-z][A-Za-z0-9_-]*:[^\]]*\]\]/g, "")
 		.trim();
 const HELP =
-	"钉钉机器人帮助\n/help 帮助\n/new 或 /clear 新会话\n/status 状态\n/stop 或 /abort 停止\n/model [provider/id|default] 模型\n/thinking [off|minimal|low|medium|high|xhigh|default] 思考强度\n/cwd [绝对路径|default] 工作目录\n支持图片、语音、文件、视频；语音/视频作为原文件，不保证自动转写或解码。";
+	"钉钉机器人帮助\n/help 帮助\n/new、/clear 或 /reset [prompt] 新会话并执行可选提示\n/status 状态\n/stop 或 /abort 停止\n/model [provider/id|default] 模型\n/thinking [off|minimal|low|medium|high|xhigh|default] 思考强度\n/cwd [绝对路径|default] 工作目录\n支持图片、语音、文件、视频；语音/视频作为原文件，不保证自动转写或解码。";
 
 export class DingtalkBotBridge {
 	constructor({ host, getConfig, log } = {}) {
@@ -108,82 +108,121 @@ export class DingtalkBotBridge {
 				session = { accountId: hash(`${scope}:${randomUUID()}`), revision: 0 };
 				this.sessions.set(scope, session);
 			}
-			const text = String(event.text?.content || (typeof event.text === "string" ? event.text : "") || "").trim();
-			if (text.startsWith("/")) {
-				await this.command(text, { session, cfg, url });
+			const originalText = String(event.text?.content || (typeof event.text === "string" ? event.text : "") || "");
+			const text = originalText.trimStart();
+			if (/^[/／]/.test(text)) {
+				await this.command(text, { session, cfg, url, scope });
 				return;
 			}
-			if (session.dispatching || session.runId) {
-				await this.reply(url, "当前会话仍在运行，请等待完成或先发送 /stop。");
-				return;
-			}
-			session.dispatching = true;
-			session.stopRequested = false;
-			const revision = session.revision;
-			const generation = this.generation;
-			try {
-				const media = await receiveMedia(event, cfg);
-				if (generation !== this.generation || revision !== session.revision || session.stopRequested) return;
-				const input =
-					[text, media.text, media.notice].filter(Boolean).join("\n") ||
-					(media.attachments.length ? "请处理附件。无法读取或解码时请明确告知。" : "");
-				if (!input) return;
-				if (media.notice) await this.reply(url, media.notice);
-				const req = { text: input, accountId: session.accountId };
-				if (session.conversationId) req.conversationId = session.conversationId;
-				const cwd = session.cwd || cfg.workspace || this.host.cwd;
-				if (cwd) req.cwd = cwd;
-				const model = session.model === null ? undefined : session.model || cfg.model;
-				const thinking = session.thinkingLevel === null ? undefined : session.thinkingLevel || cfg.thinkingLevel;
-				if (model) req.model = model;
-				if (thinking) req.thinkingLevel = thinking;
-				if (media.attachments.length) req.attachments = media.attachments;
-				if (session.stopRequested) return;
-				this.dispatching++;
-				try {
-					const receipt = await this.host.chat(req);
-					if (generation !== this.generation || revision !== session.revision) return;
-					if (!receipt?.conversationId || !receipt?.runId)
-						throw new Error("宿主未返回真实 conversationId/runId，请升级宿主；无法安全关联回复");
-					session.conversationId = receipt.conversationId;
-					if (session.stopRequested) {
-						const stopped = await this.host.abortRun?.(receipt.runId || receipt.conversationId);
-						if (!stopped?.ok) {
-							session.runId = receipt.runId;
-							throw new Error(stopped?.error || "延迟中止失败，请重新 /stop");
-						}
-						await this.reply(url, "投递已返回，当前任务已停止。");
-						return;
-					}
-					session.runId = receipt.runId;
-					const run = { session, url, text: "", bytes: 0, revision, generation };
-					this.pendingRuns.set(receipt.runId, run);
-					const early = this.earlyRuns.get(receipt.runId) || [];
-					this.earlyRuns.delete(receipt.runId);
-					for (const ev of early) await this.handleRunEvent(ev);
-				} finally {
-					this.dispatching--;
-					if (!this.dispatching) this.earlyRuns.clear();
-				}
-			} finally {
-				session.dispatching = false;
-			}
+			await this.dispatch(text.trim(), event, { session, cfg, url });
 		} catch (error) {
 			this.error(error);
 			if (url) await this.reply(url, `处理失败：${error.message || error}`).catch(() => {});
 		}
 	}
-	async command(text, { session, cfg, url }) {
-		const [raw, ...rest] = text.split(/\s+/);
-		const cmd = raw.toLowerCase();
-		const arg = rest.join(" ").trim();
+	async dispatch(text, event, { session, cfg, url }) {
+		if (session.dispatching || session.runId) {
+			await this.reply(url, "当前会话仍在运行，请等待完成或先发送 /stop。");
+			return;
+		}
+		session.dispatching = true;
+		session.stopRequested = false;
+		const revision = session.revision;
+		const generation = this.generation;
+		try {
+			const media = await receiveMedia(event, cfg);
+			if (generation !== this.generation || revision !== session.revision || session.stopRequested) return;
+			const input =
+				[text, media.text, media.notice].filter(Boolean).join("\n") ||
+				(media.attachments.length ? "请处理附件。无法读取或解码时请明确告知。" : "");
+			if (!input) return;
+			if (media.notice) await this.reply(url, media.notice);
+			const req = { text: input, accountId: session.accountId };
+			if (session.conversationId) req.conversationId = session.conversationId;
+			const cwd = session.cwd || cfg.workspace || this.host.cwd;
+			if (cwd) req.cwd = cwd;
+			const model = session.model === null ? undefined : session.model || cfg.model;
+			const thinking = session.thinkingLevel === null ? undefined : session.thinkingLevel || cfg.thinkingLevel;
+			if (model) req.model = model;
+			if (thinking) req.thinkingLevel = thinking;
+			if (media.attachments.length) req.attachments = media.attachments;
+			if (generation !== this.generation || revision !== session.revision || session.stopRequested) return;
+			this.dispatching++;
+			try {
+				const receipt = await this.host.chat(req);
+				if (generation !== this.generation || revision !== session.revision) {
+					if (receipt?.runId) {
+						const stopped = await this.host.abortRun?.(receipt.runId);
+						if (!stopped?.ok) this.error(new Error(stopped?.error || "旧会话任务中止失败"));
+					}
+					return;
+				}
+				if (!receipt?.conversationId || !receipt?.runId)
+					throw new Error("宿主未返回真实 conversationId/runId，请升级宿主；无法安全关联回复");
+				session.conversationId = receipt.conversationId;
+				if (session.stopRequested) {
+					const stopped = await this.host.abortRun?.(receipt.runId || receipt.conversationId);
+					if (!stopped?.ok) {
+						session.runId = receipt.runId;
+						throw new Error(stopped?.error || "延迟中止失败，请重新 /stop");
+					}
+					await this.reply(url, "投递已返回，当前任务已停止。");
+					return;
+				}
+				session.runId = receipt.runId;
+				const run = { session, url, text: "", bytes: 0, revision, generation };
+				this.pendingRuns.set(receipt.runId, run);
+				const early = this.earlyRuns.get(receipt.runId) || [];
+				this.earlyRuns.delete(receipt.runId);
+				for (const ev of early) await this.handleRunEvent(ev);
+			} finally {
+				this.dispatching--;
+				if (!this.dispatching) this.earlyRuns.clear();
+			}
+		} finally {
+			session.dispatching = false;
+		}
+	}
+	async resetSession(scope, session, url, patch = {}) {
+		session.revision++;
+		session.stopRequested = true;
+		const next = {
+			accountId: hash(randomUUID()),
+			revision: session.revision,
+			model: session.model,
+			thinkingLevel: session.thinkingLevel,
+			cwd: session.cwd,
+			...patch,
+		};
+		this.sessions.set(scope, next);
+		if (session.runId) {
+			this.pendingRuns.delete(session.runId);
+			try {
+				const stopped = await this.host.abortRun?.(session.runId);
+				if (!stopped?.ok) throw new Error(stopped?.error || "旧会话任务中止失败");
+			} catch (error) {
+				this.error(error);
+				await this.reply(url, "旧任务未能确认停止，请在宿主中检查；其结果不会写入新会话。");
+			}
+		}
+		return next;
+	}
+	async command(text, { session, cfg, url, scope }) {
+		const [, raw, argument = ""] = text.match(/^(\S+)(?:\s+([\s\S]*))?$/);
+		const arg = argument.trim();
+		const cmd = raw.normalize("NFKC").toLowerCase();
+		const value = arg.normalize("NFKC").toLowerCase();
+		const generation = this.generation;
+		const revision = session.revision;
+		const current = () =>
+			generation === this.generation && revision === session.revision && this.sessions.get(scope) === session;
 		let response;
 		switch (cmd) {
 			case "/help":
 				response = HELP;
 				break;
 			case "/status":
-				response = `会话：${session.conversationId || "尚未创建"}\n运行：${session.runId || (session.dispatching ? "投递中" : "空闲")}\n模型：${session.model || cfg.model || "跟随全局"}\n思考：${session.thinkingLevel || cfg.thinkingLevel || "跟随全局"}\n目录：${session.cwd || cfg.workspace || this.host.cwd || "默认"}\n最近错误：${this.status.lastError || "无"}`;
+				response = `会话：${session.conversationId || "尚未创建"}\n运行：${session.runId || (session.dispatching ? "投递中" : "空闲")}\n模型：${session.model === null ? "跟随全局" : session.model || cfg.model || "跟随全局"}\n思考：${session.thinkingLevel === null ? "跟随全局" : session.thinkingLevel || cfg.thinkingLevel || "跟随全局"}\n目录：${session.cwd || cfg.workspace || this.host.cwd || "默认"}\n最近错误：${this.status.lastError || "无"}`;
 				break;
 			case "/abort":
 			case "/stop": {
@@ -206,36 +245,32 @@ export class DingtalkBotBridge {
 			}
 			case "/new":
 			case "/clear":
-				if (session.dispatching || session.runId) throw new Error("请先 /stop 再创建新会话");
-				session.conversationId = undefined;
-				session.accountId = hash(randomUUID());
-				session.revision++;
-				response = "✨ 已开启全新会话，上下文已重置。";
-				break;
+			case "/reset": {
+				const next = await this.resetSession(scope, session, url);
+				if (this.sessions.get(scope) !== next || generation !== this.generation) return;
+				await this.reply(url, "✨ 已开启全新会话，上下文已重置。");
+				if (arg && this.sessions.get(scope) === next && generation === this.generation)
+					await this.dispatch(argument, {}, { session: next, cfg, url });
+				return;
+			}
 			case "/model":
 				if (!arg) {
 					response = `当前模型：${session.model === null ? "跟随全局" : session.model || cfg.model || "跟随全局"}\n用法：/model provider/id 或 /model default`;
 					break;
 				}
-				if (session.dispatching || session.runId) throw new Error("请先 /stop 再修改模型");
-				if (arg !== "default" && !/^[^\s/]+\/\S+$/.test(arg)) throw new Error("模型格式应为 provider/id，或 default");
-				session.model = arg === "default" ? null : arg;
-				session.conversationId = undefined;
-				session.accountId = hash(randomUUID());
-				response = `模型偏好已设置：${arg}；下次投递由宿主验证，若不可用会明确报错。`;
+				if (value !== "default" && !/^[^\s/]+\/\S+$/.test(arg)) throw new Error("模型格式应为 provider/id，或 default");
+				await this.resetSession(scope, session, url, { model: value === "default" ? null : arg });
+				response = `模型偏好已设置：${arg}；已开启新会话，下次投递由宿主验证，若不可用会明确报错。`;
 				break;
 			case "/thinking":
 				if (!arg) {
 					response = `当前思考强度：${session.thinkingLevel === null ? "跟随全局" : session.thinkingLevel || cfg.thinkingLevel || "跟随全局"}`;
 					break;
 				}
-				if (session.dispatching || session.runId) throw new Error("请先 /stop 再修改思考强度");
-				if (!["off", "minimal", "low", "medium", "high", "xhigh", "default"].includes(arg))
+				if (!["off", "minimal", "low", "medium", "high", "xhigh", "default"].includes(value))
 					throw new Error("思考强度支持 off/minimal/low/medium/high/xhigh/default");
-				session.thinkingLevel = arg === "default" ? null : arg;
-				session.conversationId = undefined;
-				session.accountId = hash(randomUUID());
-				response = `思考强度偏好已设置：${arg}；下次投递由宿主验证。`;
+				await this.resetSession(scope, session, url, { thinkingLevel: value === "default" ? null : value });
+				response = `思考强度偏好已设置：${arg}；已开启新会话，下次投递由宿主验证。`;
 				break;
 			case "/workspace":
 			case "/cwd": {
@@ -243,14 +278,11 @@ export class DingtalkBotBridge {
 					response = `当前项目根目录：${session.cwd || cfg.workspace || this.host.cwd || "默认"}`;
 					break;
 				}
-				if (session.dispatching || session.runId) throw new Error("请先 /stop 再切换目录");
-				const path = arg === "default" ? cfg.workspace || this.host.cwd : arg;
+				const path = value === "default" ? cfg.workspace || this.host.cwd : arg;
 				if (!path || !isAbsolute(path) || !(await stat(path)).isDirectory())
 					throw new Error("目录必须是存在的绝对路径");
-				session.cwd = path;
-				session.conversationId = undefined;
-				session.accountId = hash(randomUUID());
-				session.revision++;
+				if (!current()) return;
+				await this.resetSession(scope, session, url, { cwd: path });
 				response = `已设置目录：${path}；已开启新会话，下次投递由宿主校验目录权限。`;
 				break;
 			}

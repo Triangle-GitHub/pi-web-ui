@@ -167,8 +167,9 @@ export class TelegramBotBridge extends ChannelBehavior {
 		this.status.enabled = false;
 		this.status.connected = false;
 		this.status.state = "idle";
-		for (const controller of this.peerCancels?.values() || []) controller.abort();
-		this.peerCancels?.clear();
+		const runs = [];
+		for (const peer of this.peerCancels?.keys() || []) runs.push(...this.invalidatePeer(peer));
+		this.earlyRuns.clear();
 
 		if (this.pollAbort) {
 			try {
@@ -183,6 +184,7 @@ export class TelegramBotBridge extends ChannelBehavior {
 			} catch {}
 			this.offRunEvent = null;
 		}
+		await this.abortRuns(runs);
 	}
 
 	async startPollingLoop(signal) {

@@ -574,7 +574,7 @@ export function createIlink({ base, cdnBase, version, getToken }) {
 
 export default {
 	activate(host) {
-		const VERSION = "0.5.0";
+		const VERSION = "0.5.4";
 		let cfg = {};
 		try {
 			cfg = host.getSettings?.() ?? {};
@@ -583,7 +583,12 @@ export default {
 		}
 		const settings = () => cfg;
 		const offSettings = host.onSettingsChanged?.((v) => {
+			const rebind = v?.bindActive === true && cfg.bindActive !== true;
 			cfg = v ?? {};
+			if (rebind) {
+				st.peerDetached = {};
+				save();
+			}
 			applyAiTool();
 			pushState();
 		});
@@ -628,6 +633,8 @@ export default {
 			userPlanMode: {},
 			/** 用户独立会话序号（/clear /new 递增）：peer → number */
 			peerSessionSeq: {},
+			/** 显式新建的微信会话不再被全局网页投递设置覆盖。 */
+			peerDetached: {},
 			/** runKey(clientId:conversationId) → { to, ctx, timer, noticed, conversationId, clientId, runId }。 */
 			pendingRuns: new Map(),
 			/** host.chat 回执的稳定 runId → runKey（过户更换持有客户端 / 对话撞 id 改名后，
@@ -657,6 +664,7 @@ export default {
 				st.userThinkingLevels = store.get("userThinkingLevels", {}) ?? {};
 				st.userPlanMode = store.get("userPlanMode", {}) ?? {};
 				st.peerSessionSeq = store.get("peerSessionSeq", {}) ?? {};
+				st.peerDetached = store.get("peerDetached", {}) ?? {};
 			} catch (err) {
 				host.log("load state failed:", err?.message ?? err);
 			}
@@ -675,6 +683,7 @@ export default {
 				store.set("userThinkingLevels", st.userThinkingLevels);
 				store.set("userPlanMode", st.userPlanMode);
 				store.set("peerSessionSeq", st.peerSessionSeq);
+				store.set("peerDetached", st.peerDetached);
 			} catch (err) {
 				host.log("save state failed:", err?.message ?? err);
 			}
@@ -757,6 +766,10 @@ export default {
 		function setBindActive(bindActive) {
 			const active = Boolean(bindActive);
 			cfg = { ...cfg, bindActive: active };
+			if (active) {
+				st.peerDetached = {};
+				save();
+			}
 			try {
 				const prev = store.get("settings", {});
 				const baseObj = prev && typeof prev === "object" && !Array.isArray(prev) ? prev : {};
@@ -1192,7 +1205,32 @@ export default {
 			inFlightConvs.delete(convId);
 		}
 
+		async function startPeerSession(peer) {
+			const epoch = (st.peerSessionSeq[peer] || 0) + 1;
+			st.peerSessionSeq[peer] = epoch;
+			st.peerDetached[peer] = true;
+			save();
+			let failed = false;
+			for (const [key, run] of [...st.pendingRuns.entries()]) {
+				if (run.to !== peer) continue;
+				dropRun(key);
+				try {
+					const result = await host.abortRun?.(run.runId || run.conversationId || key);
+					if (!result?.ok) failed = true;
+				} catch (err) {
+					failed = true;
+					host.log("reset abort failed:", err?.message ?? err);
+				}
+			}
+			if (failed)
+				await sendText(peer, "⚠️ 新会话已隔离，但未能确认旧任务停止，请在网页端检查。", st.peerCtx[peer]).catch(
+					() => {},
+				);
+			return epoch;
+		}
+
 		async function drivePeer(peer, text, contextToken, attachments = []) {
+			const generation = mediaGeneration.get(peer) || 0;
 			const label = `微信:${peer}`;
 			// issue #226：透传宿主 host.chat 四件套（工作空间/模型/思考强度/绑定网页会话）。
 			// issue #345：按微信用户 ID 与会话序号隔离 accountId，避免全员共享同一伪客户端与无头会话。
@@ -1209,7 +1247,7 @@ export default {
 			if (thinkingLevel) req.thinkingLevel = thinkingLevel;
 
 			let bindCid = null;
-			if (settings().bindActive === true) {
+			if (settings().bindActive === true && st.peerDetached[peer] !== true) {
 				try {
 					const cid = host.getActiveConversation?.()?.conversationId;
 					if (typeof cid === "string" && cid.trim()) {
@@ -1231,6 +1269,21 @@ export default {
 				const r = await host.chat(req);
 				if (!r?.conversationId) throw new Error(r?.error || "宿主未返回实际会话 ID，消息未确认执行");
 				const conversationId = r?.conversationId;
+				if (st.disposed || seq !== (st.peerSessionSeq[peer] || 0) || generation !== (mediaGeneration.get(peer) || 0)) {
+					if (bindCid) inFlightConvs.delete(bindCid);
+					inFlightClients.delete(expectedPseudoClientId);
+					try {
+						const stopped = await host.abortRun?.(r.runId || conversationId);
+						if (!stopped?.ok) throw new Error(stopped?.error || "宿主未确认停止");
+					} catch (err) {
+						host.log("stale run abort failed:", err?.message ?? err);
+						if (!st.disposed)
+							await sendText(peer, "⚠️ 旧任务未能确认停止，请在网页端检查；旧结果不会写入新会话。", contextToken).catch(
+								() => {},
+							);
+					}
+					return;
+				}
 				const clientId = r?.clientId || expectedPseudoClientId;
 				// 宿主给的稳定运行 id（过户换持有客户端 / 对话撞 id 改名后仍然不变）。
 				const runId = typeof r?.runId === "string" ? r.runId.trim() : "";
@@ -1246,6 +1299,8 @@ export default {
 			} catch (err) {
 				if (bindCid) inFlightConvs.delete(bindCid);
 				inFlightClients.delete(expectedPseudoClientId);
+				if (st.disposed || seq !== (st.peerSessionSeq[peer] || 0) || generation !== (mediaGeneration.get(peer) || 0))
+					return;
 				host.log("host.chat failed:", err?.message ?? err);
 				sendText(peer, `执行失败：${err?.message ?? err}`, contextToken).catch(() => {});
 			}
@@ -1466,8 +1521,7 @@ export default {
 					}
 					if (["default", "默认", "clear", "reset"].includes(args.toLowerCase())) {
 						delete st.userWorkspaces[peer];
-						st.peerSessionSeq[peer] = (st.peerSessionSeq[peer] || 0) + 1;
-						save();
+						await startPeerSession(peer);
 						const currentWs = resolveWorkspace(peer) || "(跟随宿主当前项目)";
 						await sendText(peer, `📂 已恢复跟随全局根目录：${currentWs}\n✨ 已自动为您开启全新会话！`, ctx).catch(
 							(err) => host.log("reply slash failed:", err?.message ?? err),
@@ -1482,28 +1536,22 @@ export default {
 						return true;
 					}
 					st.userWorkspaces[peer] = chk.abs;
-					st.peerSessionSeq[peer] = (st.peerSessionSeq[peer] || 0) + 1;
-					save();
+					await startPeerSession(peer);
 					await sendText(peer, `📂 已将项目根目录切换为：${chk.abs}\n✨ 已自动为您开启该目录下的全新会话！`, ctx).catch(
 						(err) => host.log("reply slash failed:", err?.message ?? err),
 					);
 					return true;
 				}
+				case "reset":
 				case "clear":
 				case "new": {
-					st.peerSessionSeq[peer] = (st.peerSessionSeq[peer] || 0) + 1;
-					save();
-					for (const [runKey, run] of st.pendingRuns.entries()) {
-						if (run.to === peer) {
-							void host.abortRun?.(run.runId || run.conversationId || runKey);
-							dropRun(runKey);
-						}
-					}
+					const epoch = await startPeerSession(peer);
+					if (epoch !== st.peerSessionSeq[peer] || st.disposed) return true;
 					if (args) {
 						await sendText(peer, "✨ 已为您开启全新会话，正在执行指令…", ctx).catch((err) =>
 							host.log("reply slash failed:", err?.message ?? err),
 						);
-						await drivePeer(peer, args, ctx);
+						if (epoch === st.peerSessionSeq[peer] && !st.disposed) await drivePeer(peer, args, ctx);
 						return true;
 					}
 					await sendText(peer, "✨ 对话上下文已清空，已为您开启全新会话！", ctx).catch((err) =>
@@ -1526,7 +1574,8 @@ export default {
 					const currentWs = resolveWorkspace(peer) || "(跟随宿主当前项目)";
 					const currentModel = resolveModel(peer) || "(跟随全局默认)";
 					const currentThinking = resolveThinkingLevel(peer) || "(跟随全局设置)";
-					const bindActive = settings().bindActive === true ? "投递到网页活跃会话" : "独立无头会话";
+					const bindActive =
+						settings().bindActive === true && st.peerDetached[peer] !== true ? "投递到网页活跃会话" : "独立无头会话";
 					const statusText = [
 						"🟢 微信通道运行状态",
 						"",
@@ -1561,16 +1610,14 @@ export default {
 					}
 					if (["default", "默认", "clear", "reset"].includes(args.toLowerCase())) {
 						delete st.userModels[peer];
-						st.peerSessionSeq[peer] = (st.peerSessionSeq[peer] || 0) + 1;
-						save();
+						await startPeerSession(peer);
 						await sendText(peer, "🤖 已恢复跟随全局默认模型。\n✨ 已自动为您开启全新会话！", ctx).catch((err) =>
 							host.log("reply slash failed:", err?.message ?? err),
 						);
 						return true;
 					}
 					st.userModels[peer] = args;
-					st.peerSessionSeq[peer] = (st.peerSessionSeq[peer] || 0) + 1;
-					save();
+					await startPeerSession(peer);
 					await sendText(peer, `🤖 已将模型切换为：${args}\n✨ 已自动为您开启该模型下的全新会话！`, ctx).catch((err) =>
 						host.log("reply slash failed:", err?.message ?? err),
 					);
@@ -1607,8 +1654,7 @@ export default {
 					}
 					if (["default", "默认", "clear", "reset"].includes(args.toLowerCase())) {
 						delete st.userThinkingLevels[peer];
-						st.peerSessionSeq[peer] = (st.peerSessionSeq[peer] || 0) + 1;
-						save();
+						await startPeerSession(peer);
 						await sendText(peer, "🧠 已恢复跟随全局思考强度设置。\n✨ 已自动为您开启全新会话！", ctx).catch((err) =>
 							host.log("reply slash failed:", err?.message ?? err),
 						);
@@ -1624,8 +1670,7 @@ export default {
 						return true;
 					}
 					st.userThinkingLevels[peer] = mapped;
-					st.peerSessionSeq[peer] = (st.peerSessionSeq[peer] || 0) + 1;
-					save();
+					await startPeerSession(peer);
 					await sendText(peer, `🧠 已将思考强度设置为：${mapped}\n✨ 已自动为您开启该档位下的全新会话！`, ctx).catch(
 						(err) => host.log("reply slash failed:", err?.message ?? err),
 					);
@@ -1796,6 +1841,7 @@ export default {
 			st.lastPollAt = Date.now();
 			st.lastError = "";
 			for (const m of r?.msgs ?? []) {
+				if (st.disposed) return;
 				if (inboundPartsOf(m?.item_list).some((p) => p.kind !== "text")) {
 					if (inboundMediaTasks.size >= 4) {
 						void sendText(String(m.from_user_id ?? ""), "媒体处理繁忙，请稍后重发。", m.context_token).catch(() => {});

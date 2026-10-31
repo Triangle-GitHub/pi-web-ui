@@ -84,7 +84,12 @@
 	--brand-grad-b: #6366f1;
 	--on-amber: #1a1a1a;
 	--search-active-fg: #040507;
+	--switch-bg-off: #424754;
+	--switch-border-off: #8791a3;
 	--switch-knob: #ffffff;
+	--switch-bg-on: #00f5d4;
+	--switch-border-on: #00f5d4;
+	--switch-knob-on: #1a1a1a;
 	--sunken-bg: rgba(0, 0, 0, 0.45);
 	--glow-015: rgba(0, 245, 212, 0.015);
 	--glow-025: rgba(0, 245, 212, 0.025);

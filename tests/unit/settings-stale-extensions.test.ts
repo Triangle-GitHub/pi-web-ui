@@ -90,7 +90,7 @@ describe("disabledExtensions stale 剔除（issue #192）", () => {
 			makeHost(makeSession([{ sourceInfo: { origin: "package", source: "npm:loaded-pkg" }, path: "/x" }])),
 			new SubagentTemplatesStore(join(dir, "templates.json")),
 		);
-		svc.push();
+		svc.refreshResources();
 
 		expect([...svc.current.disabledExtensions].sort()).toEqual(["npm:loaded-pkg", "npm:listed-pkg", realPath].sort());
 		// 持久化同步
@@ -113,7 +113,7 @@ describe("disabledExtensions stale 剔除（issue #192）", () => {
 			makeHost(new Error("not ready")),
 			new SubagentTemplatesStore(join(dir, "templates.json")),
 		);
-		svc.push();
+		svc.refreshResources();
 		// 记录保留（不清）
 		expect(svc.current.disabledExtensions).toEqual(["npm:ghost-pkg"]);
 		// 但面板不补回（re-add 按磁盘挡）
@@ -139,7 +139,7 @@ describe("disabledExtensions stale 剔除（issue #192）", () => {
 			),
 			new SubagentTemplatesStore(join(dir, "templates.json")),
 		);
-		svc.push();
+		svc.refreshResources();
 
 		// disabledExtensions 中残留的 <inline:...> 全部被剔除，只有合法的外部扩展保留
 		expect(svc.current.disabledExtensions).toEqual([realPath]);

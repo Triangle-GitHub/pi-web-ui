@@ -81,6 +81,12 @@ export function focusComposer(): boolean {
 }
 
 let lastSessionSwitchInitiatedAt = 0;
+let sessionSwitchSink: (() => void) | null = null;
+
+/** App 注册会话导航处理，确保所有新建/切换入口都退出群组与其他视图。 */
+export function registerSessionSwitchSink(fn: (() => void) | null): void {
+	sessionSwitchSink = fn;
+}
 
 /**
  * 标记发起了一次会话切换或新建（记录时间戳并尝试聚焦输入框）。
@@ -89,6 +95,7 @@ let lastSessionSwitchInitiatedAt = 0;
  */
 export function notifySessionSwitch(): void {
 	lastSessionSwitchInitiatedAt = Date.now();
+	sessionSwitchSink?.();
 	focusComposer();
 }
 
@@ -110,6 +117,7 @@ export function resetComposerSinks(): void {
 	insertSink = null;
 	removeMentionSink = null;
 	lastSessionSwitchInitiatedAt = 0;
+	sessionSwitchSink = null;
 }
 
 /**

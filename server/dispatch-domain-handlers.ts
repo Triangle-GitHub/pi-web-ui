@@ -670,7 +670,7 @@ export function handleSettingsMessage(
 			void cs.saveCommands(msg.commands);
 			return true;
 		case "get_settings":
-			cs.pushSettings();
+			cs.refreshSettings();
 			return true;
 		case "set_settings":
 			// SAFETY: Both dispatch engines validate the explicitly enumerated settings fields below.

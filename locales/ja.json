@@ -2403,7 +2403,6 @@
 		"worktreeSwitch": "Switch worktree",
 		"worktreeManage": "Manage worktree",
 		"worktreeBadgeLinked": "Worktree",
-		"worktreeBadgeDirtyCount": "{count} with edits",
 		"worktreeActionSwitchMain": "Switch to Main",
 		"worktreeActionRemove": "Remove Worktree",
 		"worktreeActionRemoveConfirm": "Are you sure you want to remove worktree \"{path}\"? Uncommitted changes may be lost.",

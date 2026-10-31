@@ -1188,11 +1188,13 @@ describe("wechat-ilink: 回执与入站边界行为", () => {
 	async function runInbound(
 		messages: Record<string, unknown>[],
 		chatImpl?: (req: any, emit: (ev: any) => void) => any,
+		options: { bindActive?: boolean; storage?: Map<string, unknown> } = {},
 	) {
 		const replies: string[] = [];
 		let emit = (_ev: any) => {};
 		let polled = false;
-		const storage = new Map<string, unknown>();
+		let deliver: ((messages: Record<string, unknown>[]) => void) | undefined;
+		const storage = options.storage ?? new Map<string, unknown>();
 		const original = globalThis.fetch;
 		globalThis.fetch = vi.fn(async (url: any, init?: RequestInit) => {
 			if (String(url).includes("getupdates")) {
@@ -1200,8 +1202,11 @@ describe("wechat-ilink: 回执与入站边界行为", () => {
 					polled = true;
 					return { ok: true, json: async () => ({ ret: 0, msgs: messages }) } as Response;
 				}
-				await new Promise<void>((resolve) => init?.signal?.addEventListener("abort", () => resolve(), { once: true }));
-				return { ok: true, json: async () => ({ ret: 0, msgs: [] }) } as Response;
+				const next = await new Promise<Record<string, unknown>[]>((resolve) => {
+					deliver = resolve;
+					init?.signal?.addEventListener("abort", () => resolve([]), { once: true });
+				});
+				return { ok: true, json: async () => ({ ret: 0, msgs: next }) } as Response;
 			}
 			if (String(url).includes("sendmessage"))
 				replies.push(JSON.parse(String(init?.body)).msg.item_list[0].text_item?.text ?? "");
@@ -1212,7 +1217,14 @@ describe("wechat-ilink: 回执与入站边界行为", () => {
 		);
 		const abortRun = vi.fn(async (_id: string) => ({ ok: true }));
 		const host = {
-			getSettings: () => ({ autoDrive: true, typing: false, allowFrom: "*", respondGroups: true }),
+			getSettings: () => ({
+				autoDrive: true,
+				typing: false,
+				allowFrom: "*",
+				respondGroups: true,
+				bindActive: options.bindActive,
+			}),
+			getActiveConversation: () => ({ conversationId: "web-current" }),
 			onSettingsChanged: () => () => {},
 			storage: {
 				get: (k: string, d: unknown) => (storage.has(k) ? storage.get(k) : d),
@@ -1240,6 +1252,13 @@ describe("wechat-ilink: 回执与入站边界行为", () => {
 			chat,
 			abortRun,
 			replies,
+			storage,
+			enqueue: async (next: Record<string, unknown>[]) => {
+				await vi.waitFor(() => expect(deliver).toBeDefined());
+				const receive = deliver!;
+				deliver = undefined;
+				receive(next);
+			},
 			emit: (ev: any) => emit(ev),
 			close: () => {
 				cleanup?.();
@@ -1253,13 +1272,132 @@ describe("wechat-ilink: 回执与入站边界行为", () => {
 		item_list: [{ type: 1, text_item: { text: "你好" } }],
 		...extra,
 	});
-	it.each(["/stop", "/abort", "/new", "/clear"])("%s 中止优先回执中的稳定 runId", async (command) => {
-		const h = await runInbound([msg(), msg({ item_list: [{ type: 1, text_item: { text: command } }] })]);
+	it.each(["/stop", "/abort", "/8", "／ABORT", "/new", "/clear", "/reset", "/2", "2/new", "/2/new", "／NEW"])(
+		"%s 中止优先回执中的稳定 runId",
+		async (command) => {
+			const h = await runInbound([msg(), msg({ item_list: [{ type: 1, text_item: { text: command } }] })]);
+			try {
+				await vi.waitFor(() => expect(h.abortRun).toHaveBeenCalledWith("pr-stable-run"));
+				expect(h.abortRun).not.toHaveBeenCalledWith("real-conv");
+			} finally {
+				h.close();
+			}
+		},
+	);
+	it.each([
+		"/new",
+		"/clear",
+		"/reset",
+		"/2",
+		"2/new",
+		"/2/new",
+		"／NEW",
+		`/cwd ${process.cwd()}`,
+		`/workspace ${process.cwd()}`,
+		`/1 ${process.cwd()}`,
+		"/cwd default",
+		"/model provider/test",
+		"/model default",
+		"/4 provider/test",
+		"/thinking high",
+		"/thinking default",
+		"/5 high",
+	])("%s 后不再投递回旧网页会话，且只影响当前微信用户", async (command) => {
+		const h = await runInbound(
+			[
+				msg(),
+				msg({ item_list: [{ type: 1, text_item: { text: command } }] }),
+				msg(),
+				msg(),
+				msg({ from_user_id: "other-user" }),
+			],
+			undefined,
+			{ bindActive: true },
+		);
 		try {
-			await vi.waitFor(() => expect(h.abortRun).toHaveBeenCalledWith("pr-stable-run"));
-			expect(h.abortRun).not.toHaveBeenCalledWith("real-conv");
+			await vi.waitFor(() => expect(h.chat).toHaveBeenCalledTimes(4));
+			const requests = h.chat.mock.calls.map(([req]) => req);
+			expect(requests[0].conversationId).toBe("web-current");
+			expect(requests[1].conversationId).toBeUndefined();
+			expect(requests[2].conversationId).toBeUndefined();
+			expect(requests[1].accountId).not.toBe(requests[0].accountId);
+			expect(requests[2].accountId).toBe(requests[1].accountId);
+			expect(requests[3].conversationId).toBe("web-current");
 		} finally {
 			h.close();
+		}
+	});
+	it.each(["/new", "/reset", "/8", "/model default", "/thinking high"])(
+		"%s 后迟到的媒体运行回执不会认领旧会话",
+		async (command) => {
+			let complete!: (receipt: any) => void;
+			const h = await runInbound(
+				[msg({ item_list: [{ type: 3, voice_item: {} }] })],
+				() =>
+					new Promise((resolve) => {
+						complete = resolve;
+					}),
+			);
+			try {
+				await vi.waitFor(() => expect(h.chat).toHaveBeenCalledTimes(1));
+				await h.enqueue([msg({ item_list: [{ type: 1, text_item: { text: command } }] })]);
+				await vi.waitFor(() => expect(h.replies.length).toBe(2));
+				complete({ conversationId: "stale-conv", runId: "stale-run" });
+				await vi.waitFor(() => expect(h.abortRun).toHaveBeenCalledWith("stale-run"));
+				h.emit({
+					type: "message",
+					conversationId: "stale-conv",
+					runId: "stale-run",
+					message: { role: "assistant", content: "旧结果" },
+				});
+				h.emit({ type: "run_end", conversationId: "stale-conv", runId: "stale-run" });
+				expect(h.replies.join("\n")).not.toContain("旧结果");
+			} finally {
+				h.close();
+			}
+		},
+	);
+	it.each(["rejected", "throw"])("重置后迟到回执无法中止时明确告知用户：%s", async (failure) => {
+		let complete!: (receipt: any) => void;
+		const h = await runInbound(
+			[msg({ item_list: [{ type: 3, voice_item: {} }] })],
+			() =>
+				new Promise((resolve) => {
+					complete = resolve;
+				}),
+		);
+		try {
+			await vi.waitFor(() => expect(h.chat).toHaveBeenCalledTimes(1));
+			h.abortRun.mockImplementation(async () => {
+				if (failure === "throw") throw new Error("abort failed");
+				return { ok: false };
+			});
+			await h.enqueue([msg({ item_list: [{ type: 1, text_item: { text: "/reset" } }] })]);
+			await vi.waitFor(() => expect(h.replies.length).toBe(2));
+			complete({ conversationId: "stale-conv", runId: "stale-run" });
+			await vi.waitFor(() => expect(h.replies.join("\n")).toContain("旧任务未能确认停止"));
+		} finally {
+			h.close();
+		}
+	});
+	it("/new 带提示直接投递到全新会话，重载插件后保持独立模式", async () => {
+		const h = await runInbound([msg({ item_list: [{ type: 1, text_item: { text: "/new 新任务" } }] })], undefined, {
+			bindActive: true,
+		});
+		try {
+			await vi.waitFor(() => expect(h.chat).toHaveBeenCalledTimes(1));
+			expect(h.chat.mock.calls[0]![0].conversationId).toBeUndefined();
+			expect(h.chat.mock.calls[0]![0].text).toContain("新任务");
+		} finally {
+			h.close();
+		}
+		const reloaded = await runInbound([msg()], undefined, { bindActive: true, storage: h.storage });
+		try {
+			await vi.waitFor(() => expect(reloaded.chat).toHaveBeenCalledTimes(1));
+			expect(reloaded.chat.mock.calls[0]![0].conversationId).toBeUndefined();
+			expect(reloaded.chat.mock.calls[0]![0].accountId).toBe(h.chat.mock.calls[0]![0].accountId);
+		} finally {
+			reloaded.close();
 		}
 	});
 	it.each(["/new", "/clear", `/cwd ${process.cwd()}`])("%s 后下一次 host.chat 使用独立 accountId", async (command) => {

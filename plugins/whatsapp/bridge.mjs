@@ -7,6 +7,10 @@ export function sessionKey(event) {
 	return JSON.stringify([event.from || event.sender || "", event.groupId || event.chatId || "", event.threadId || ""]);
 }
 
+function commandName(text) {
+	return text.trim().split(/\s+/, 1)[0].normalize("NFKC").toLowerCase();
+}
+
 export class WhatsappBotBridge {
 	constructor({ host, getConfig, log, api, payload, extractText, stripMarkers, accountId } = {}) {
 		Object.assign(this, { host, getConfig, api, payload, extractText, stripMarkers, accountId });
@@ -19,6 +23,7 @@ export class WhatsappBotBridge {
 		this.dispatching = 0;
 		this.sessions = new Map();
 		this.queues = new Map();
+		this.inboundEpochs = new Map();
 		this.status = {
 			enabled: false,
 			connected: false,
@@ -81,17 +86,35 @@ export class WhatsappBotBridge {
 		const key = sessionKey(event);
 		// Serialize a peer's configuration and dispatch; control commands must interrupt a pending dispatch.
 		const text = this.extractText(event).trim();
-		if (/^\/(stop|abort)(?:\s|$)/i.test(text)) return this.processInbound(event, key);
+		const control = [
+			"/new",
+			"/clear",
+			"/reset",
+			"/stop",
+			"/abort",
+			"/model",
+			"/thinking",
+			"/cwd",
+			"/workspace",
+		].includes(commandName(text));
+		const epoch = this.inboundEpochs.get(key) || 0;
 		const previous = this.queues.get(key) || Promise.resolve();
-		const task = previous.catch(() => {}).then(() => this.processInbound(event, key));
-		this.queues.set(key, task);
+		const task = control
+			? this.processInbound(event, key)
+			: previous
+					.catch(() => {})
+					.then(() => {
+						if (epoch === (this.inboundEpochs.get(key) || 0)) return this.processInbound(event, key);
+					});
+		if (control) this.queues.delete(key);
+		else this.queues.set(key, task);
 		try {
 			await task;
 		} finally {
 			if (this.queues.get(key) === task) this.queues.delete(key);
 		}
 	}
-	async processInbound(event, key) {
+	async processInbound(event, key, literal = false) {
 		const sender = String(event.from || event.sender || "");
 		if (!sender) return;
 		const id = event.id || event.messageId;
@@ -121,11 +144,13 @@ export class WhatsappBotBridge {
 			};
 			this.sessions.set(key, session);
 		}
-		const text = this.extractText(event).trim();
+		const rawText = String(event.text?.body ?? event.body ?? this.extractText(event));
+		const text = literal ? rawText : rawText.trim();
 		const inboundRevision = session.revision || 0;
 		const inboundGeneration = this.generation;
 		try {
-			if (text.startsWith("/")) return await this.command(text, session, sender);
+			if (!literal && commandName(text).startsWith("/"))
+				return await this.command(rawText.trimStart(), session, sender, key);
 			const attachments = [];
 			if (MEDIA_TYPES.includes(event.type)) {
 				const saved = await receiveMedia(this.host, cfg, event);
@@ -175,12 +200,16 @@ export class WhatsappBotBridge {
 				if (!result?.conversationId || !result?.runId)
 					throw new Error("Host did not return conversationId/runId; cannot safely associate replies");
 				if (generation !== this.generation || revision !== (session.revision || 0)) {
-					await this.host.abortRun?.(result.runId || result.conversationId);
+					const aborted = await this.host.abortRun?.(result.runId || result.conversationId);
+					if (!aborted?.ok) {
+						this.status.lastError = aborted?.error || "Host abort unavailable";
+						await this.reply(sender, `Could not stop the previous task: ${this.status.lastError}`);
+					}
 					return;
 				}
 				session.conversationId = result.conversationId;
 				session.runId = result.runId;
-				const run = { session, sender, accumulatedText: "", timer: null };
+				const run = { session, revision, sender, accumulatedText: "", timer: null };
 				this.pendingRuns.set(result.runId, run);
 				run.timer = setTimeout(() => {
 					if (this.pendingRuns.delete(result.runId))
@@ -195,73 +224,86 @@ export class WhatsappBotBridge {
 				if (!this.dispatching) this.earlyRuns.clear();
 			}
 		} catch (err) {
+			if (
+				(literal || !commandName(text).startsWith("/")) &&
+				(inboundRevision !== (session.revision || 0) || inboundGeneration !== this.generation)
+			)
+				return;
 			this.status.lastError = err.message;
 			await this.reply(sender, `Request failed: ${err.message}`);
 		}
 	}
-	async command(text, session, sender) {
+	async command(text, session, sender, key) {
 		const [raw] = text.split(/\s+/);
-		const cmd = raw.toLowerCase();
-		const arg = text.slice(raw.length).trim();
+		const cmd = commandName(raw);
+		const prompt = text.slice(raw.length).trimStart();
+		const arg = prompt.trim();
+		const revision = session.revision || 0;
+		const value = arg.normalize("NFKC").toLowerCase();
 		let reply;
 		switch (cmd) {
 			case "/help":
 				reply =
-					"WhatsApp Bot Help\n/help /new /clear /status /stop (/abort) /model [provider/id|default] /thinking [off|minimal|low|medium|high|xhigh|default] /cwd [absolute path]\nSettings apply on the next text message. Images are supplied as real image attachments. Audio/documents/video are file attachments; automatic transcription/video decoding depends on host tools.";
+					"WhatsApp Bot Help\n/help /new [prompt] /clear [prompt] /reset [prompt] /status /stop (/abort) /model [provider/id|default] /thinking [off|minimal|low|medium|high|xhigh|default] /cwd [absolute path]\nSettings apply on the next text message. Images are supplied as real image attachments. Audio/documents/video are file attachments; automatic transcription/video decoding depends on host tools.";
 				break;
 			case "/status":
 				reply = `WhatsApp Bot Status: ${this.status.state}\nConversation: ${session.conversationId || "none"}\nModel: ${session.model || "host default"}\nThinking: ${session.thinkingLevel || "host default"}\nWorkspace: ${session.cwd || "host default"}\nLast error: ${this.status.lastError || "none"}`;
 				break;
 			case "/new":
 			case "/clear":
-				if (session.conversationId && [...this.pendingRuns.values()].some((r) => r.session === session)) {
-					const result = await this.host.abortRun?.(session.runId || session.conversationId);
-					if (!result?.ok) throw new Error(result?.error || "Host abort unavailable");
-				}
-				this.forgetRuns(session);
-				delete session.conversationId;
-				delete session.runId;
-				session.accountId = this.accountId(randomUUID());
+			case "/reset": {
+				const reset = this.resetSession(session, key);
+				const nextRevision = session.revision;
+				await reset;
+				if (nextRevision !== session.revision) return;
+				if (arg) return this.processInbound({ from: sender, type: "text", text: { body: prompt } }, key, true);
 				reply = "Context cleared. The next message starts a fresh conversation.";
 				break;
+			}
 			case "/stop":
 			case "/abort": {
+				this.inboundEpochs.set(key, (this.inboundEpochs.get(key) || 0) + 1);
 				session.revision = (session.revision || 0) + 1;
 				if (!session.conversationId) {
 					reply = "Stop requested. Any pending download or dispatch will be cancelled before model delivery.";
 					break;
 				}
-				const result = await this.host.abortRun?.(session.runId || session.conversationId);
-				if (!result?.ok) throw new Error(result?.error || "Host abort unavailable");
+				const target = session.runId || session.conversationId;
 				this.forgetRuns(session);
 				delete session.runId;
+				const result = await this.host.abortRun?.(target);
+				if (!result?.ok) throw new Error(result?.error || "Host abort unavailable");
 				reply = "Stop requested.";
 				break;
 			}
 			case "/model":
-				if (arg && arg !== "default" && !/^[^\s/]+\/\S+$/.test(arg))
+				if (arg && value !== "default" && !/^[^\s/]+\/\S+$/.test(arg))
 					throw new Error("Use /model provider/id or /model default");
-				if (arg) session.model = arg === "default" ? "" : arg;
+				if (arg) {
+					session.model = value === "default" ? this.getConfig().model || "" : arg;
+					await this.resetSession(session, key);
+				}
 				reply = `Model: ${session.model || "host default"}${arg ? " (requested for next message; host validates on dispatch)" : ""}`;
 				break;
 			case "/thinking":
-				if (arg && !["off", "minimal", "low", "medium", "high", "xhigh", "default"].includes(arg))
+				if (arg && !["off", "minimal", "low", "medium", "high", "xhigh", "default"].includes(value))
 					throw new Error("Unsupported thinking level");
-				if (arg) session.thinkingLevel = arg === "default" ? "" : arg;
+				if (arg) {
+					session.thinkingLevel = value === "default" ? this.getConfig().thinkingLevel || "" : value;
+					await this.resetSession(session, key);
+				}
 				reply = `Thinking: ${session.thinkingLevel || "host default"}${arg ? " (requested for next message)" : ""}`;
 				break;
 			case "/cwd":
 			case "/workspace":
 				if (arg) {
-					if (!isAbsolute(arg)) throw new Error("Workspace must be an absolute path");
-					const stat = await this.host.fs?.statPath(arg);
+					const cwd = value === "default" ? this.getConfig().workspace || this.host.cwd || "" : arg;
+					if (!isAbsolute(cwd)) throw new Error("Workspace must be an absolute path");
+					const stat = await this.host.fs?.statPath(cwd);
+					if (revision !== (session.revision || 0)) return;
 					if (stat?.type !== "dir") throw new Error("Workspace must be an existing authorized directory");
-					if ([...this.pendingRuns.values()].some((r) => r.session === session))
-						throw new Error("Stop the current task before switching workspace");
-					session.cwd = arg;
-					delete session.conversationId;
-					delete session.runId;
-					session.accountId = this.accountId(randomUUID());
+					session.cwd = cwd;
+					await this.resetSession(session, key);
 				}
 				reply = `Workspace: ${session.cwd || "host default"}`;
 				break;
@@ -269,6 +311,20 @@ export class WhatsappBotBridge {
 				reply = `Unknown command: ${raw}. Use /help.`;
 		}
 		await this.reply(sender, reply);
+	}
+	async resetSession(session, key) {
+		this.inboundEpochs.set(key, (this.inboundEpochs.get(key) || 0) + 1);
+		session.revision = (session.revision || 0) + 1;
+		const target = session.runId || session.conversationId;
+		const active = [...this.pendingRuns.values()].some((r) => r.session === session);
+		this.forgetRuns(session);
+		delete session.conversationId;
+		delete session.runId;
+		session.accountId = this.accountId(randomUUID());
+		if (target && active) {
+			const result = await this.host.abortRun?.(target);
+			if (!result?.ok) throw new Error(result?.error || "Host abort unavailable");
+		}
 	}
 	forgetRuns(session) {
 		for (const [id, run] of this.pendingRuns)
@@ -288,6 +344,7 @@ export class WhatsappBotBridge {
 			}
 			return;
 		}
+		if (run.revision !== (run.session.revision || 0)) return;
 		if (ev.conversationId) run.session.conversationId = ev.conversationId;
 		if (ev.type === "message" && ev.message?.role === "assistant") {
 			const content = ev.message.content;
@@ -308,7 +365,10 @@ export class WhatsappBotBridge {
 			const text = failure
 				? `Task ${ev.stopReason || "failed"}. ${this.stripMarkers(run.accumulatedText)}`
 				: this.stripMarkers(run.accumulatedText) || "Task completed (no text output).";
-			for (const chunk of chunkMarkdownText(text, 3800)) await this.reply(run.sender, chunk);
+			for (const chunk of chunkMarkdownText(text, 3800)) {
+				if (run.revision !== (run.session.revision || 0)) break;
+				await this.reply(run.sender, chunk);
+			}
 		}
 	}
 }

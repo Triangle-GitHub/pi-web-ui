@@ -5,6 +5,12 @@
 	color-scheme: dark;
 	--on-send-blue-hover: #ffffff;
 	--on-stop-red-hover: #ffffff;
+	--switch-knob: #ffffff;
+	--switch-bg-off: #424754;
+	--switch-border-off: #8791a3;
+	--switch-bg-on: #8b5cf6;
+	--switch-border-on: #8b5cf6;
+	--switch-knob-on: #ffffff;
 }
 
 /* ---- ambient gradient（镜像 .fp-markdown 预览底色，覆盖整个窗口）---- */

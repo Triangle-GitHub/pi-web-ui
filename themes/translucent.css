@@ -25,6 +25,12 @@
  * --msgs-bg 覆盖回 transparent 可恢复「消息区全透、壁纸从卡片间隙露出」。
  */
 :root {
+	--switch-bg-off: #424754;
+	--switch-border-off: #8791a3;
+	--switch-knob: #ffffff;
+	--switch-bg-on: #8b5cf6;
+	--switch-border-on: #8b5cf6;
+	--switch-knob-on: #ffffff;
 	color-scheme: dark;
 	--bg: #0d0e12;
 	--bg-elev: #14161c;

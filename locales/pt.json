@@ -2403,7 +2403,6 @@
 		"worktreeSwitch": "Switch worktree",
 		"worktreeManage": "Manage worktree",
 		"worktreeBadgeLinked": "Worktree",
-		"worktreeBadgeDirtyCount": "{count} com alterações",
 		"worktreeActionSwitchMain": "Voltar para a principal",
 		"worktreeActionRemove": "Remover worktree",
 		"worktreeActionRemoveConfirm": "Tem certeza de que quer remover o worktree \"{path}\"? Alterações não confirmadas podem ser perdidas.",

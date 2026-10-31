@@ -32,6 +32,112 @@ function setup(chat?: any) {
 afterEach(() => vi.unstubAllGlobals());
 
 describe("WhatsApp behavior contract", () => {
+	it.each(["/new", "/clear", "/reset", "/RESET", "／ＮＥＷ", "／ＣＬＥＡＲ", "／ＲＥＳＥＴ"])(
+		"%s executes its prompt literally on a new account",
+		async (command) => {
+			let n = 0;
+			const { bridge, host, event } = setup(vi.fn(async () => ({ conversationId: `conv${++n}`, runId: `run${n}` })));
+			await bridge.start();
+			await bridge.onInboundMessage(inbound("old"));
+			await bridge.onInboundMessage(inbound(`${command} /stop keep ＡＢＣ\n  /reset literal  `));
+			expect(host.chat).toHaveBeenCalledTimes(2);
+			expect(host.chat.mock.calls[1][0].text).toBe("/stop keep ＡＢＣ\n  /reset literal  ");
+			expect(host.chat.mock.calls[1][0]).not.toHaveProperty("conversationId");
+			expect(host.chat.mock.calls[1][0].accountId).not.toBe(host.chat.mock.calls[0][0].accountId);
+			await event({ type: "run_end", runId: "run2" });
+			await bridge.onInboundMessage(inbound("continue"));
+			expect(host.chat.mock.calls[2][0]).toMatchObject({
+				accountId: host.chat.mock.calls[1][0].accountId,
+				conversationId: "conv2",
+			});
+			await bridge.stop();
+		},
+	);
+	it.each([
+		"／ＭＯＤＥＬ p/model",
+		"/MODEL DEFAULT",
+		"／ＴＨＩＮＫＩＮＧ HIGH",
+		"/THINKING DEFAULT",
+		"／ＷＯＲＫＳＰＡＣＥ /next",
+		"/WORKSPACE DEFAULT",
+	])("%s rotates the active context and preserves preferences", async (command) => {
+		const { bridge, host } = setup();
+		await bridge.start();
+		await bridge.onInboundMessage(inbound("old"));
+		await bridge.onInboundMessage(inbound(command));
+		expect(host.abortRun).toHaveBeenCalledWith("run");
+		await bridge.onInboundMessage(inbound("fresh"));
+		const next = host.chat.mock.calls[1][0];
+		expect(next.accountId).not.toBe(host.chat.mock.calls[0][0].accountId);
+		expect(next).not.toHaveProperty("conversationId");
+		if (command.includes("p/model")) expect(next.model).toBe("p/model");
+		if (command.includes("HIGH")) expect(next.thinkingLevel).toBe("high");
+		if (command.includes("/next")) expect(next.cwd).toBe("/next");
+		await bridge.stop();
+	});
+	it.each(["/stop", "/abort", "／ＳＴＯＰ", "／ＡＢＯＲＴ"])(
+		"%s releases stale run records after abort failure",
+		async (command) => {
+			for (const throws of [false, true]) {
+				let count = 0;
+				const { bridge, host, event, sent } = setup(
+					vi.fn(async () => ({ conversationId: "actual", runId: `run${++count}` })),
+				);
+				await bridge.start();
+				await bridge.onInboundMessage(inbound("old"));
+				if (throws) host.abortRun.mockRejectedValueOnce(new Error("abort threw"));
+				else host.abortRun.mockResolvedValueOnce({ ok: false, error: "abort denied" } as any);
+				await bridge.onInboundMessage(inbound(command));
+				expect(host.abortRun).toHaveBeenCalledWith("run1");
+				expect(sent.at(-1).text.body).toContain(throws ? "abort threw" : "abort denied");
+				expect(bridge.pendingRuns.size).toBe(0);
+				await event({ type: "run_end", runId: "run1", conversationId: "stale" });
+				await bridge.onInboundMessage(inbound("continue"));
+				expect(host.chat).toHaveBeenCalledTimes(2);
+				expect(host.chat.mock.calls[1][0].conversationId).toBe("actual");
+				expect([...bridge.pendingRuns.keys()]).toEqual(["run2"]);
+				await bridge.stop();
+			}
+		},
+	);
+	it("allows fresh delivery while the previous task abort is pending", async () => {
+		let finishAbort: any;
+		const { bridge, host } = setup();
+		await bridge.start();
+		await bridge.onInboundMessage(inbound("old"));
+		host.abortRun.mockImplementationOnce(
+			() =>
+				new Promise((resolve) => {
+					finishAbort = resolve;
+				}),
+		);
+		const reset = bridge.onInboundMessage(inbound("/reset"));
+		await vi.waitFor(() => expect(finishAbort).toBeTypeOf("function"));
+		await bridge.onInboundMessage(inbound("fresh"));
+		expect(host.chat).toHaveBeenCalledTimes(2);
+		finishAbort({ ok: true });
+		await reset;
+		await bridge.stop();
+	});
+	it("ignores workspace validation completed after reset", async () => {
+		let resolveStat: any;
+		const { bridge, host } = setup();
+		host.fs.statPath.mockImplementationOnce(
+			() =>
+				new Promise((resolve) => {
+					resolveStat = resolve;
+				}),
+		);
+		await bridge.start();
+		const workspace = bridge.onInboundMessage(inbound("／ＷＯＲＫＳＰＡＣＥ /late"));
+		await vi.waitFor(() => expect(resolveStat).toBeTypeOf("function"));
+		await bridge.onInboundMessage(inbound("/reset"));
+		resolveStat({ type: "dir" });
+		await workspace;
+		await bridge.onInboundMessage(inbound("fresh"));
+		expect(host.chat.mock.calls[0][0].cwd).toBe("/workspace");
+		await bridge.stop();
+	});
 	it("handles every command without model dispatch and passes settings on the next request", async () => {
 		const { bridge, host, sent } = setup();
 		await bridge.start();
@@ -56,6 +162,114 @@ describe("WhatsApp behavior contract", () => {
 		);
 		await bridge.onInboundMessage(inbound("/abort"));
 		expect(host.abortRun).toHaveBeenCalledWith("run");
+		await bridge.stop();
+	});
+	it.each(["/cwd", "/workspace", "/CWD", "/WORKSPACE"])(
+		"%s rotates the account and clears the completed conversation binding",
+		async (command) => {
+			const { bridge, host, event } = setup();
+			await bridge.start();
+			await bridge.onInboundMessage(inbound("old"));
+			await event({ type: "run_end", runId: "run" });
+			const oldAccount = host.chat.mock.calls[0][0].accountId;
+			await bridge.onInboundMessage(inbound(`${command} /next`));
+			await bridge.onInboundMessage(inbound("fresh"));
+			expect(host.chat.mock.calls[1][0]).toMatchObject({ cwd: "/next" });
+			expect(host.chat.mock.calls[1][0].accountId).not.toBe(oldAccount);
+			expect(host.chat.mock.calls[1][0]).not.toHaveProperty("conversationId");
+			await bridge.stop();
+		},
+	);
+	it.each(["/new", "/clear", "/NEW", "/CLEAR"])(
+		"%s rotates identity and drops old bindings and replies",
+		async (command) => {
+			let sequence = 0;
+			const { bridge, host, sent, event } = setup(
+				vi.fn(async () => ({ conversationId: `conv${++sequence}`, runId: `run${sequence}` })),
+			);
+			await bridge.start();
+			await bridge.onInboundMessage(inbound("old"));
+			const oldAccount = host.chat.mock.calls[0][0].accountId;
+			await bridge.onInboundMessage(inbound(command));
+			expect(host.abortRun).toHaveBeenCalledWith("run1");
+			const replies = sent.length;
+			await event({ type: "run_end", runId: "run1", conversationId: "old-binding" });
+			expect(sent).toHaveLength(replies);
+			await bridge.onInboundMessage(inbound("fresh"));
+			expect(host.chat.mock.calls[1][0].accountId).not.toBe(oldAccount);
+			expect(host.chat.mock.calls[1][0]).not.toHaveProperty("conversationId");
+			await bridge.stop();
+		},
+	);
+	it.each(["/new", "/clear"])(
+		"%s bypasses pending dispatch and invalidates queued work and late receipts",
+		async (command) => {
+			let resolveOld: any;
+			const oldReceipt = new Promise((resolve) => {
+				resolveOld = resolve;
+			});
+			const chat = vi
+				.fn()
+				.mockImplementationOnce(() => oldReceipt)
+				.mockResolvedValue({ conversationId: "fresh", runId: "fresh-run" });
+			const { bridge, host } = setup(chat);
+			await bridge.start();
+			const old = bridge.onInboundMessage(inbound("old"));
+			await vi.waitFor(() => expect(chat).toHaveBeenCalledTimes(1));
+			const queued = bridge.onInboundMessage(inbound("queued before reset"));
+			await bridge.onInboundMessage(inbound(command));
+			await bridge.onInboundMessage(inbound("fresh"));
+			expect(chat).toHaveBeenCalledTimes(2);
+			expect(chat.mock.calls[1][0].accountId).not.toBe(chat.mock.calls[0][0].accountId);
+			expect(chat.mock.calls[1][0]).not.toHaveProperty("conversationId");
+			resolveOld({ conversationId: "old", runId: "old-run" });
+			await Promise.all([old, queued]);
+			expect(host.abortRun).toHaveBeenCalledWith("old-run");
+			expect(chat).toHaveBeenCalledTimes(2);
+			expect(bridge.sessions.get(sessionKey(inbound("fresh"))).conversationId).toBe("fresh");
+			await bridge.stop();
+		},
+	);
+	it.each(["/new", "/clear"])("%s detaches an old run even when abort fails", async (command) => {
+		const { bridge, host, sent, event } = setup();
+		await bridge.start();
+		await bridge.onInboundMessage(inbound("old"));
+		const oldAccount = host.chat.mock.calls[0][0].accountId;
+		host.abortRun.mockResolvedValueOnce({ ok: false, error: "abort denied" } as any);
+		await bridge.onInboundMessage(inbound(command));
+		expect(sent.at(-1).text.body).toContain("abort denied");
+		await event({ type: "run_end", runId: "run", conversationId: "old" });
+		await bridge.onInboundMessage(inbound("fresh"));
+		expect(host.chat.mock.calls[1][0].accountId).not.toBe(oldAccount);
+		expect(host.chat.mock.calls[1][0]).not.toHaveProperty("conversationId");
+		await bridge.stop();
+	});
+	it.each(["/new", "/clear"])("%s cancels old media preparation before host delivery", async (command) => {
+		let resolveMedia: any;
+		const { bridge, host } = setup();
+		const fetchMock = vi.mocked(fetch);
+		fetchMock.mockImplementation(async (url: any, options: any) => {
+			if (String(url).includes("/media-id"))
+				return new Promise((resolve) => {
+					resolveMedia = resolve;
+				});
+			if (String(url) === "https://media.test/image")
+				return {
+					ok: true,
+					headers: new Headers({ "content-type": "image/png" }),
+					arrayBuffer: async () => new Uint8Array([137, 80, 78, 71]).buffer,
+				} as any;
+			return { ok: true, json: async () => ({ messages: [{ id: "out" }] }) } as any;
+		});
+		await bridge.start();
+		const media = bridge.onInboundMessage({ from: "123", type: "image", image: { id: "media-id" } });
+		await vi.waitFor(() => expect(resolveMedia).toBeTypeOf("function"));
+		await bridge.onInboundMessage(inbound(command));
+		await bridge.onInboundMessage(inbound("fresh"));
+		resolveMedia({ ok: true, json: async () => ({ url: "https://media.test/image", mime_type: "image/png" }) });
+		await media;
+		expect(host.chat).toHaveBeenCalledTimes(1);
+		expect(host.chat.mock.calls[0][0].text).toBe("fresh");
 		await bridge.stop();
 	});
 	it("buffers early events and uses actual runId through takeover and id changes", async () => {

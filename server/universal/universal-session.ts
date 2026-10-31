@@ -2344,6 +2344,10 @@ export class UniversalSession implements DispatchSession {
 		/* no-op */
 	}
 
+	refreshSettings(): void {
+		this.pushSettings();
+	}
+
 	pushSettings(): void {
 		const s = this.stateStore?.getSettings(this.clientId);
 		const settings: UiSettingsState = {

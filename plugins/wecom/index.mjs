@@ -94,7 +94,7 @@ export class WecomBotBridge {
 		this.userConversations = new Map();
 		this.userWorkspaces = new Map();
 		this.preferences = new Map();
-		this.dispatching = new Set();
+		this.dispatching = new Map();
 		this.epochs = new Map();
 		this.instanceId = randomUUID();
 
@@ -178,7 +178,7 @@ export class WecomBotBridge {
 		this.status.messagesReceived++;
 		this.status.lastMessageAt = Date.now();
 		const type = String(event.msgType || event.MsgType || "text").toLowerCase();
-		let text = String(event.content || event.Content || event.text || "").trim();
+		let text = String(event.content || event.Content || event.text || "").trimStart();
 		if (type !== "text") {
 			const recognition = event.recognition || event.Recognition;
 			if (type === "voice" && typeof recognition === "string" && recognition.trim())
@@ -195,16 +195,23 @@ export class WecomBotBridge {
 				return;
 			}
 		}
-		if (!text) return;
-		if (text.startsWith("/") && (await this.handleSlashCommand(text, { userId: scope, webhookKey, cfg }))) return;
+		if (!text.trim()) return;
+		if (/^[/／]/.test(text)) {
+			const command = await this.handleSlashCommand(text, { userId: scope, webhookKey, cfg });
+			if (!command || command === true) return;
+			if ((this.epochs.get(scope) || 0) !== command.epoch) return;
+			// A reset's prompt is literal input, including slash-prefixed text.
+			text = command.prompt;
+		}
 		if (this.dispatching.has(scope) || [...this.pendingRuns.values()].some((r) => r.scope === scope)) {
 			await this.reply(webhookKey, "当前会话正在处理，请等待或使用 /stop。");
 			return;
 		}
+		const epoch = this.epochs.get(scope) || 0;
 		const prefs = this.preferences.get(scope) || {};
 		const req = {
 			text: text.slice(0, 8000),
-			accountId: peerAccountId(this.instanceId + ":" + scope + ":" + (this.epochs.get(scope) || 0)),
+			accountId: peerAccountId(this.instanceId + ":" + scope + ":" + epoch),
 		};
 		const conversationId = this.userConversations.get(scope);
 		if (conversationId) req.conversationId = conversationId;
@@ -212,14 +219,19 @@ export class WecomBotBridge {
 		if (cwd) req.cwd = cwd;
 		if (prefs.model ?? cfg.model) req.model = prefs.model ?? cfg.model;
 		if (prefs.thinkingLevel ?? cfg.thinkingLevel) req.thinkingLevel = prefs.thinkingLevel ?? cfg.thinkingLevel;
-		this.dispatching.add(scope);
+		this.dispatching.set(scope, epoch);
 		try {
 			const result = await this.host.chat(req);
+			if ((this.epochs.get(scope) || 0) !== epoch) {
+				this.abortDetachedRun(result);
+				return;
+			}
 			if (!result?.conversationId) throw new Error("宿主未返回真实会话 ID");
 			this.userConversations.set(scope, result.conversationId);
 			const key = result.runId || result.conversationId;
 			this.pendingRuns.set(key, {
 				scope,
+				epoch,
 				webhookKey,
 				conversationId: result.conversationId,
 				runId: result.runId,
@@ -229,32 +241,46 @@ export class WecomBotBridge {
 			this.earlyRuns.delete(key);
 			for (const ev of early) await this.handleRunEvent(ev);
 		} catch (err) {
+			if ((this.epochs.get(scope) || 0) !== epoch) return;
 			this.log("warn", "WeCom dispatch failed: " + err.message);
 			await this.reply(webhookKey, "投递失败：" + err.message);
 		} finally {
-			this.dispatching.delete(scope);
+			if (this.dispatching.get(scope) === epoch) this.dispatching.delete(scope);
 			if (!this.dispatching.size) this.earlyRuns.clear();
 		}
 	}
 
+	abortDetachedRun(run) {
+		if (!run || !this.host.abortRun) return;
+		Promise.resolve()
+			.then(() => this.host.abortRun(run.runId || run.conversationId))
+			.catch((err) => this.log("warn", "WeCom detached run abort failed: " + err.message));
+	}
+
+	resetScope(scope) {
+		// Rotate the host account too: omitting conversationId alone can reuse
+		// the host account's old conversation and pending queue.
+		this.epochs.set(scope, (this.epochs.get(scope) || 0) + 1);
+		this.userConversations.delete(scope);
+		this.dispatching.delete(scope);
+		for (const [key, run] of this.pendingRuns) {
+			if (run.scope !== scope) continue;
+			this.pendingRuns.delete(key);
+			this.earlyRuns.delete(key);
+			this.abortDetachedRun(run);
+		}
+	}
+
 	async handleSlashCommand(cmdText, { userId, webhookKey, cfg }) {
-		const [raw, ...args] = cmdText.trim().split(/\s+/);
-		const cmd = raw.toLowerCase(),
-			arg = args.join(" ");
+		const [, raw, prompt = ""] = cmdText.trimStart().match(/^(\S+)(?:\s+([\s\S]*))?$/);
+		const cmd = raw.normalize("NFKC").toLowerCase();
+		const arg = prompt.trim();
 		const send = (text) => this.reply(webhookKey || cfg.webhookKey, text);
 		const busy = this.dispatching.has(userId) || [...this.pendingRuns.values()].some((r) => r.scope === userId);
-		if (
-			busy &&
-			["/new", "/clear", "/cwd", "/workspace", "/model", "/thinking"].includes(cmd) &&
-			(arg || ["/new", "/clear"].includes(cmd))
-		) {
-			await send("当前会话正在处理，请先 /stop 并等待结束后再切换配置。");
-			return true;
-		}
 		switch (cmd) {
 			case "/help":
 				await send(
-					"/help 帮助\n/new 或 /clear 新会话\n/status 状态\n/stop 或 /abort 停止\n/model [provider/id|default]\n/thinking [off|minimal|low|medium|high|xhigh|default]\n/cwd [路径]（/workspace 别名）\n媒体：仅支持平台已有的语音识别文本；当前接入无法下载或解码图片、文件、视频及原始语音。",
+					"/help 帮助\n/new、/clear 或 /reset [prompt] 新会话并执行可选提示词\n/status 状态\n/stop 或 /abort 停止\n/model [provider/id|default]\n/thinking [off|minimal|low|medium|high|xhigh|default]\n/cwd [路径]（/workspace 别名）\n媒体：仅支持平台已有的语音识别文本；当前接入无法下载或解码图片、文件、视频及原始语音。",
 				);
 				return true;
 			case "/abort":
@@ -275,24 +301,26 @@ export class WecomBotBridge {
 			case "/model":
 			case "/thinking": {
 				const prefs = this.preferences.get(userId) || {};
+				const value = cmd === "/thinking" || arg.toLowerCase() === "default" ? arg.toLowerCase() : arg;
 				if (arg) {
-					if (cmd === "/thinking" && !["off", "minimal", "low", "medium", "high", "xhigh", "default"].includes(arg)) {
+					if (cmd === "/thinking" && !["off", "minimal", "low", "medium", "high", "xhigh", "default"].includes(value)) {
 						await send("无效思考强度：off/minimal/low/medium/high/xhigh/default");
 						return true;
 					}
-					if (cmd === "/model" && arg !== "default" && !/^[^\s/]+\/[^\s]+$/.test(arg)) {
+					if (cmd === "/model" && value !== "default" && !/^[^\s/]+\/[^\s]+$/.test(value)) {
 						await send("模型格式：/model provider/id（或 default）");
 						return true;
 					}
-					prefs[cmd === "/model" ? "model" : "thinkingLevel"] = arg === "default" ? undefined : arg;
+					prefs[cmd === "/model" ? "model" : "thinkingLevel"] = value === "default" ? undefined : value;
 					this.preferences.set(userId, prefs);
+					this.resetScope(userId);
 				}
 				await send(
 					"模型：" +
 						(prefs.model ?? cfg.model ?? "跟随全局") +
 						"\n思考强度：" +
 						(prefs.thinkingLevel ?? cfg.thinkingLevel ?? "跟随全局") +
-						"\n配置于下次投递生效，实际可用性由宿主校验。",
+						"\n设置后下次投递使用新上下文，实际可用性由宿主校验。",
 				);
 				return true;
 			}
@@ -304,15 +332,15 @@ export class WecomBotBridge {
 					);
 					return true;
 				}
-				this.userWorkspaces.set(userId, arg);
-				this.epochs.set(userId, (this.epochs.get(userId) || 0) + 1);
-				this.userConversations.delete(userId);
+				this.userWorkspaces.set(userId, arg.toLowerCase() === "default" ? "" : arg);
+				this.resetScope(userId);
 				await send("项目根目录已设置：" + arg + "\n下次投递由宿主验证路径并创建新会话。");
 				return true;
 			case "/clear":
 			case "/new":
-				this.epochs.set(userId, (this.epochs.get(userId) || 0) + 1);
-				this.userConversations.delete(userId);
+			case "/reset":
+				this.resetScope(userId);
+				if (prompt.trim()) return { prompt, epoch: this.epochs.get(userId) };
 				await send("已清空当前上下文，下次消息开启全新会话。");
 				return true;
 			case "/status":
@@ -346,6 +374,7 @@ export class WecomBotBridge {
 			return;
 		}
 		const owner = this.pendingRuns.get(convId);
+		if ((this.epochs.get(owner.scope) || 0) !== owner.epoch) return;
 		if (ev.conversationId) {
 			owner.conversationId = ev.conversationId;
 			this.userConversations.set(owner.scope, ev.conversationId);
@@ -399,6 +428,7 @@ export class WecomBotBridge {
 				try {
 					const url = `https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=${key}`;
 					for (const chunk of chunks) {
+						if ((this.epochs.get(run.scope) || 0) !== run.epoch) return;
 						const res = await fetch(url, {
 							method: "POST",
 							headers: { "content-type": "application/json; charset=utf-8" },

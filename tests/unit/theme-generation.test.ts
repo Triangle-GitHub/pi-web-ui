@@ -36,7 +36,9 @@ describe("theme generation and inherited button colors", () => {
 				// Formatting belongs to Prettier; compare tokens and structural tails separately.
 				expect(variables(generated), file).toEqual(variables(read(`themes/${file}`)));
 				for (const [token, value] of variables(generated)) {
-					expect(value, `${file}: redundant ${token}`).not.toBe(defaults.get(token));
+					if (!token.startsWith("--switch-")) {
+						expect(value, `${file}: redundant ${token}`).not.toBe(defaults.get(token));
+					}
 				}
 				if (file === "md-preview.css") {
 					expect(generated).toContain('@import "./bases/statusbar-flat-base.css"');

@@ -252,6 +252,7 @@ export class QqBotBridge {
 		this.log = log || ((level, msg) => console.log(`[qq-bot:${level}] ${msg}`));
 
 		this.running = false;
+		this.stopGeneration = 0;
 		this.ws = null;
 		this.heartbeatTimer = null;
 		this.lastSequence = null;
@@ -403,6 +404,7 @@ export class QqBotBridge {
 	}
 
 	async stop() {
+		this.stopGeneration++;
 		this.running = false;
 		this.status.enabled = false;
 		this.status.connected = false;
@@ -431,6 +433,8 @@ export class QqBotBridge {
 			if (run.timeoutTimer) clearTimeout(run.timeoutTimer);
 		}
 		this.pendingRuns.clear();
+		this.conversationBindings.clear();
+		this.webRunTexts.clear();
 		this.runIdIndex.clear();
 		this.earlyRuns.clear();
 		this.earlyRunEvents.clear();
@@ -642,7 +646,8 @@ export class QqBotBridge {
 		// Keep direct messages compatible; scope group/channel sessions to their actual destination.
 		const sessionPeer = this.sessionPeer(authorId, replyTarget);
 		// Commands must run before media downloads, especially cancellation.
-		if (cleanText.startsWith("/") || /^\d+\/.+/.test(cleanText) || /^\d+$/.test(cleanText)) {
+		const commandText = cleanText.replace(/[！-～]/g, (char) => String.fromCharCode(char.charCodeAt(0) - 0xfee0));
+		if (commandText.startsWith("/") || /^\d+\/.+/.test(commandText) || /^\d+(?:\s|$)/.test(commandText)) {
 			if (await this.handleSlashCommand(cleanText, { authorId: sessionPeer, replyTarget, cfg })) return;
 		}
 		// 图片/语音/视频/文件（QQ 走 attachments，带腾讯 CDN url，有时效）
@@ -761,7 +766,8 @@ export class QqBotBridge {
 			`qq_${String(authorId).slice(-8)}_${seq}`;
 		let bindCid = null;
 
-		if (cfg.bindActive === true) {
+		// An explicit reset owns its new context; never bind it back to the web context.
+		if (cfg.bindActive === true && seq === 0) {
 			try {
 				const active = this.host.getActiveConversation?.()?.conversationId;
 				if (typeof active === "string" && active.trim()) {
@@ -787,14 +793,18 @@ export class QqBotBridge {
 			}
 		}, timeoutSec * 1000);
 
-		this.pendingRuns.set(conversationId, {
+		const dispatchedRun = {
 			authorId,
 			replyTarget,
 			accumulatedText: "",
 			startedAt: Date.now(),
 			timeoutTimer,
 			noticed: false,
-		});
+		};
+		this.pendingRuns.set(conversationId, dispatchedRun);
+		// Both the epoch and object identity must survive reset, abort and bridge stop.
+		const ownsDispatch = () =>
+			(this.peerSessionSeq.get(authorId) || 0) === seq && this.pendingRuns.get(conversationId) === dispatchedRun;
 
 		this.conversationBindings.set(conversationId, {
 			authorId,
@@ -825,6 +835,7 @@ export class QqBotBridge {
 			this.lastInFlightStartedAt = startedAt;
 
 			const r = await this.host.chat(chatReq);
+			if (!ownsDispatch()) return;
 			this.inFlightConvs.delete(conversationId);
 			if (r?.conversationId) {
 				this.inFlightConvs.delete(r.conversationId);
@@ -865,6 +876,7 @@ export class QqBotBridge {
 			for (const event of early) await this.handleRunEvent(event);
 			if (!this.inFlightConvs.size) this.earlyRunEvents.clear();
 		} catch (err) {
+			if (!ownsDispatch()) return;
 			this.log("warn", `QQBot host.chat dispatch failed: ${err.message}`);
 			const run = this.pendingRuns.get(conversationId);
 			if (run?.timeoutTimer) clearTimeout(run.timeoutTimer);
@@ -946,8 +958,30 @@ export class QqBotBridge {
 		}
 	}
 
+	async resetAuthorSession(authorId, replyTarget, cfg) {
+		if ([...this.pendingRuns.values()].some((run) => run.authorId === authorId)) {
+			await this.handleSlashCommand("/abort", { authorId, replyTarget, cfg });
+			if ([...this.pendingRuns.values()].some((run) => run.authorId === authorId)) return false;
+		}
+		this.peerSessionSeq.set(authorId, (this.peerSessionSeq.get(authorId) || 0) + 1);
+		this.userActiveConvs.delete(authorId);
+		this.userActiveSeq.delete(authorId);
+		for (const [key, binding] of this.conversationBindings) {
+			if (binding.authorId !== authorId) continue;
+			this.conversationBindings.delete(key);
+			this.webRunTexts.delete(key);
+		}
+		return true;
+	}
+
 	async handleSlashCommand(cmdText, { authorId, replyTarget, cfg }) {
-		const match = /^\/?([^\s]*)(?:\s+([\s\S]*))?$/.exec(cmdText.trim());
+		// Normalize only the command token: paths and prompts must retain their exact text.
+		const normalized = cmdText
+			.trim()
+			.replace(/^\S+/, (token) =>
+				token.replace(/[！-～]/g, (char) => String.fromCharCode(char.charCodeAt(0) - 0xfee0)),
+			);
+		const match = /^\/?([^\s]*)(?:\s+([\s\S]*))?$/.exec(normalized);
 		if (!match) return false;
 
 		let rawCmd = match[1].toLowerCase();
@@ -1008,8 +1042,8 @@ export class QqBotBridge {
 					return true;
 				}
 				if (["default", "默认", "clear", "reset"].includes(args.toLowerCase())) {
+					if (!(await this.resetAuthorSession(authorId, replyTarget, cfg))) return true;
 					this.userWorkspaces.delete(authorId);
-					this.peerSessionSeq.set(authorId, (this.peerSessionSeq.get(authorId) || 0) + 1);
 					const cur = this.resolveWorkspace(authorId, cfg) || "(跟随宿主当前项目)";
 					await this.replyMessage(replyTarget, `📂 已恢复跟随全局根目录：${cur}\n✨ 已自动为您开启全新会话！`).catch(
 						() => {},
@@ -1021,25 +1055,18 @@ export class QqBotBridge {
 					await this.replyMessage(replyTarget, `⚠️ 切换失败：${chk.error}`).catch(() => {});
 					return true;
 				}
+				if (!(await this.resetAuthorSession(authorId, replyTarget, cfg))) return true;
 				this.userWorkspaces.set(authorId, chk.abs);
-				this.peerSessionSeq.set(authorId, (this.peerSessionSeq.get(authorId) || 0) + 1);
 				await this.replyMessage(
 					replyTarget,
 					`📂 已将项目根目录切换为：${chk.abs}\n✨ 已自动为您开启该目录下的全新会话！`,
 				).catch(() => {});
 				return true;
 			}
+			case "reset":
 			case "clear":
 			case "new": {
-				if ([...this.pendingRuns.values()].some((run) => run.authorId === authorId)) {
-					await this.handleSlashCommand("/abort", { authorId, replyTarget, cfg });
-					if ([...this.pendingRuns.values()].some((run) => run.authorId === authorId)) return true;
-				}
-				this.peerSessionSeq.set(authorId, (this.peerSessionSeq.get(authorId) || 0) + 1);
-				this.userActiveConvs.delete(authorId);
-				for (const [key, binding] of this.conversationBindings) {
-					if (binding.authorId === authorId) this.conversationBindings.delete(key);
-				}
+				if (!(await this.resetAuthorSession(authorId, replyTarget, cfg))) return true;
 				if (args) {
 					await this.replyMessage(replyTarget, "✨ 已为您开启全新会话，正在执行指令…").catch(() => {});
 					await this.driveAuthor(authorId, args, replyTarget);
@@ -1053,7 +1080,8 @@ export class QqBotBridge {
 				const currentWs = this.resolveWorkspace(authorId, cfg) || "(跟随宿主当前项目)";
 				const currentModel = this.resolveModel(authorId, cfg) || "(跟随全局默认)";
 				const currentThinking = this.resolveThinkingLevel(authorId, cfg) || "(跟随全局设置)";
-				const bindActive = cfg.bindActive === true ? "投递到网页活跃会话" : "独立无头会话";
+				const bindActive =
+					cfg.bindActive === true && !(this.peerSessionSeq.get(authorId) || 0) ? "投递到网页活跃会话" : "独立无头会话";
 				const planMode = this.resolvePlanMode(authorId, cfg) ? "已开启" : "未开启";
 				let pendingCount = 0;
 				for (const run of this.pendingRuns.values()) {
@@ -1090,15 +1118,15 @@ export class QqBotBridge {
 					return true;
 				}
 				if (["default", "默认", "clear", "reset"].includes(args.toLowerCase())) {
+					if (!(await this.resetAuthorSession(authorId, replyTarget, cfg))) return true;
 					this.userModels.delete(authorId);
-					this.peerSessionSeq.set(authorId, (this.peerSessionSeq.get(authorId) || 0) + 1);
 					await this.replyMessage(replyTarget, "🤖 已恢复跟随全局默认模型。\n✨ 已自动为您开启全新会话！").catch(
 						() => {},
 					);
 					return true;
 				}
+				if (!(await this.resetAuthorSession(authorId, replyTarget, cfg))) return true;
 				this.userModels.set(authorId, args);
-				this.peerSessionSeq.set(authorId, (this.peerSessionSeq.get(authorId) || 0) + 1);
 				await this.replyMessage(replyTarget, `🤖 已将模型切换为：${args}\n✨ 已自动为您开启该模型下的全新会话！`).catch(
 					() => {},
 				);
@@ -1134,8 +1162,8 @@ export class QqBotBridge {
 					return true;
 				}
 				if (["default", "默认", "clear", "reset"].includes(args.toLowerCase())) {
+					if (!(await this.resetAuthorSession(authorId, replyTarget, cfg))) return true;
 					this.userThinkingLevels.delete(authorId);
-					this.peerSessionSeq.set(authorId, (this.peerSessionSeq.get(authorId) || 0) + 1);
 					await this.replyMessage(replyTarget, "🧠 已恢复跟随全局思考强度设置。\n✨ 已自动为您开启全新会话！").catch(
 						() => {},
 					);
@@ -1149,8 +1177,8 @@ export class QqBotBridge {
 					).catch(() => {});
 					return true;
 				}
+				if (!(await this.resetAuthorSession(authorId, replyTarget, cfg))) return true;
 				this.userThinkingLevels.set(authorId, mapped);
-				this.peerSessionSeq.set(authorId, (this.peerSessionSeq.get(authorId) || 0) + 1);
 				await this.replyMessage(
 					replyTarget,
 					`🧠 已将思考强度设置为：${mapped}\n✨ 已自动为您开启该档位下的全新会话！`,
@@ -1191,6 +1219,8 @@ export class QqBotBridge {
 						if (!result?.ok) throw new Error(result?.error || "宿主未确认中止");
 						if (run.timeoutTimer) clearTimeout(run.timeoutTimer);
 						this.forgetRun(key, run.aliasId, run.canonicalId);
+						for (const id of [key, run.aliasId, run.canonicalId]) this.inFlightConvs.delete(id);
+						if (!this.inFlightConvs.size) this.earlyRunEvents.clear();
 						stopped++;
 					} catch (err) {
 						await this.replyMessage(replyTarget, `⚠️ 中止失败：${err.message}`).catch(() => {});
@@ -1237,6 +1267,15 @@ export class QqBotBridge {
 		for (const [rid, k] of this.runIdIndex) {
 			if (keySet.has(k)) this.runIdIndex.delete(rid);
 		}
+	}
+
+	createDeliveryGuard(authorId, conversationId, binding) {
+		const peerSeq = this.peerSessionSeq.get(authorId) || 0;
+		const generation = this.stopGeneration;
+		return () =>
+			this.stopGeneration === generation &&
+			(this.peerSessionSeq.get(authorId) || 0) === peerSeq &&
+			(!binding || this.conversationBindings.get(conversationId) === binding);
 	}
 
 	async handleRunEvent(ev) {
@@ -1364,12 +1403,15 @@ export class QqBotBridge {
 				this.recordRecentChat(targetConvId, run.authorId, { assistantText: finalText });
 
 				const chunks = chunkMarkdownText(finalText, 3000);
+				const canDeliver = this.createDeliveryGuard(run.authorId);
 
 				try {
 					for (let i = 0; i < chunks.length; i++) {
+						if (!canDeliver()) return;
 						const seq = (run.replyTarget.__nextSeq = (run.replyTarget.__nextSeq || 0) + 1);
 						await this.replyMessage(run.replyTarget, chunks[i], seq);
 					}
+					if (!canDeliver()) return;
 					this.status.messagesReplied++;
 					this.status.lastReplyAt = Date.now();
 					this.host?.broadcast?.({ type: "bot_status", status: this.getStatus() });
@@ -1393,11 +1435,14 @@ export class QqBotBridge {
 				if (cfg.bindActive !== false && binding.replyTarget) {
 					const syncText = `💻 [来自电脑网页端同步]\n${cleanText}`;
 					const chunks = chunkMarkdownText(syncText, 3000);
+					const canDeliver = this.createDeliveryGuard(binding.authorId, convId, binding);
 					try {
 						for (let i = 0; i < chunks.length; i++) {
+							if (!canDeliver()) return;
 							const seq = (binding.replyTarget.__nextSeq = (binding.replyTarget.__nextSeq || 0) + 1);
 							await this.replyMessage(binding.replyTarget, chunks[i], seq);
 						}
+						if (!canDeliver()) return;
 						this.status.messagesReplied++;
 						this.status.lastReplyAt = Date.now();
 						this.host?.broadcast?.({ type: "bot_status", status: this.getStatus() });

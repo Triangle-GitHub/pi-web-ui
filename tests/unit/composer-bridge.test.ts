@@ -6,6 +6,9 @@ import {
 	registerAttachmentSink,
 	registerDraftSink,
 	registerFocusSink,
+	registerSessionSwitchSink,
+	notifySessionSwitch,
+	getLastSessionSwitchTime,
 	resetComposerSinks,
 } from "../../web/src/composer-bridge.js";
 import type { DraftAttachment } from "../../web/src/composer-draft.js";
@@ -101,6 +104,33 @@ describe("composer-bridge", () => {
 		resetComposerSinks();
 		expect(isComposerReady()).toBe(false);
 		expect(composeToComposer({ text: "y" })).toBe(false);
+	});
+
+	it("session navigation runs even when the group view has no composer mounted", () => {
+		let activeGroupId: string | null = "room-a";
+		let view = "devices";
+		registerSessionSwitchSink(() => {
+			activeGroupId = null;
+			view = "chat";
+		});
+		expect(focusComposer()).toBe(false);
+		notifySessionSwitch();
+		expect(activeGroupId).toBeNull();
+		expect(view).toBe("chat");
+		expect(getLastSessionSwitchTime()).toBeGreaterThan(0);
+
+		registerSessionSwitchSink(null);
+		activeGroupId = "room-b";
+		notifySessionSwitch();
+		expect(activeGroupId).toBe("room-b");
+	});
+
+	it("session navigation runs before composer focus", () => {
+		const order: string[] = [];
+		registerSessionSwitchSink(() => order.push("navigate"));
+		registerFocusSink(() => order.push("focus"));
+		notifySessionSwitch();
+		expect(order).toEqual(["navigate", "focus"]);
 	});
 
 	it("focusComposer: 没注册 sink 回 false，注册后触发并回 true，注销后回 false", () => {

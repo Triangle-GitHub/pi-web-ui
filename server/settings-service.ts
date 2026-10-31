@@ -224,7 +224,7 @@ export class SettingsService {
 			this.host.applyToolGating();
 		if (before.goalModeEnabled !== false && after.goalModeEnabled === false) this.host.onGoalModeDisabled?.();
 		if (changed("showForkedParentSessions")) this.host.onSessionsFilterChanged?.();
-		this.push(false);
+		this.push();
 		this.host.flushSnapshot();
 		if (
 			changed(
@@ -336,13 +336,13 @@ export class SettingsService {
 		}
 		return false;
 	}
-	push(maintain = true): void {
+	/** Discover disk resources and prune stale preferences only on explicit refresh. Never reloads. */
+	refreshResources(): void {
 		if (this.disposed || this.host.isDisposed()) return;
+		this.resetResourceCatalog();
 		this.settings = this.host.stateStore.getSettings(this.host.clientId);
 		this.presets = this.host.stateStore.getPresets(this.host.clientId);
 		const disabledSkills = new Set(this.settings.disabledSkills);
-		const reviewDisabledSkills = new Set(this.settings.reviewDisabledSkills);
-		const disabledExts = new Set(this.settings.disabledExtensions);
 		let loadedSkillNames: Set<string> | null = null;
 		let loadedExtNames: Set<string> | null = null;
 		try {
@@ -359,17 +359,14 @@ export class SettingsService {
 			});
 			const diskSkills = this.host.filterDiskSkills?.(discoveredSkills) ?? discoveredSkills;
 
-			// Prune entries that no longer exist on disk AND aren't disabled
-			// (e.g. a skill/extension file was deleted). Disabled entries are
-			// kept so they can be re-enabled even when filtered out of the loader.
-			const keepSkills = new Set<string>([
-				...loadedSkills.map((s) => s.name),
-				...diskSkills.map((s) => s.name),
-				...this.settings.disabledSkills,
-			]);
+			// Rebuild membership from loaded and discovered resources so deleted
+			// disabled entries cannot keep themselves alive through the cache.
+			const keepSkills = new Set<string>([...loadedSkills.map((s) => s.name), ...diskSkills.map((s) => s.name)]);
 			const keepExts = new Set<string>([
 				...loadedExts.map((e) => extensionKey(e)),
-				...this.settings.disabledExtensions.filter((id) => !isInternalExtension({ path: id })),
+				...this.settings.disabledExtensions.filter(
+					(id) => !isInternalExtension({ path: id }) && this.extensionStillOnDisk(id),
+				),
 			]);
 			// eslint-disable-next-line unicorn/no-useless-spread -- snapshot: handlers may unsubscribe mid-emit
 			for (const name of [...this.knownSkills.keys()]) {
@@ -407,12 +404,6 @@ export class SettingsService {
 					enabled: true,
 				});
 			}
-
-			// 若发现磁盘新增了 loader 尚未加载的技能，触发会话后台异步 reload 以刷新提示词和技能工具
-			const hasUnloadedDiskSkills = diskSkills.some((ds) => !loadedSkillNames!.has(ds.name));
-			if (maintain && hasUnloadedDiskSkills && !this.host.isStreaming()) {
-				void this.applyRuntime();
-			}
 		} catch {
 			// Session not ready yet — keep whatever we already know.
 		}
@@ -420,7 +411,7 @@ export class SettingsService {
 		// disabledSkills / reviewDisabledSkills 持久化记录中移除——否则每次
 		// 推送都会把已删除的 skill 以灰条形式永恒地补回面板（“关闭过的
 		// skill 被一直记录”）。session 未就绪时保守跳过。
-		if (maintain && loadedSkillNames !== null) {
+		if (loadedSkillNames !== null) {
 			const stale = [
 				...new Set([
 					...this.settings.disabledSkills,
@@ -447,7 +438,7 @@ export class SettingsService {
 		// disabledExtensions 同理：已卸载（loader 里没有、磁盘/配置里也没有）的扩展
 		// 从禁用记录里剔除并持久化 —— 否则卸载过的扩展以“已禁用”灰条永生（issue #192）。
 		// loadedExtNames 非 null 即 session 就绪；取不到（catch 分支）时保守跳过。
-		if (maintain && loadedExtNames !== null) {
+		if (loadedExtNames !== null) {
 			const staleExts = this.settings.disabledExtensions.filter(
 				(id) => isInternalExtension({ path: id }) || (!loadedExtNames.has(id) && !this.extensionStillOnDisk(id)),
 			);
@@ -476,6 +467,50 @@ export class SettingsService {
 					enabled: false,
 				});
 			}
+		}
+		this.push();
+	}
+
+	private catalogCwd: string | undefined;
+
+	private resetResourceCatalog(): void {
+		const cwd = this.host.cwd();
+		if (cwd === this.catalogCwd) return;
+		this.catalogCwd = cwd;
+		this.knownSkills.clear();
+		this.knownExtensions.clear();
+	}
+
+	/** Publish persisted preferences and the current in-memory resource catalog. No discovery, writes or reloads. */
+	push(): void {
+		if (this.disposed || this.host.isDisposed()) return;
+		this.resetResourceCatalog();
+		this.settings = this.host.stateStore.getSettings(this.host.clientId);
+		this.presets = this.host.stateStore.getPresets(this.host.clientId);
+		const disabledSkills = new Set(this.settings.disabledSkills);
+		const reviewDisabledSkills = new Set(this.settings.reviewDisabledSkills);
+		const disabledExts = new Set(this.settings.disabledExtensions);
+		try {
+			const loader = this.host.getSession().resourceLoader;
+			for (const skill of loader.getSkills().skills) {
+				this.knownSkills.set(skill.name, { name: skill.name, description: skill.description, enabled: true });
+			}
+			for (const extension of loader.getExtensions().extensions) {
+				if (isInternalExtension(extension)) continue;
+				const id = extensionKey(extension);
+				const path = extension.sourceInfo?.path ?? extension.path;
+				this.knownExtensions.set(id, {
+					id,
+					name:
+						extension.sourceInfo?.origin === "package" && extension.sourceInfo.source
+							? extension.sourceInfo.source
+							: basename(path),
+					path,
+					enabled: true,
+				});
+			}
+		} catch {
+			// Session initialization may still be in progress.
 		}
 		const skills = [...this.knownSkills.values()]
 			.map((s) => ({ ...s, enabled: !disabledSkills.has(s.name) }))
@@ -1361,7 +1396,7 @@ export class SettingsService {
 		try {
 			await this.host.reloadSession();
 			if (this.disposed || this.host.isDisposed()) return;
-			this.push(false);
+			this.refreshResources();
 			this.host.flushSnapshot();
 			this.host.emit({ type: "notice", level: "info", text: "设置已应用", textEn: "Settings applied" });
 		} catch (err) {

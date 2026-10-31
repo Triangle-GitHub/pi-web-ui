@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { ClientSession } from "../../server/agent-service.js";
+import { conversationIdentity } from "../../server/conversation-identity.js";
 
 function setup() {
 	let resolve!: () => void;
@@ -24,7 +25,7 @@ function setup() {
 		},
 	};
 	const parent: any = { id: "parent", suspendedSubagents: new Set([child]) };
-	const host: any = {
+	const host: any = Object.assign(Object.create(ClientSession.prototype), {
 		convs: new Map([
 			[child.id, child],
 			[parent.id, parent],
@@ -38,7 +39,7 @@ function setup() {
 		emit: vi.fn(),
 		emitConversations: vi.fn(),
 		scheduleSubagentCompletionNotice: vi.fn(),
-	};
+	});
 	const steer = () => (ClientSession.prototype as any).steerSubagentRound.call(host, child, "revise");
 	return { child, parent, host, steer, resolve, reject };
 }
@@ -47,7 +48,7 @@ describe("idle subagent revision rounds (#784)", () => {
 	it("returns before execution finishes, resets consumed/notified state and removes old pending notices", async () => {
 		const { child, parent, host, steer, resolve } = setup();
 		const timer = setTimeout(() => {}, 60_000);
-		host.pendingSubagentNotices.set("parent", { timer, subagents: new Set([child]) });
+		host.pendingSubagentNotices.set(conversationIdentity(parent), { timer, subagents: new Set([child]) });
 		await steer();
 		expect(child.promptInFlight).toBe(true);
 		expect(child.subagentDoneNotified).toBe(false);
@@ -99,7 +100,7 @@ describe("idle subagent revision rounds (#784)", () => {
 	});
 
 	it("discards an old completion while worktree finalization is awaiting", async () => {
-		const { child, host, steer, resolve } = setup();
+		const { child, parent, host, steer, resolve } = setup();
 		child.subagentDoneNotified = false;
 		child.subagentConsumedByParent = false;
 		let finalize!: () => void;
@@ -107,8 +108,11 @@ describe("idle subagent revision rounds (#784)", () => {
 			new Promise<void>((res) => {
 				finalize = res;
 			});
-		host.pendingSubagentNotices.set("parent", { timer: null, subagents: new Set([child]) });
-		const delivery = (ClientSession.prototype as any).flushSubagentCompletionNotice.call(host, "parent");
+		host.pendingSubagentNotices.set(conversationIdentity(parent), { timer: null, subagents: new Set([child]) });
+		const delivery = (ClientSession.prototype as any).flushSubagentCompletionNotice.call(
+			host,
+			conversationIdentity(parent),
+		);
 		await steer();
 		finalize();
 		await delivery;
@@ -132,7 +136,7 @@ describe("idle subagent revision rounds (#784)", () => {
 			await steer();
 			resolve();
 			await child.kickoff;
-			await (ClientSession.prototype as any).flushSubagentCompletionNotice.call(host, "parent");
+			await (ClientSession.prototype as any).flushSubagentCompletionNotice.call(host, conversationIdentity(parent));
 			expect(child.subagentDoneNotified).toBe(true);
 			expect(parent.session.sendUserMessage).toHaveBeenCalledTimes(round);
 			child.subagentConsumedByParent = true;
@@ -144,6 +148,21 @@ describe("idle subagent revision rounds (#784)", () => {
 		expect(parent.session.sendUserMessage).toHaveBeenCalledTimes(2);
 	});
 
+	it("settles a revision on the child's new holder despite a reused source display id", async () => {
+		const { child, host, steer, resolve } = setup();
+		const target: any = { convs: new Map(), scheduleSubagentCompletionNotice: vi.fn(), emitConversations: vi.fn() };
+		host.allSubagentSessions = () => [target];
+		await steer();
+		host.convs.delete(child.id);
+		child.id = "c3";
+		target.convs.set(child.id, child);
+		host.convs.set("c3", { id: "c3" });
+		resolve();
+		await child.kickoff;
+		expect(target.scheduleSubagentCompletionNotice).toHaveBeenCalledWith(child);
+		expect(target.emitConversations).toHaveBeenCalledOnce();
+		expect(host.scheduleSubagentCompletionNotice).not.toHaveBeenCalled();
+	});
 	it("does not let an old execution clear state owned by a newer round", async () => {
 		const { child, host, steer, resolve } = setup();
 		await steer();

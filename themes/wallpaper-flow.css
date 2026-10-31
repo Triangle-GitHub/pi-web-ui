@@ -70,8 +70,12 @@
 	--send-blue: #f8fafc;
 	--on-send-blue: #1a1a1a;
 	--send-blue-hover: #ffffff;
+	--switch-bg-off: #424754;
+	--switch-border-off: #8791a3;
 	--switch-knob: #ffffff;
-	--switch-bg-on: #4ade80;
+	--switch-bg-on: #ffffff;
+	--switch-border-on: #ffffff;
+	--switch-knob-on: #1a1a1a;
 }
 @import "./bases/flow-base.css";
 

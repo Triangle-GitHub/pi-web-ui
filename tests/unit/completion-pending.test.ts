@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { ClientSession } from "../../server/agent-service.js";
+import { conversationIdentity } from "../../server/conversation-identity.js";
 
 function host() {
 	const client: any = Object.create(ClientSession.prototype);
@@ -28,10 +29,10 @@ describe("completion notification lifecycle", () => {
 		conv.promptInFlight = true;
 		expect(client.completionPending(conv)).toBe(true);
 		conv.promptInFlight = false;
-		other.pendingSubagentNotices.set(conv.id, {});
+		other.pendingSubagentNotices.set(conversationIdentity(conv), {});
 		expect(client.completionPending(conv)).toBe(true);
 		other.pendingSubagentNotices.clear();
-		other.deliveringSubagentNotices.set(conv.id, 1);
+		other.deliveringSubagentNotices.set(conversationIdentity(conv), 1);
 		expect(client.completionPending(conv)).toBe(true);
 		other.deliveringSubagentNotices.clear();
 		expect(client.completionPending(conv)).toBe(false);
@@ -68,8 +69,10 @@ describe("completion notification lifecycle", () => {
 		const source = host();
 		const target = host();
 		target.activeId = "parent";
-		source.findSubagentOwner = () => ({ session: target, convId: "parent" });
-		source.refreshCompletionState("parent");
+		const parent = { id: "parent" };
+		target.convs.set(parent.id, parent);
+		source.allSubagentSessions = () => [target];
+		source.refreshCompletionState(conversationIdentity(parent));
 		expect(target.emitConversations).toHaveBeenCalledOnce();
 		expect(target.flushSnapshot).toHaveBeenCalledOnce();
 		expect(source.emitConversations).not.toHaveBeenCalled();

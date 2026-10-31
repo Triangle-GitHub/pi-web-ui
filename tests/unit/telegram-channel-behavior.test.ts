@@ -129,7 +129,11 @@ describe("Telegram channel behavior", () => {
 		await bridge.onInboundMessage(msg());
 		host.abortRun.mockResolvedValueOnce({ ok: false, error: "abort denied" } as any);
 		await bridge.onInboundMessage(msg("/stop"));
-		await bridge.handleRunEvent({ runId: "real-run", type: "run_end", error: "agent failed" });
+		await bridge.handleRunEvent({ runId: "real-run", type: "run_end", error: "stale failure" });
+		expect(sent().some((p) => p.text.includes("stale failure"))).toBe(false);
+		host.chat.mockResolvedValueOnce({ conversationId: "fresh", runId: "fresh-run" });
+		await bridge.onInboundMessage(msg());
+		await bridge.handleRunEvent({ runId: "fresh-run", type: "run_end", error: "agent failed" });
 		expect(
 			sent()
 				.map((p) => p.text)

@@ -68,6 +68,21 @@ const emitTheme = (name, overrides = {}, tail = "", nameEn = "", group = "", bas
 	for (const [k, v] of Object.entries(overrides)) if (k !== "color-scheme") vars.set(k, v);
 	// 2) 文字令牌可读性下限（与 themes/ 手写主题的压暗规则同一算法）
 	applyTextFloors(vars);
+	// Every palette owns switch colors; components only consume these tokens.
+	const light = (overrides["color-scheme"] ?? "light") === "light";
+	const switchOn = vars.get("--accent");
+	const switchRgb = parseHexColor(switchOn);
+	const switchKnob =
+		contrastRatio([255, 255, 255], switchRgb) >= contrastRatio([26, 26, 26], switchRgb) ? "#ffffff" : "#1a1a1a";
+	const switchColors = {
+		"--switch-bg-off": light ? "#d0d7de" : "#424754",
+		"--switch-border-off": light ? "#687282" : "#8791a3",
+		"--switch-knob": light ? "#343b48" : "#ffffff",
+		"--switch-bg-on": switchOn,
+		"--switch-border-on": switchOn,
+		"--switch-knob-on": switchKnob,
+	};
+	for (const [key, value] of Object.entries(switchColors)) vars.set(key, value);
 	const lines = ["/* theme-name: " + name + " */"];
 	if (nameEn) lines.push("/* theme-name-en: " + nameEn + " */");
 	if (group) lines.push("/* theme-group: " + group + " */");
@@ -83,7 +98,7 @@ const emitTheme = (name, overrides = {}, tail = "", nameEn = "", group = "", bas
 			k === "--accent-contrast"
 				? (overrides["--accent-contrast"] ?? accentContrast(vars))
 				: (semanticForeground(k, vars, overrides) ?? v);
-		if (val !== defaults.get(k)) lines.push(`\t${k}: ${val};`);
+		if (k.startsWith("--switch-") || val !== defaults.get(k)) lines.push(`\t${k}: ${val};`);
 	}
 	lines.push("}", "");
 	return lines.join("\n") + tail;

@@ -1676,6 +1676,7 @@ export interface DispatchSession {
 		execModel?: string;
 	}): Promise<void>;
 	pushSettings(): void;
+	refreshSettings(): void;
 	setSettings(partial: {
 		promptMode?: "append" | "replace";
 		customSystemPrompt?: string;

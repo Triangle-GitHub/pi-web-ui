@@ -20,6 +20,12 @@
  * 配壁纸用最佳；不配壁纸时界面直接透出 --bg 纯色（= 默认暗色，无差别）。
  */
 :root {
+	--switch-bg-off: #424754;
+	--switch-border-off: #8791a3;
+	--switch-knob: #ffffff;
+	--switch-bg-on: #8b5cf6;
+	--switch-border-on: #8b5cf6;
+	--switch-knob-on: #ffffff;
 	color-scheme: dark;
 	--bg: #0d0e12;
 	--bg-elev: #14161c;

@@ -390,6 +390,47 @@ describe("subagents tools", () => {
 		expect(result.content[0].text).toContain("400");
 	});
 
+	it.each(["get_result", "dismiss"])(
+		"%s keeps the resolved execution identity across asynchronous worktree finalization",
+		async (action) => {
+			const host = makeHostSpies();
+			const original = {
+				convId: "c2",
+				executionId: "exec-original",
+				type: "general",
+				title: "original",
+				prompt: "",
+				state: "done",
+				streaming: false,
+				messageCount: 1,
+				output: "original output",
+			};
+			const replacement = { ...original, executionId: "exec-replacement", output: "replacement output" };
+			let replaced = false;
+			(host.getSubagent as ReturnType<typeof vi.fn>).mockImplementation((id: string) =>
+				id === "exec-original" ? original : id === "c2" ? (replaced ? replacement : original) : undefined,
+			);
+			host.finalizeSubagentWorktree = vi.fn(async () => {
+				replaced = true;
+			});
+			host.dismissSubagent = vi.fn(async () => ({ ok: true }));
+			const [tool] = makeSubagentTools(host, () => "en");
+			const result = await tool.execute!(
+				"operation",
+				{ action, runId: "c2" } as never,
+				undefined,
+				undefined,
+				{} as never,
+			);
+			expect(host.finalizeSubagentWorktree).toHaveBeenCalledWith("exec-original");
+			if (action === "dismiss") expect(host.dismissSubagent).toHaveBeenCalledWith("exec-original", expect.any(Object));
+			else {
+				expect(JSON.stringify(result)).toContain("original output");
+				expect(JSON.stringify(result)).not.toContain("replacement output");
+				expect(host.markSubagentsConsumed).toHaveBeenCalledWith(["exec-original"]);
+			}
+		},
+	);
 	it("subagent action=wait_all 等到全部终态后汇总结果（含错误标记）", async () => {
 		const host = makeHostSpies();
 		const sa1 = {
@@ -469,6 +510,109 @@ describe("subagents tools", () => {
 		expect(result.content[0].text).toContain("别人");
 	});
 
+	it("wait_all uses stable ancestry after parent rename and never waits for a reused display id", async () => {
+		const host = makeHostSpies();
+		const snapshots = [
+			{
+				convId: "c8",
+				executionId: "exec-parent",
+				type: "general",
+				title: "self",
+				prompt: "",
+				state: "running",
+				streaming: true,
+				messageCount: 1,
+				output: "",
+			},
+			{
+				convId: "worker",
+				executionId: "exec-child",
+				parentExecutionId: "exec-parent",
+				parentId: "c2",
+				type: "general",
+				title: "child",
+				prompt: "",
+				state: "done",
+				streaming: false,
+				messageCount: 1,
+				output: "child result",
+			},
+			{
+				convId: "unrelated",
+				executionId: "exec-other",
+				parentExecutionId: "exec-replacement",
+				parentId: "c8",
+				type: "general",
+				title: "unrelated",
+				prompt: "",
+				state: "running",
+				streaming: true,
+				messageCount: 1,
+				output: "",
+			},
+		];
+		(host.listSubagents as ReturnType<typeof vi.fn>).mockReturnValue(snapshots);
+		(host.getSubagent as ReturnType<typeof vi.fn>).mockImplementation((id: string) =>
+			snapshots.find((s) => s.executionId === id || s.convId === id),
+		);
+		host.resolveConversationId = (id) => snapshots.find((s) => s.executionId === id || s.convId === id)?.convId;
+		const [tool] = makeSubagentTools(
+			host,
+			() => "en",
+			() => "exec-parent",
+		);
+		const result = await tool.execute!(
+			"wait",
+			{ action: "wait_all", timeoutSeconds: 1 } as never,
+			undefined,
+			undefined,
+			{} as never,
+		);
+		expect(JSON.stringify(result)).toContain("child result");
+		expect(JSON.stringify(result)).not.toContain("timed out");
+		expect(host.markSubagentsConsumed).toHaveBeenCalledWith(["exec-child"]);
+	});
+	it("finished_all does not exclude a moved child sharing its parent's display id", async () => {
+		const host = makeHostSpies();
+		const parent = {
+			convId: "c2",
+			executionId: "exec-parent",
+			type: "general",
+			title: "parent",
+			prompt: "",
+			state: "running",
+			streaming: true,
+			messageCount: 1,
+			output: "",
+		};
+		const child = {
+			...parent,
+			executionId: "exec-child",
+			parentExecutionId: "exec-parent",
+			state: "done",
+			streaming: false,
+			title: "child",
+		};
+		(host.listSubagents as ReturnType<typeof vi.fn>).mockReturnValue([parent, child]);
+		(host.getSubagent as ReturnType<typeof vi.fn>).mockImplementation((id: string) =>
+			id === "exec-child" ? child : id === "exec-parent" || id === "c2" ? parent : undefined,
+		);
+		host.getActiveConversationId = () => "c2";
+		host.dismissSubagent = vi.fn(async () => ({ ok: true }));
+		const [tool] = makeSubagentTools(
+			host,
+			() => "en",
+			() => "exec-parent",
+		);
+		await tool.execute!(
+			"dismiss",
+			{ action: "dismiss", scope: "finished_all" } as never,
+			undefined,
+			undefined,
+			{} as never,
+		);
+		expect(host.dismissSubagent).toHaveBeenCalledWith("exec-child", expect.any(Object));
+	});
 	it("subagent action=wait_all 排除自身后为空时直接返回（不等超时）", async () => {
 		const host = makeHostSpies();
 		(host.listSubagents as ReturnType<typeof vi.fn>).mockReturnValue([

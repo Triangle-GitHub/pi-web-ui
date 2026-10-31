@@ -2403,7 +2403,6 @@
 		"worktreeSwitch": "Switch worktree",
 		"worktreeManage": "Manage worktree",
 		"worktreeBadgeLinked": "Worktree",
-		"worktreeBadgeDirtyCount": "{count} değişiklik",
 		"worktreeActionSwitchMain": "Ana Depoya Dön",
 		"worktreeActionRemove": "Worktree'yi Kaldır",
 		"worktreeActionRemoveConfirm": "Worktree «{path}» kaldırılsın mı? Gönderilmemiş değişiklikler kaybolabilir.",

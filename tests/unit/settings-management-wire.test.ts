@@ -4,6 +4,16 @@ import type { DispatchSession } from "../../server/index.js";
 import type { ClientMessage } from "../../server/protocol.js";
 
 describe("management settings wire", () => {
+	it("routes explicit panel requests to resource refresh rather than ordinary state push", () => {
+		const refreshSettings = vi.fn();
+		const pushSettings = vi.fn();
+		expect(
+			handleSettingsMessage({ type: "get_settings" }, { refreshSettings, pushSettings } as unknown as DispatchSession),
+		).toBe(true);
+		expect(refreshSettings).toHaveBeenCalledTimes(1);
+		expect(pushSettings).not.toHaveBeenCalled();
+	});
+
 	it("forwards skill catalog and code mode preferences without losing explicit false or zero", () => {
 		const setSettings = vi.fn();
 		const patch = {

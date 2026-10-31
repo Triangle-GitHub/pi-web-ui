@@ -14,7 +14,6 @@ import {
 	parseFrame,
 	RELAY_LIMITS,
 	safePath,
-	sendChunks,
 	sendFrame,
 } from "./relay.js";
 

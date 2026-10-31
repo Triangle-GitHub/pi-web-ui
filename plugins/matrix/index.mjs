@@ -262,9 +262,10 @@ export class MatrixBotBridge {
 		}
 	}
 
-	async feedback(roomId, text, threadId = "") {
+	async feedback(roomId, text, threadId = "", isCurrent = () => true) {
 		try {
-			await this.sendRoomMessage(roomId, text, threadId);
+			if (!isCurrent()) return;
+			await this.sendRoomMessage(roomId, text, threadId, isCurrent);
 		} catch (err) {
 			this.status.lastError = err.message;
 			this.log("warn", `Matrix feedback delivery failed: ${err.message}`);
@@ -288,9 +289,11 @@ export class MatrixBotBridge {
 				throw new Error("E2EE rooms cannot be decrypted or encrypted by this plugin. Use an unencrypted room.");
 			let text = extractMatrixText(event.content, this.botUserId);
 			const content = event.content || {};
-			if (text.startsWith("/") && !mediaTypes[content.msgtype]) {
-				await this.handleSlashCommand(text, { roomId, sender, cfg, key, threadId });
-				return;
+			if (/^[/／]/.test(text) && !mediaTypes[content.msgtype]) {
+				const command = await this.handleSlashCommand(text, { roomId, sender, cfg, key, threadId });
+				if (!command?.prompt) return;
+				if (command.epoch !== (this.epochs.get(key) || 0)) throw new Error("会话已切换，请重试重置提示词");
+				text = command.prompt;
 			}
 			const workspace = this.resolveWorkspace(key, cfg);
 			const epoch = this.epochs.get(key) || 0;
@@ -334,7 +337,16 @@ export class MatrixBotBridge {
 				throw new Error("当前会话仍在运行，请先 /stop 或等待完成。");
 			const conversationId = this.userConversations.get(key) || `mtx_${randomUUID()}`;
 			this.userConversations.set(key, conversationId);
-			const run = { key, roomId, threadId, sender, conversationId, requestedId: conversationId, accumulatedText: "" };
+			const run = {
+				key,
+				epoch,
+				roomId,
+				threadId,
+				sender,
+				conversationId,
+				requestedId: conversationId,
+				accumulatedText: "",
+			};
 			this.pendingRuns.set(conversationId, run);
 			this.dispatching++;
 			try {
@@ -351,10 +363,12 @@ export class MatrixBotBridge {
 						}).filter(([, v]) => v),
 					),
 				});
-				this.pendingRuns.delete(conversationId);
+				if (epoch !== (this.epochs.get(key) || 0)) return;
+				if (this.pendingRuns.get(conversationId) === run) this.pendingRuns.delete(conversationId);
 				run.conversationId = result?.conversationId || conversationId;
 				run.runId = result?.runId;
 				this.userConversations.set(key, run.conversationId);
+				if (run.ended) return;
 				this.pendingRuns.set(run.runId || run.conversationId, run);
 				const earlyKey = run.runId || run.conversationId;
 				const early = this.earlyRuns.get(earlyKey);
@@ -374,7 +388,8 @@ export class MatrixBotBridge {
 		}
 	}
 
-	async sendContent(roomId, content, threadId = "") {
+	async sendContent(roomId, content, threadId = "", isCurrent = () => true) {
+		if (!isCurrent()) return;
 		const cfg = this.getConfig();
 		if (!cfg.homeserverUrl || !cfg.accessToken) throw new Error("Matrix credentials are not configured");
 		if (this.encryptedRooms.has(roomId)) throw new Error("E2EE sending is unsupported; use an unencrypted room");
@@ -385,6 +400,7 @@ export class MatrixBotBridge {
 			"GET",
 			`/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/state`,
 		);
+		if (!isCurrent()) return;
 		if (Array.isArray(state) && state.some((ev) => ev.type === "m.room.encryption")) {
 			this.encryptedRooms.add(roomId);
 			throw new Error("E2EE sending is unsupported; use an unencrypted room");
@@ -399,20 +415,28 @@ export class MatrixBotBridge {
 		);
 	}
 
-	async sendRoomMessage(roomId, text, threadId = "") {
-		await this.sendContent(roomId, { msgtype: "m.text", body: text }, threadId);
+	async sendRoomMessage(roomId, text, threadId = "", isCurrent = () => true) {
+		await this.sendContent(roomId, { msgtype: "m.text", body: text }, threadId, isCurrent);
 	}
 
 	async handleSlashCommand(cmdText, { roomId, sender, cfg, key = scopeKey(roomId, sender), threadId = "" }) {
-		const [command] = cmdText.trim().split(/\s+/);
+		cmdText = cmdText.trim().replace(/^／/, "/");
+		const [command] = cmdText.split(/\s+/);
 		const cmd = command.toLowerCase();
-		const arg = cmdText.slice(command.length).trim();
+		let arg = cmdText.slice(command.length).trim();
+		if (cmd === "/thinking" || (cmd === "/model" && arg.toLowerCase() === "default")) arg = arg.toLowerCase();
+		const epoch = this.epochs.get(key) || 0;
+		const ensureIdle = () => {
+			if (epoch !== (this.epochs.get(key) || 0)) throw new Error("会话已切换，请重试命令");
+			if ([...this.pendingRuns.values()].some((r) => r.key === key))
+				throw new Error("请先 /stop 并等待任务结束，再切换会话设置。");
+		};
 		const reply = (text) => this.sendRoomMessage(roomId, text, threadId);
 		const prefs = this.preferences.get(key) || {};
 		switch (cmd) {
 			case "/help":
 				await reply(
-					"🔮 Matrix 机器人帮助\n/help /new /clear /status /stop (/abort)\n/model [provider/id|default] /thinking [off|minimal|low|medium|high|xhigh|default]\n/cwd [absolute path] (/workspace)\n图片作为附件传入支持视觉的模型；文件使用本地路径，语音和视频不自动转录或解码。E2EE 不支持。",
+					"🔮 Matrix 机器人帮助\n/help /new /clear (/reset) /status /stop (/abort)\n/model [provider/id|default] /thinking [off|minimal|low|medium|high|xhigh|default]\n/cwd [absolute path] (/workspace)\n图片作为附件传入支持视觉的模型；文件使用本地路径，语音和视频不自动转录或解码。E2EE 不支持。",
 				);
 				break;
 			case "/status":
@@ -438,12 +462,14 @@ export class MatrixBotBridge {
 				break;
 			}
 			case "/clear":
+			case "/reset":
 			case "/new":
 				if ([...this.pendingRuns.values()].some((r) => r.key === key))
 					throw new Error("请先 /stop 并等待任务结束，再开启新会话。");
 				this.downloads.get(key)?.abort(new Error("已开启新会话"));
 				this.epochs.set(key, (this.epochs.get(key) || 0) + 1);
 				this.userConversations.set(key, `mtx_${randomUUID()}`);
+				if (arg) return { prompt: arg, epoch: this.epochs.get(key) };
 				await reply("✨ 已开启全新会话（未删除历史）。");
 				break;
 			case "/model":
@@ -455,6 +481,7 @@ export class MatrixBotBridge {
 						if (!models?.some((m) => `${m.provider}/${m.id}` === arg))
 							throw new Error("未知或不可用模型；请使用 provider/id");
 					}
+					ensureIdle();
 					this.preferences.set(key, { ...prefs, model: arg === "default" ? "" : arg });
 					this.downloads.get(key)?.abort(new Error("模型已切换"));
 					this.epochs.set(key, (this.epochs.get(key) || 0) + 1);
@@ -466,7 +493,11 @@ export class MatrixBotBridge {
 				if (arg) {
 					if (!["off", "minimal", "low", "medium", "high", "xhigh", "default"].includes(arg))
 						throw new Error("无效思考强度");
+					ensureIdle();
 					this.preferences.set(key, { ...prefs, thinkingLevel: arg === "default" ? "" : arg });
+					this.downloads.get(key)?.abort(new Error("思考强度已切换"));
+					this.epochs.set(key, epoch + 1);
+					this.userConversations.delete(key);
 				}
 				await reply(`思考: ${this.preferences.get(key)?.thinkingLevel ?? cfg.thinkingLevel ?? "default"}`);
 				break;
@@ -476,7 +507,7 @@ export class MatrixBotBridge {
 					if (!isAbsolute(arg)) throw new Error("cwd 必须是绝对目录");
 					const stat = await this.host.fs.statPath(arg);
 					if (stat.type !== "dir") throw new Error("cwd 必须是目录");
-					if ([...this.pendingRuns.values()].some((r) => r.key === key)) throw new Error("请先停止当前任务");
+					ensureIdle();
 					this.downloads.get(key)?.abort(new Error("工作区已切换"));
 					this.epochs.set(key, (this.epochs.get(key) || 0) + 1);
 					this.userWorkspaces.set(key, arg);
@@ -522,6 +553,10 @@ export class MatrixBotBridge {
 			}
 			return;
 		}
+		if (run.epoch !== undefined && run.epoch !== (this.epochs.get(run.key) || 0)) {
+			for (const [pendingId, value] of this.pendingRuns) if (value === run) this.pendingRuns.delete(pendingId);
+			return;
+		}
 		if (ev.type === "message" && (ev.message?.role === "assistant" || ev.message?.author === "assistant")) {
 			const content = ev.message.content;
 			const text =
@@ -531,6 +566,7 @@ export class MatrixBotBridge {
 			run.accumulatedText += (run.accumulatedText ? "\n" : "") + text;
 		}
 		if (ev.type === "run_end") {
+			run.ended = true;
 			for (const [pendingId, value] of this.pendingRuns) if (value === run) this.pendingRuns.delete(pendingId);
 			const ending =
 				ev.stopReason === "aborted"
@@ -540,7 +576,11 @@ export class MatrixBotBridge {
 						: "";
 			const text =
 				[stripInternalMarkers(run.accumulatedText), ending].filter(Boolean).join("\n\n") || "任务结束（无文本输出）。";
-			for (const chunk of chunkMarkdownText(text, 3800)) await this.feedback(run.roomId, chunk, run.threadId);
+			const isCurrent = () => run.epoch === undefined || run.epoch === (this.epochs.get(run.key) || 0);
+			for (const chunk of chunkMarkdownText(text, 3800)) {
+				if (!isCurrent()) break;
+				await this.feedback(run.roomId, chunk, run.threadId, isCurrent);
+			}
 			this.status.messagesReplied++;
 			this.status.lastReplyAt = Date.now();
 		}

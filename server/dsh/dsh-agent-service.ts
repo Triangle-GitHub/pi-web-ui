@@ -4126,6 +4126,10 @@ export class DshClientSession {
 		return defs;
 	}
 
+	refreshSettings(): void {
+		this.pushSettings();
+	}
+
 	pushSettings(): void {
 		if (this.runtime?.alive && !this.cachedEffectiveSystemPrompt) {
 			void this.refreshPromptInfo().catch(() => {});

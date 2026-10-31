@@ -9,7 +9,7 @@
 
 import { createHash } from "node:crypto";
 import { chunkMarkdownText } from "./markdown-chunks.mjs";
-import { runtime, scopeKey, inboundResources, receiveAttachments } from "./runtime.mjs";
+import { runtime, scopeKey, inboundResources, receiveAttachments, parseCommand } from "./runtime.mjs";
 
 /** Strips internal system markers from assistant response text before delivery. */
 export function stripInternalMarkers(text) {
@@ -393,10 +393,15 @@ export class FeishuBotBridge {
 		const scope = scopeKey(openId, chatId, threadId);
 		const ctx = { messageId, openId, chatId, cfg, scope, replyInThread: Boolean(threadId) };
 		try {
-			const cleanText = stripMentions(extractInboundText(msg.content, msg.message_type));
+			const inboundText = extractInboundText(msg.content, msg.message_type);
+			// Strip only actual Feishu mention placeholders so command prompts keep literal @text.
+			const commandText = (msg.mentions || [])
+				.reduce((text, mention) => (mention.key ? text.replaceAll(mention.key, "") : text), inboundText)
+				.trim();
+			const cleanText = parseCommand(commandText).command.startsWith("/") ? commandText : stripMentions(inboundText);
 			this.status.messagesReceived++;
 			this.status.lastMessageAt = Date.now();
-			if (cleanText.startsWith("/")) {
+			if (parseCommand(cleanText).command.startsWith("/")) {
 				await this.handleSlashCommand(cleanText, ctx);
 				return;
 			}
@@ -415,7 +420,7 @@ export class FeishuBotBridge {
 			try {
 				await this.reactMessage(cfg, messageId, "THUMBSUP");
 			} catch {}
-			await this.dispatch(cleanText, attachments, ctx);
+			await this.dispatch(cleanText, attachments, { ...ctx, epoch, cancellation });
 		} catch (err) {
 			this.status.lastError = err.message;
 			this.log("warn", err.message);
@@ -432,9 +437,14 @@ export class FeishuBotBridge {
 
 		// Use structure-aware chunking to protect code fences and respect Feishu char limits
 		const chunks = chunkMarkdownText(finalText, 3800);
+		const isCurrent = () =>
+			(run.epoch === undefined || run.epoch === (this.epochs?.get(run.scope) || 0)) &&
+			(run.cancellation === undefined || run.cancellation === (this.cancellations?.get(run.scope) || 0)) &&
+			(run.generation === undefined || run.generation === (this.generation || 0));
 
 		try {
 			for (let i = 0; i < chunks.length; i++) {
+				if (!isCurrent()) return;
 				const chunk = chunks[i];
 				if (run.messageId) {
 					// Reply to initial message
@@ -458,6 +468,7 @@ export class FeishuBotBridge {
 				}
 			}
 
+			if (!isCurrent()) return;
 			this.status.messagesReplied++;
 			this.status.lastReplyAt = Date.now();
 
@@ -470,6 +481,7 @@ export class FeishuBotBridge {
 		} catch (err) {
 			this.status.lastError = err.message;
 			this.log("warn", `Feishu reply delivery failed: ${err.message}`);
+			if (!isCurrent()) return;
 			try {
 				await this.replyMessage(cfg, {
 					messageId: run.messageId,

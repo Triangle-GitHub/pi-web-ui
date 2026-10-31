@@ -69,6 +69,9 @@ export function isSubagentTerminal(r: SubagentSnapshot | undefined): boolean {
 export interface SubagentSnapshot {
 	/** conversation id（= 工具的 runId；左栏点击即 switch 到它）。 */
 	convId: string;
+	/** Stable runtime addresses, independent of holder-local display ids. */
+	executionId?: string;
+	parentExecutionId?: string;
 	/** 展示类型 / 角色（explore / implement / review …，默认 general）。 */
 	type: string;
 	/** 标题：prompt 首行（截断）。 */
@@ -156,6 +159,7 @@ export interface SubagentToolHost {
 	): Promise<string>;
 	/** 取单个子代理快照（按 convId）。 */
 	getSubagent(convId: string): SubagentSnapshot | undefined;
+	resolveConversationId?(id: string): string | undefined;
 	/** 列出现有的子代理与派生的受控对话（按创建顺序）。scope: all（默认）/ subagent / persistent。
 	 *  `forSelfId`（可选，B20）：调用者自身对话 id。传了才把「祖先链能走到它」的
 	 *  会话外子代理一并列出（过户把整族搬去别的 ClientSession 后，wait_all/list
@@ -292,6 +296,10 @@ export function makeSubagentTool(
 	// （按 runtime 身份查当前持有方），不能死用建时的旧 id —— 否则 wait_all
 	// 排除自省/展开后代时拿错锚点。传函数形式由建时点按 findConversationHome 解析。
 	const selfIdOf = (): string | undefined => (typeof selfConvId === "function" ? selfConvId() : selfConvId);
+	const executionOf = (snapshot: SubagentSnapshot): string => snapshot.executionId ?? snapshot.convId;
+	const executionOfId = (id: string): string => host.getSubagent(id)?.executionId ?? id;
+	const parentOf = (snapshot: SubagentSnapshot): string | undefined =>
+		snapshot.executionId ? snapshot.parentExecutionId : snapshot.parentId;
 	const getLang: () => ServerLang = lang ?? host.lang ?? (() => "en");
 	const text = (t: string, details: unknown = {}): { content: { type: "text"; text: string }[]; details: unknown } => ({
 		content: [{ type: "text", text: t }],
@@ -305,23 +313,24 @@ export function makeSubagentTool(
 
 	const expandDescendants = (roots: Set<string> | string[]): string[] => {
 		if (roots instanceof Set ? roots.size === 0 : (roots as string[]).length === 0) return [];
-		const rootSet = roots instanceof Set ? roots : new Set(roots);
+		const rootSet = new Set([...roots].map(executionOfId));
 		// B20：带 forSelfId（本会话的族）展开 —— 过户把整族搬到别的会话后，
 		// 只列本会话自己的列表会展不开后代，wait_all 会误报「没有需要等待的子代理」。
 		const all = host.listSubagents(undefined, selfIdOf());
 		const out: string[] = [];
 		for (const s of all) {
-			if (rootSet.has(s.convId)) continue;
-			let curParent = s.parentId;
+			if (rootSet.has(executionOf(s))) continue;
+			let curParent = parentOf(s);
 			const seen = new Set<string>();
 			while (curParent) {
-				if (rootSet.has(curParent)) {
-					out.push(s.convId);
+				if (rootSet.has(executionOfId(curParent))) {
+					out.push(executionOf(s));
 					break;
 				}
 				if (seen.has(curParent)) break;
 				seen.add(curParent);
-				curParent = host.getSubagent(curParent)?.parentId;
+				const parent = host.getSubagent(curParent);
+				curParent = parent ? parentOf(parent) : undefined;
 			}
 		}
 		return out;
@@ -330,13 +339,14 @@ export function makeSubagentTool(
 	const isDescendantOf = (targetId: string, rootId: string): boolean => {
 		const target = host.getSubagent(targetId);
 		if (!target) return false;
-		let curParent = target.parentId;
+		let curParent = parentOf(target);
 		const seen = new Set<string>([targetId]);
 		while (curParent) {
-			if (curParent === rootId) return true;
+			if (executionOfId(curParent) === executionOfId(rootId)) return true;
 			if (seen.has(curParent)) break;
 			seen.add(curParent);
-			curParent = host.getSubagent(curParent)?.parentId;
+			const parent = host.getSubagent(curParent);
+			curParent = parent ? parentOf(parent) : undefined;
 		}
 		return false;
 	};
@@ -345,11 +355,12 @@ export function makeSubagentTool(
 		let d = 0;
 		let cur = host.getSubagent(targetId);
 		const seen = new Set<string>([targetId]);
-		while (cur?.parentId) {
-			if (seen.has(cur.parentId)) break;
-			seen.add(cur.parentId);
+		while (cur && parentOf(cur)) {
+			const parentId = parentOf(cur)!;
+			if (seen.has(parentId)) break;
+			seen.add(parentId);
 			d++;
-			cur = host.getSubagent(cur.parentId);
+			cur = host.getSubagent(parentId);
 			if (!cur) break;
 		}
 		return d;
@@ -727,6 +738,8 @@ export function makeSubagentTool(
 							}),
 						);
 					}
+					const executionId = host.getSubagent(convId)?.executionId;
+					const addressLine = executionId ? `\nrunId: ${executionId}` : "";
 					const subagentTitleText = subagentTitle(p.prompt);
 					const templateLineZh = templateName ? `\n模板：${templateName}` : "";
 					const templateLineEn = templateName ? `\nTemplate: ${templateName}` : "";
@@ -744,9 +757,9 @@ export function makeSubagentTool(
 					return text(
 						pick(
 							getLang(),
-							`${kindLabelZh}已启动（运行列表可见）：${convId}\n类型：${subagentType} · 标题：${subagentTitleText}${templateLineZh}${modelLineZh}${thinkingLineZh}${notifyLineZh}${isolationLineZh}` +
+							`${kindLabelZh}已启动（运行列表可见）：${convId}\n类型：${subagentType} · 标题：${subagentTitleText}${templateLineZh}${modelLineZh}${thinkingLineZh}${notifyLineZh}${isolationLineZh}${addressLine}` +
 								`\n用 subagent(action="wait_all") 一次等全部完成（不用轮询），subagent(action="get_result") 取单个结果，subagent(action="list") 看运行态，subagent(action="steer") 改向，subagent(action="stop") 停止。`,
-							`${kindLabelEn} started (visible in the running list): ${convId}\nType: ${subagentType} · Title: ${subagentTitleText}${templateLineEn}${modelLineEn}${thinkingLineEn}${notifyLineEn}${isolationLineEn}` +
+							`${kindLabelEn} started (visible in the running list): ${convId}\nType: ${subagentType} · Title: ${subagentTitleText}${templateLineEn}${modelLineEn}${thinkingLineEn}${notifyLineEn}${isolationLineEn}${addressLine}` +
 								`\nUse subagent(action="wait_all") to wait for all at once (no polling), subagent(action="get_result") for a single result, subagent(action="list") for live status, subagent(action="steer") to redirect, subagent(action="stop") to stop.`,
 							"subagents.spawn.started",
 							{
@@ -773,6 +786,7 @@ export function makeSubagentTool(
 						),
 						{
 							convId,
+							executionId,
 							template: p.template,
 							model: p.model,
 							thinking: p.thinking,
@@ -827,10 +841,11 @@ export function makeSubagentTool(
 						);
 					}
 					// 终态结果被父对话取走，标记已消费，避免后续重复触发自动通知
-					host.markSubagentsConsumed?.([p.runId]);
+					const targetAddress = executionOf(r);
+					host.markSubagentsConsumed?.([targetAddress]);
 					if (host.finalizeSubagentWorktree) {
-						await host.finalizeSubagentWorktree(p.runId);
-						r = host.getSubagent(p.runId) ?? r;
+						await host.finalizeSubagentWorktree(targetAddress);
+						r = host.getSubagent(targetAddress) ?? r;
 					}
 					let worktreeDetail = "";
 					if (r.worktree) {
@@ -897,7 +912,7 @@ export function makeSubagentTool(
 							),
 						);
 					}
-					await host.steerSubagent(p.runId, p.message);
+					await host.steerSubagent(executionOfId(p.runId), p.message);
 					const steerId = shortId(p.runId);
 					return text(
 						pick(
@@ -932,7 +947,7 @@ export function makeSubagentTool(
 								: "subagent";
 						const modelTag = r.model ? ` · ${r.model}${r.thinkingLevel ? `:${r.thinkingLevel}` : ""}` : "";
 						return (
-							`- ${r.convId} · ${r.type}${modelTag} · ${subagentVerdict(r, tLang)} · ${r.title}` +
+							`- ${r.convId}${r.executionId ? ` (runId: ${r.executionId})` : ""} · ${r.type}${modelTag} · ${subagentVerdict(r, tLang)} · ${r.title}` +
 							(tLang === "zh" ? `（${tag} · msg: ${r.messageCount}）` : ` (${tag} · msg: ${r.messageCount})`)
 						);
 					});
@@ -976,15 +991,18 @@ export function makeSubagentTool(
 				}
 
 				case "wait_all": {
-					const selfId = selfIdOf();
+					const selfAddress = selfIdOf();
+					const selfId = selfAddress ? executionOfId(selfAddress) : undefined;
 					const ancestorIdsOf = (selfId: string): Set<string> => {
 						const out = new Set<string>();
 						const seen = new Set<string>([selfId]);
-						let cur = host.getSubagent(selfId)?.parentId;
+						const snapshot = host.getSubagent(selfAddress ?? selfId);
+						let cur = snapshot ? parentOf(snapshot) : undefined;
 						while (cur && !seen.has(cur)) {
 							seen.add(cur);
-							out.add(cur);
-							cur = host.getSubagent(cur)?.parentId;
+							out.add(executionOfId(cur));
+							const parent = host.getSubagent(cur);
+							cur = parent ? parentOf(parent) : undefined;
 						}
 						return out;
 					};
@@ -995,7 +1013,8 @@ export function makeSubagentTool(
 
 					if (explicit) {
 						const seedRoots: string[] = [];
-						for (const id of p.runIds!) {
+						for (const requestedId of p.runIds!) {
+							const id = executionOfId(requestedId);
 							if (selfId && id === selfId) continue;
 							if (selfAncestorIds.has(id)) continue;
 							wanted.add(id);
@@ -1014,7 +1033,7 @@ export function makeSubagentTool(
 						}
 					} else {
 						for (const r of host.listSubagents()) {
-							wanted.add(r.convId);
+							wanted.add(executionOf(r));
 						}
 					}
 					if (selfId) wanted.delete(selfId);
@@ -1271,7 +1290,7 @@ export function makeSubagentTool(
 					}
 
 					try {
-						await host.handoffSubagent(fromId, p.toRunId, p.payload);
+						await host.handoffSubagent(fromId, executionOf(target), p.payload);
 						const fromShort = shortId(fromId);
 						const toShort = shortId(p.toRunId);
 						return text(
@@ -1337,18 +1356,18 @@ export function makeSubagentTool(
 						let inScopeList = all;
 						if (selfId) {
 							const descIds = new Set(expandDescendants(new Set([selfId])));
-							inScopeList = all.filter((s) => descIds.has(s.convId));
+							inScopeList = all.filter((s) => descIds.has(executionOf(s)));
 						}
 						// 口径与 finishedSubagentCount 一致：isSubagent、非 streaming、非当前 active
 						candidateIds = inScopeList
 							.filter((s) => {
 								if (s.streaming || s.state === "running") return false;
-								if (s.convId === selfId) return false;
-								if (activeConvId && s.convId === activeConvId) return false;
+								if (selfId && executionOf(s) === executionOfId(selfId)) return false;
+								if (activeConvId && executionOf(s) === executionOfId(activeConvId)) return false;
 								if (s.persisted && !p.includePersisted) return false;
 								return true;
 							})
-							.map((s) => s.convId);
+							.map(executionOf);
 
 						if (candidateIds.length === 0) {
 							return text(
@@ -1362,7 +1381,7 @@ export function makeSubagentTool(
 							);
 						}
 					} else {
-						candidateIds = [...new Set(explicitIds)];
+						candidateIds = [...new Set(explicitIds.map(executionOfId))];
 					}
 
 					const isSingleExplicit = !isFinishedAll && explicitIds.length === 1;
@@ -1381,7 +1400,7 @@ export function makeSubagentTool(
 								),
 							);
 						}
-						if (selfId && targetId === selfId) {
+						if (selfId && executionOfId(targetId) === executionOfId(selfId)) {
 							return text(
 								pick(
 									getLang(),
@@ -1391,7 +1410,7 @@ export function makeSubagentTool(
 								),
 							);
 						}
-						if (activeConvId && targetId === activeConvId) {
+						if (activeConvId && executionOfId(targetId) === executionOfId(activeConvId)) {
 							const activeId = shortId(targetId);
 							return text(
 								pick(
@@ -1507,11 +1526,11 @@ export function makeSubagentTool(
 							skipped.push({ runId: targetId, reason: "not_found" });
 							continue;
 						}
-						if (selfId && targetId === selfId) {
+						if (selfId && executionOfId(targetId) === executionOfId(selfId)) {
 							skipped.push({ runId: targetId, reason: "self" });
 							continue;
 						}
-						if (activeConvId && targetId === activeConvId) {
+						if (activeConvId && executionOfId(targetId) === executionOfId(activeConvId)) {
 							skipped.push({ runId: targetId, reason: "active" });
 							continue;
 						}

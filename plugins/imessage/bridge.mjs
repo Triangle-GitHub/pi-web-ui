@@ -14,6 +14,14 @@ import {
 const execAsync = promisify(execFile);
 const THINKING = new Set(["off", "minimal", "low", "medium", "high", "xhigh"]);
 
+// Normalize only the command token: paths, model IDs and prompts remain literal.
+function parseCommand(text) {
+	const match = /^(\S+)(?:\s+([\s\S]*))?$/.exec(text);
+	if (!match) return null;
+	const cmd = match[1].normalize("NFKC").toLowerCase();
+	return cmd.startsWith("/") ? { cmd, arg: match[2] || "" } : null;
+}
+
 // Messages has no public inbound API. Read only the local database; never mutate it.
 export class IMessageBotBridge {
 	/** @param {{host?: any, getConfig?: any, log?: any, execFileImpl?: any, platform?: string}} options */
@@ -141,18 +149,31 @@ export class IMessageBotBridge {
 		const room = String(event.chatId || event.chatGuid || event.groupId || sender),
 			key = JSON.stringify([room, event.threadId || "", sender]);
 		const target = event.chatId || event.chatGuid || event.groupId ? { chatId: room } : sender;
-		if (/^\/(stop|abort)(?:\s|$)/i.test(String(event.text || event.content || "").trim())) {
-			return this.receive(event, { sender, key, target });
+		const text = cleanIMessageText(event.text || event.content || "");
+		const scope = {
+			sender,
+			key,
+			target,
+			generation: this.generation,
+			cancelEpoch: this.cancelEpochs.get(key) || 0,
+		};
+		// Control commands must not wait for a chat receipt or attachment preparation.
+		if (
+			["/stop", "/abort", "/new", "/clear", "/reset", "/cwd", "/workspace", "/model", "/thinking"].includes(
+				parseCommand(text)?.cmd,
+			)
+		) {
+			return this.receive(event, scope);
 		}
 		const previous = this.queues.get(key) || Promise.resolve();
-		const next = previous.catch(() => {}).then(() => this.receive(event, { sender, key, target }));
+		const next = previous.catch(() => {}).then(() => this.receive(event, scope));
 		this.queues.set(key, next);
 		return next.finally(() => {
 			if (this.queues.get(key) === next) this.queues.delete(key);
 		});
 	}
-	async receive(event, { sender, key, target }) {
-		const generation = this.generation;
+	async receive(event, { sender, key, target, generation, cancelEpoch, literalText }) {
+		if (generation !== this.generation || cancelEpoch !== (this.cancelEpochs.get(key) || 0)) return;
 		const id = event.id || event.guid;
 		if (id) {
 			if (this.seenMessageIds.has(id)) return;
@@ -165,14 +186,14 @@ export class IMessageBotBridge {
 			await this.reply(target, "访问受限：您不在白名单中。");
 			return;
 		}
-		const text = cleanIMessageText(event.text || event.content || "");
+		const text = literalText ?? cleanIMessageText(event.text || event.content || "");
 		if (String(event.text || event.content || "").startsWith(IMESSAGE_BOT_PREFIX)) return;
-		this.status.messagesReceived++;
-		if (text.startsWith("/")) {
-			await this.command(text, { key, target, cfg });
+		if (literalText === undefined) this.status.messagesReceived++;
+		if (literalText === undefined && parseCommand(text)) {
+			const rawText = String(event.text || event.content || "").trimStart();
+			await this.command(parseCommand(rawText) ? rawText : text, { sender, key, target, cfg, generation, cancelEpoch });
 			return;
 		}
-		const cancelEpoch = this.cancelEpochs.get(key) || 0;
 		const attachments = [];
 		let imageBytes = 0,
 			imageCount = 0;
@@ -228,7 +249,15 @@ export class IMessageBotBridge {
 			await this.reply(target, "当前会话仍在运行，请等待完成或使用 /stop。");
 			return;
 		}
-		const run = { key, target, text: "", conversationId: this.userConversations.get(key), runId: null };
+		const run = {
+			key,
+			target,
+			text: "",
+			conversationId: this.userConversations.get(key),
+			runId: null,
+			generation,
+			cancelEpoch,
+		};
 		this.dispatches++;
 		try {
 			const opts = this.settings.get(key) || {};
@@ -257,47 +286,53 @@ export class IMessageBotBridge {
 			this.earlyRuns.delete(token);
 			for (const ev of early) await this.handleRunEvent(ev);
 		} catch (error) {
-			if (generation !== this.generation) return;
+			if (generation !== this.generation || cancelEpoch !== (this.cancelEpochs.get(key) || 0)) return;
 			await this.reply(target, `任务启动失败：${error.message}`);
 		} finally {
 			this.dispatches--;
 			if (!this.dispatches) this.earlyRuns.clear();
 		}
 	}
-	async command(text, { key, target, cfg }) {
-		const [raw, ...parts] = text.split(/\s+/),
-			cmd = raw.toLowerCase(),
-			arg = parts.join(" ").trim();
-		const opts = this.settings.get(key) || {};
+	async command(text, { sender, key, target, cfg, generation, cancelEpoch }) {
+		const parsed = parseCommand(text);
+		const cmd = parsed.cmd;
+		const arg = ["/new", "/clear", "/reset"].includes(cmd) ? parsed.arg : parsed.arg.trim();
+		const opts = { ...(this.settings.get(key) || {}) };
+		const isDefault = arg.normalize("NFKC").toLowerCase() === "default";
+		const isReset = ["/new", "/clear", "/reset"].includes(cmd);
 		switch (cmd) {
 			case "/help":
 				await this.reply(
 					target,
-					"/help /new /clear /status /stop (/abort) /model [provider/id] /thinking [off|minimal|low|medium|high|xhigh] /cwd [目录]。图片支持 PNG/JPEG/GIF/WebP；语音、视频及文件不自动转录。",
+					"/help /new [prompt] /clear [prompt] /reset [prompt] /status /stop (/abort) /model [provider/id|default] /thinking [off|minimal|low|medium|high|xhigh|default] /cwd [目录|default] (/workspace)。设置模型、思考强度或目录会开启新上下文。图片支持 PNG/JPEG/GIF/WebP；语音、视频及文件不自动转录。",
 				);
 				return;
 			case "/model":
-				if (arg) {
-					if (!/^[^\s/]+\/\S+$/.test(arg)) {
-						await this.reply(target, "用法：/model provider/id");
-						return;
-					}
-					opts.model = arg;
-					this.settings.set(key, opts);
+				if (!arg) {
+					await this.reply(target, `模型：${opts.model || cfg.model || "跟随宿主"}`);
+					return;
 				}
-				await this.reply(target, `模型：${opts.model || cfg.model || "跟随宿主"}（下次运行生效）`);
-				return;
-			case "/thinking":
-				if (arg) {
-					if (!THINKING.has(arg)) {
-						await this.reply(target, "思考强度应为 off|minimal|low|medium|high|xhigh");
-						return;
-					}
-					opts.thinkingLevel = arg;
-					this.settings.set(key, opts);
+				if (!isDefault && !/^[^\s/]+\/\S+$/.test(arg)) {
+					await this.reply(target, "用法：/model provider/id|default");
+					return;
 				}
-				await this.reply(target, `思考强度：${opts.thinkingLevel || cfg.thinkingLevel || "跟随宿主"}（下次运行生效）`);
-				return;
+				if (isDefault) delete opts.model;
+				else opts.model = arg;
+				break;
+			case "/thinking": {
+				if (!arg) {
+					await this.reply(target, `思考强度：${opts.thinkingLevel || cfg.thinkingLevel || "跟随宿主"}`);
+					return;
+				}
+				const level = arg.normalize("NFKC").toLowerCase();
+				if (!isDefault && !THINKING.has(level)) {
+					await this.reply(target, "思考强度应为 off|minimal|low|medium|high|xhigh|default");
+					return;
+				}
+				if (isDefault) delete opts.thinkingLevel;
+				else opts.thinkingLevel = level;
+				break;
+			}
 			case "/stop":
 			case "/abort": {
 				this.cancelEpochs.set(key, (this.cancelEpochs.get(key) || 0) + 1);
@@ -316,15 +351,19 @@ export class IMessageBotBridge {
 					await this.reply(target, `工作目录：${this.resolveWorkspace(key, cfg)}`);
 					return;
 				}
-				try {
-					if (!(await stat(arg)).isDirectory()) throw new Error("不是目录");
-				} catch (error) {
-					await this.reply(target, `目录无效：${error.message}`);
-					return;
+				if (!isDefault) {
+					try {
+						if (!(await stat(arg)).isDirectory()) throw new Error("不是目录");
+					} catch (error) {
+						if (generation !== this.generation || cancelEpoch !== (this.cancelEpochs.get(key) || 0)) return;
+						await this.reply(target, `目录无效：${error.message}`);
+						return;
+					}
 				}
 				break;
 			case "/new":
 			case "/clear":
+			case "/reset":
 				break;
 			case "/status":
 				await this.reply(
@@ -336,14 +375,46 @@ export class IMessageBotBridge {
 				await this.reply(target, "未知命令。发送 /help 查看支持的命令。");
 				return;
 		}
-		if ([...this.pendingRuns.values()].some((r) => r.key === key)) {
+		if (generation !== this.generation || cancelEpoch !== (this.cancelEpochs.get(key) || 0)) return;
+		const runs = [...this.pendingRuns.entries()].filter(([, run]) => run.key === key);
+		if (runs.length && (cmd === "/cwd" || cmd === "/workspace")) {
 			await this.reply(target, "请先 /stop 并等待任务结束后再切换会话或目录。");
 			return;
 		}
-		if (arg && (cmd === "/cwd" || cmd === "/workspace")) this.userWorkspaces.set(key, resolve(arg));
+		if (cmd === "/cwd" || cmd === "/workspace") {
+			if (isDefault) this.userWorkspaces.delete(key);
+			else this.userWorkspaces.set(key, resolve(arg));
+		}
+		if (cmd === "/model" || cmd === "/thinking") this.settings.set(key, opts);
+		this.cancelEpochs.set(key, cancelEpoch + 1);
+		// Detach the old queue; its captured epoch prevents stale work from dispatching.
+		this.queues.delete(key);
 		this.userConversations.delete(key);
 		this.sessionEpochs.set(key, (this.sessionEpochs.get(key) || 0) + 1);
-		await this.reply(target, "已开启新会话（不删除历史）；将在下条消息创建。");
+		// Unbind synchronously: abortRun may emit events before its promise resolves.
+		for (const [token] of runs) {
+			this.pendingRuns.delete(token);
+			this.earlyRuns.delete(token);
+		}
+		const failures = [];
+		for (const [, run] of runs) {
+			try {
+				const result = await this.host.abortRun?.(run.runId || run.conversationId);
+				if (!result?.ok) failures.push(result?.error || "宿主不支持中止");
+			} catch (error) {
+				failures.push(error.message);
+			}
+		}
+		if (generation !== this.generation || cancelEpoch + 1 !== (this.cancelEpochs.get(key) || 0)) return;
+		await this.reply(
+			target,
+			"已开启新会话（不删除历史）。" +
+				(failures.length ? `旧任务停止失败：${failures.join("；")}。旧任务已解绑，其回复将被忽略。` : ""),
+		);
+		if (isReset && arg) {
+			// Bypass command parsing and message-ID deduplication for the literal reset prompt.
+			await this.receive({}, { sender, key, target, generation, cancelEpoch: cancelEpoch + 1, literalText: arg });
+		}
 	}
 	async handleRunEvent(ev) {
 		const token = ev.runId || ev.conversationId;
@@ -360,6 +431,7 @@ export class IMessageBotBridge {
 			}
 			return;
 		}
+		if (run.generation !== this.generation || run.cancelEpoch !== (this.cancelEpochs.get(run.key) || 0)) return;
 		if (ev.conversationId) run.conversationId = ev.conversationId;
 		if (ev.type === "message" && (ev.message?.role === "assistant" || ev.message?.author === "assistant")) {
 			const content = ev.message.content;
@@ -384,7 +456,11 @@ export class IMessageBotBridge {
 				: ev.stopReason === "aborted"
 					? "任务已停止。"
 					: "任务完成，无文本输出。附件不会自动发送，请使用 imessage 工具的 file 参数。");
-		for (const chunk of chunkMarkdownText(text, 3000)) await this.reply(run.target, chunk);
-		this.status.messagesReplied++;
+		for (const chunk of chunkMarkdownText(text, 3000)) {
+			if (run.generation !== this.generation || run.cancelEpoch !== (this.cancelEpochs.get(run.key) || 0)) return;
+			await this.reply(run.target, chunk);
+		}
+		if (run.generation === this.generation && run.cancelEpoch === (this.cancelEpochs.get(run.key) || 0))
+			this.status.messagesReplied++;
 	}
 }

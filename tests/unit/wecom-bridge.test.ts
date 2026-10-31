@@ -53,7 +53,7 @@ describe("WeCom scoped runtime", () => {
 		expect(host.chat).toHaveBeenCalledTimes(3);
 		expect(new Set(host.chat.mock.calls.map((c: any) => c[0].accountId)).size).toBe(3);
 	});
-	it("stops the owning run after rename and rejects context reset while busy", async () => {
+	it("stops the owning run after rename and resets while busy", async () => {
 		const { bridge, send, host, fetch } = setup();
 		await send("hello");
 		await bridge.handleRunEvent({
@@ -62,12 +62,13 @@ describe("WeCom scoped runtime", () => {
 			conversationId: "renamed",
 			message: { role: "assistant", content: "answer" },
 		});
-		await send("/new");
-		expect(fetch.mock.calls.at(-1)![1].body).toContain("请先 /stop");
 		await send("/abort");
 		expect(host.abortRun).toHaveBeenCalledWith("run");
-		await bridge.handleRunEvent({ type: "run_end", runId: "other", conversationId: "renamed" });
-		expect(bridge.pendingRuns.size).toBe(1);
+		await send("/new");
+		expect(fetch.mock.calls.at(-1)![1].body).toContain("全新会话");
+		await bridge.handleRunEvent({ type: "run_end", runId: "run", conversationId: "renamed" });
+		expect(bridge.pendingRuns.size).toBe(0);
+		expect(fetch).toHaveBeenCalledTimes(2);
 	});
 	it("applies scoped model/thinking/cwd on next chat; new drops actual conversation", async () => {
 		const { send, host, bridge } = setup();

@@ -1,12 +1,14 @@
 # WhatsApp 机器人与工作台
 
-基于 Meta WhatsApp Business Cloud API（Graph API v20.0），无第三方运行依赖。插件版本 **0.2.3**。
+基于 Meta WhatsApp Business Cloud API（Graph API v20.0），无第三方运行依赖。插件版本 **0.2.4**。
 
 ## 命令与会话
 
-支持 `/help`、`/new`、`/clear`、`/status`、`/stop`（别名 `/abort`）、`/model [provider/id|default]`、`/thinking [off|minimal|low|medium|high|xhigh|default]`、`/cwd [absolute path]`（兼容 `/workspace`）。未知斜杠命令直接提示，不交给模型。
+支持 `/help`、`/new [prompt]`、`/clear [prompt]`、`/reset [prompt]`、`/status`、`/stop`（别名 `/abort`）、`/model [provider/id|default]`、`/thinking [off|minimal|low|medium|high|xhigh|default]`、`/cwd [absolute path]`（兼容 `/workspace`）。未知斜杠命令直接提示，不交给模型。
 
-模型与思考参数在下一次投递时由宿主验证；命令回复不会伪称模型已切换。目录必须存在、已获宿主文件授权，切目录会新建会话。`/new`、`/clear` 先中止运行，再使用新的独立账号启动上下文。`/stop` 调用真实 `host.abortRun(runId || conversationId)`，优先稳定运行 ID，过户或对话改名后仍准确中止。取消投递后晚到的回执同样优先使用其 `runId` 中止。
+模型与思考参数在下一次投递时由宿主验证；命令回复不会伪称模型已切换。目录必须存在、已获宿主文件授权，切目录会新建会话。命令名兼容大小写及全角字符（含全角斜杠），参数保留原文。`/new`、`/clear`、`/reset` 带提示词时，会在新会话执行该提示词，提示词以 `/` 开头也作为正文发送。模型、思考强度及目录 setter 均重置上下文；`DEFAULT` 恢复默认，思考强度兼容大小写。
+
+`/new`、`/clear`、`/reset` 立即使旧队列、下载和在途投递失效，解除旧会话绑定并轮换独立账号，保留模型、思考强度及目录偏好，同时请求中止旧运行。迟到回执也会请求中止，旧事件不会恢复绑定；中止失败会明确反馈。`/stop` 调用真实 `host.abortRun(runId || conversationId)`，优先稳定运行 ID，过户或对话改名后仍准确中止。取消投递后晚到的回执同样优先使用其 `runId` 中止。
 
 会话使用通道来源隔离账号。使用 `await host.chat()` 回执的真实 `conversationId` 和稳定 `runId`，支持回执前到达的消息及结束事件、会话过户及改名。未返回稳定运行 ID 时明确报错。发送失败记录日志、状态并通知工作台；投递失败、中止、模型错误、超时均有反馈。
 

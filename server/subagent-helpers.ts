@@ -14,6 +14,7 @@ import type { SubagentSnapshot, SubagentState } from "./subagents.js";
 import type { RoleWaitOutcome } from "./goal-service.js";
 import type { Conversation } from "./agent-service.js";
 import { SUBAGENT_PROMPT_SNAPSHOT_CAP } from "./agent-formatters.js";
+import { conversationIdentity, parentConversationIdentity, conversationParent } from "./conversation-identity.js";
 
 /** 子代理是否处于活跃（流式运行中或首轮投递启动中）状态。
  *  #589：名额与可见性解耦——仅活跃（非终态）子代理占用 MAX_SUBAGENTS 并发名额；
@@ -103,6 +104,8 @@ export function toSubagentSnapshot(conv: Conversation): SubagentSnapshot {
 	const modelKey = m ? `${m.provider}/${m.id}` : (conv.subagentTemplate?.model ?? undefined);
 	return {
 		convId: conv.id,
+		executionId: conversationIdentity(conv),
+		parentExecutionId: parentConversationIdentity(conv),
 		type: conv.subagentType ?? "general",
 		title: conv.title,
 		prompt:
@@ -118,7 +121,7 @@ export function toSubagentSnapshot(conv: Conversation): SubagentSnapshot {
 		model: modelKey,
 		thinkingLevel,
 		output: conv.session.getLastAssistantText() ?? "",
-		parentId: conv.parentId,
+		parentId: (conversationParent(conv) as Conversation | undefined)?.id,
 		persisted: isPersisted,
 		handoffTo: conv.peerHandoffTo ? [...conv.peerHandoffTo] : undefined,
 		handoffFrom: conv.peerHandoffFrom ? [...conv.peerHandoffFrom] : undefined,

@@ -4,7 +4,17 @@ import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 
 const HELP =
-	"Telegram 机器人帮助: /help /new /clear /status /stop (/abort) /model [provider/id] /thinking [off|minimal|low|medium|high|xhigh] /cwd [absolute path]";
+	"Telegram 机器人帮助: /help /new [prompt] (/clear /reset) /status /stop (/abort) /model [provider/id] /thinking [off|minimal|low|medium|high|xhigh] /cwd [absolute path] (/workspace)";
+
+export function parseCommand(text) {
+	const match = text.match(/^([/／][^\s　]+)(?:[\s　]+([\s\S]*))?$/u);
+	if (!match) return null;
+	const head = match[1].normalize("NFKC").toLowerCase();
+	const command = head.match(/^\/([a-z][a-z0-9_]*)(?:@(\w+))?$/);
+	if (!command) return null;
+	const aliases = { clear: "new", reset: "new", abort: "stop", workspace: "cwd" };
+	return { cmd: `/${aliases[command[1]] || command[1]}`, bot: command[2], value: (match[2] || "").trim() };
+}
 const LIMIT = 20 * 1024 * 1024;
 export async function validateWorkspace(value) {
 	if (!path.isAbsolute(value)) throw new Error("Workspace must be an absolute path.");
@@ -92,7 +102,31 @@ export class ChannelBehavior {
 			{ apiBase: cfg.apiBase },
 		);
 	}
-	async onInboundMessage(msg) {
+	peerController(peer) {
+		this.peerCancels ||= new Map();
+		if (!this.peerCancels.has(peer)) this.peerCancels.set(peer, new AbortController());
+		return this.peerCancels.get(peer);
+	}
+	invalidatePeer(peer, reset = true) {
+		this.peerController(peer).abort();
+		this.peerCancels.delete(peer);
+		this.peerQueues?.delete(peer);
+		if (reset) {
+			this.userConversations.delete(peer);
+			this.peerEpochs.set(peer, randomUUID());
+		}
+		const runs = [...this.pendingRuns.entries()].filter(([, run]) => run.peer === peer);
+		for (const [id] of runs) this.pendingRuns.delete(id);
+		return runs;
+	}
+	async abortRuns(runs) {
+		const results = await Promise.allSettled(runs.map(([id]) => this.host.abortRun(id)));
+		for (const result of results) {
+			if (result.status === "rejected") throw result.reason;
+			if (result.value?.ok === false) throw new Error(result.value.error || "Abort failed");
+		}
+	}
+	async onInboundMessage(msg, promptOverride) {
 		const cfg = this.getConfig();
 		if (!msg?.chat?.id || !msg.from?.id || msg.from.is_bot) return;
 		const user = String(msg.from.id);
@@ -100,33 +134,31 @@ export class ChannelBehavior {
 			await this.send(msg, "访问受限：你的账号不在允许列表中。");
 			return;
 		}
-		let text = String(msg.text || msg.caption || "").trim();
+		let text = String(promptOverride ?? (msg.text || msg.caption || "")).trim();
 		const bot = this.status.botUsername;
-		const command = text.match(/^\/([a-z]+)(?:@([\w]+))?(?:\s+([\s\S]*))?$/i);
-		if (command?.[2] && command[2].toLowerCase() !== bot.toLowerCase()) return;
-		if (msg.chat.type !== "private") {
-			const mentioned = bot && text.toLowerCase().includes(`@${bot.toLowerCase()}`);
+		const command = promptOverride === undefined ? parseCommand(text) : null;
+		if (command?.bot && command.bot !== bot.toLowerCase()) return;
+		if (promptOverride === undefined && msg.chat.type !== "private") {
+			const mentioned = command?.bot || (bot && text.toLowerCase().includes(`@${bot.toLowerCase()}`));
 			const replying = Boolean(this.botInfo?.id && msg.reply_to_message?.from?.id === this.botInfo.id);
 			if (!mentioned && !replying) return;
 		}
-		if (bot) text = text.replace(new RegExp(`@${bot}\\b`, "gi"), "").trim();
+		if (bot && !command) text = text.replace(new RegExp(`@${bot}\\b`, "gi"), "").trim();
 		const peer = this.peer(msg);
 		this.preferences ||= new Map();
 		this.peerQueues ||= new Map();
 		this.peerEpochs ||= new Map();
 		this.peerCancels ||= new Map();
-		if (/^\/(?:stop|abort|new|clear)(?:\s|$)/i.test(text)) {
-			this.peerCancels.get(peer)?.abort();
-			this.peerCancels.delete(peer);
+		const controller = this.peerController(peer);
+		if (command) {
 			try {
-				await this.handleCommand(msg, peer, text);
+				await this.handleCommand(msg, peer, command, controller);
 			} catch (err) {
 				await this.send(msg, `❌ ${err.message}`);
 			}
 			return;
 		}
-		const controller = this.peerCancels.get(peer) || new AbortController();
-		this.peerCancels.set(peer, controller);
+		const epoch = this.peerEpochs.get(peer) || 0;
 		// Serialize dispatch while stop/reset bypasses downloads immediately.
 		const previous = this.peerQueues.get(peer) || Promise.resolve();
 		const work = previous
@@ -134,10 +166,6 @@ export class ChannelBehavior {
 			.then(async () => {
 				try {
 					if (controller.signal.aborted) return;
-					if (text.startsWith("/")) {
-						await this.handleCommand(msg, peer, text);
-						return;
-					}
 					const media =
 						msg.photo?.at(-1) || msg.voice || msg.audio || msg.document || msg.video || msg.video_note || msg.animation;
 					if (!text && !media) {
@@ -156,10 +184,7 @@ export class ChannelBehavior {
 					const req = {
 						text,
 						attachments,
-						accountId: `tg_${createHash("sha256")
-							.update(`${peer}:${this.peerEpochs.get(peer) || 0}`)
-							.digest("hex")
-							.slice(0, 16)}`,
+						accountId: `tg_${createHash("sha256").update(`${peer}:${epoch}`).digest("hex").slice(0, 16)}`,
 						cwd,
 						model: pref.model || cfg.model || undefined,
 						thinkingLevel: pref.thinking || cfg.thinkingLevel || undefined,
@@ -172,11 +197,12 @@ export class ChannelBehavior {
 						if (!receipt?.conversationId || !receipt?.runId || receipt.ok === false)
 							throw new Error(receipt?.error || "Host did not return conversationId and runId.");
 						if (controller.signal.aborted) {
-							await this.host.abortRun(receipt.runId || receipt.conversationId);
+							this.earlyRuns.delete(receipt.runId);
+							await this.abortRuns([[receipt.runId]]);
 							return;
 						}
 						this.userConversations.set(peer, receipt.conversationId);
-						const run = { peer, msg, conversationId: receipt.conversationId, accumulatedText: "" };
+						const run = { peer, msg, controller, conversationId: receipt.conversationId, accumulatedText: "" };
 						this.pendingRuns.set(receipt.runId, run);
 						const events = this.earlyRuns.get(receipt.runId) || [];
 						this.earlyRuns.delete(receipt.runId);
@@ -232,25 +258,16 @@ export class ChannelBehavior {
 			prompt: `\nTelegram media saved locally: ${JSON.stringify(file)}. Use read with this local file path when needed.${audiovisual ? " Audio/video is not decoded or transcribed by this plugin. If your tools cannot decode it, explicitly tell the user and request a transcript or supported still image." : " If the file cannot be decoded, explicitly tell the user."}`,
 		};
 	}
-	async handleCommand(msg, peer, text) {
-		const [raw, ...parts] = text.split(/\s+/);
-		const cmd = raw.toLowerCase();
-		const value = parts.join(" ").trim();
+	async handleCommand(msg, peer, { cmd, value }, controller) {
 		const pref = { ...(this.preferences.get(peer) || {}) };
 		const runs = [...this.pendingRuns.entries()].filter(([, r]) => r.peer === peer);
-		if (["/new", "/clear", "/stop", "/abort"].includes(cmd)) {
-			for (const [id, run] of runs) {
-				const result = await this.host.abortRun(id || run.conversationId);
-				if (result?.ok === false) throw new Error(result.error || "Abort failed");
-				this.pendingRuns.delete(id);
-			}
-			if (cmd === "/new" || cmd === "/clear") {
-				this.userConversations.delete(peer);
-				this.peerEpochs.set(peer, randomUUID());
-			}
+		if (cmd === "/new" || cmd === "/stop") {
+			const oldRuns = this.invalidatePeer(peer, cmd === "/new");
+			const follow = cmd === "/new" && value ? this.onInboundMessage(msg, value) : Promise.resolve();
+			await Promise.all([this.abortRuns(oldRuns), follow]);
 			await this.send(
 				msg,
-				cmd === "/new" || cmd === "/clear"
+				cmd === "/new"
 					? "✅ New conversation. Peer preferences retained; stored history was not deleted."
 					: "✅ Stopped.",
 			);
@@ -299,10 +316,10 @@ export class ChannelBehavior {
 			await this.send(msg, `Unknown command. ${HELP}`);
 			return;
 		}
-		if (runs.length) throw new Error("Stop the current run before changing preferences.");
+		if (controller.signal.aborted) return;
+		const oldRuns = this.invalidatePeer(peer);
 		this.preferences.set(peer, pref);
-		this.peerEpochs.set(peer, randomUUID());
-		this.userConversations.delete(peer);
+		await this.abortRuns(oldRuns);
 		await this.send(msg, `✅ ${cmd.slice(1)} updated for this peer. Next message starts a new conversation.`);
 	}
 	async handleRunEvent(ev) {
@@ -329,6 +346,7 @@ export class ChannelBehavior {
 			}
 			return;
 		}
+		if (run.controller?.signal.aborted) return;
 		if (ev.conversationId) {
 			run.conversationId = ev.conversationId;
 			this.userConversations.set(run.peer, ev.conversationId);
@@ -357,7 +375,10 @@ export class ChannelBehavior {
 			? `❌ ${typeof error === "string" ? error : JSON.stringify(error)}${text ? `\n${text}` : ""}`
 			: text || "✅ Task completed (no text output).";
 		try {
-			for (const chunk of this.chunkText(final, 3800)) await this.send(run.msg, chunk);
+			for (const chunk of this.chunkText(final, 3800)) {
+				if (run.controller?.signal.aborted) return;
+				await this.send(run.msg, chunk);
+			}
 			this.status.messagesReplied++;
 			this.status.lastReplyAt = Date.now();
 		} catch (e) {

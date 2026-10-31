@@ -7,17 +7,46 @@ export function scopeKey(openId, chatId = "", threadId = "") {
 		.digest("hex");
 }
 
+export function parseCommand(text) {
+	const match = String(text)
+		.trim()
+		.match(/^(\S+)(?:\s+([\s\S]*))?$/);
+	return {
+		command: (match?.[1] || "").normalize("NFKC").toLowerCase(),
+		arg: match?.[2] || "",
+	};
+}
+
+async function resetContext(bridge, scope) {
+	bridge.epochs ??= new Map();
+	bridge.cancellations ??= new Map();
+	bridge.epochs.set(scope, (bridge.epochs.get(scope) || 0) + 1);
+	bridge.cancellations.set(scope, (bridge.cancellations.get(scope) || 0) + 1);
+	const epoch = bridge.epochs.get(scope);
+	const cancellation = bridge.cancellations.get(scope);
+	bridge.userConversations.delete(scope);
+	bridge.dispatchingScopes?.delete(scope);
+	const runs = [...bridge.pendingRuns.values()].filter((run) => run.scope === scope);
+	for (const run of runs) bridge.pendingRuns.delete(run.runId);
+	const results = await Promise.allSettled(runs.map((run) => bridge.host.abortRun(run.runId)));
+	return { epoch, cancellation, failed: results.some((result) => result.status === "rejected" || !result.value?.ok) };
+}
+
 export const runtime = {
 	async dispatch(text, attachments, ctx) {
 		const { scope, cfg } = ctx;
+		if (ctx.epoch !== undefined && ctx.epoch !== (this.epochs?.get(scope) || 0)) return;
+		if (ctx.cancellation !== undefined && ctx.cancellation !== (this.cancellations?.get(scope) || 0)) return;
 		if ([...this.pendingRuns.values()].some((r) => r.scope === scope) || this.dispatchingScopes?.has(scope)) {
 			return this.replyMessage(cfg, { ...ctx, msgType: "text", text: "当前会话正在运行，请等待完成或使用 /stop。" });
 		}
-		this.dispatchingScopes ??= new Set();
-		this.dispatchingScopes.add(scope);
+		this.dispatchingScopes ??= new Map();
+		const dispatchToken = Symbol();
+		this.dispatchingScopes.set(scope, dispatchToken);
 		this.inFlight = (this.inFlight || 0) + 1;
 		const generation = this.generation || 0;
 		const cancellation = this.cancellations?.get(scope) || 0;
+		const epoch = this.epochs?.get(scope) || 0;
 		try {
 			const preferences = this.preferences?.get(scope) || {};
 			const receipt = await this.host.chat({
@@ -40,6 +69,9 @@ export const runtime = {
 			this.userConversations.set(scope, receipt.conversationId);
 			const run = {
 				...ctx,
+				epoch,
+				cancellation,
+				generation,
 				runId: receipt.runId,
 				conversationId: receipt.conversationId,
 				accumulatedText: "",
@@ -53,15 +85,16 @@ export const runtime = {
 			this.status.lastError = err.message;
 			await this.replyMessage(cfg, { ...ctx, msgType: "text", text: `任务启动失败：${err.message}` });
 		} finally {
-			this.dispatchingScopes.delete(scope);
+			if (this.dispatchingScopes.get(scope) === dispatchToken) this.dispatchingScopes.delete(scope);
 			if (!--this.inFlight) this.earlyRuns.clear();
 		}
 	},
 
 	async handleSlashCommand(text, ctx) {
 		const { cfg, scope = ctx.openId } = ctx;
-		const [command, ...rest] = text.trim().split(/\s+/);
-		const arg = rest.join(" ");
+		const { command, arg } = parseCommand(text);
+		const isDefault = arg.toLowerCase() === "default";
+		const initialEpoch = this.epochs?.get(scope) || 0;
 		let answer;
 		try {
 			this.preferences ??= new Map();
@@ -74,7 +107,7 @@ export const runtime = {
 						...ctx,
 						msgType: "interactive",
 						title: "飞书机器人帮助",
-						text: "/help 帮助\n/new /clear 新会话\n/status 状态\n/stop /abort 停止\n/model [provider/id] 模型\n/thinking [off|minimal|low|medium|high|xhigh] 思考强度\n/cwd [绝对路径] 工作区\n支持图片、文件、语音与视频附件；音视频理解依赖模型工具，无法解码会明确告知。",
+						text: "/help 帮助\n/new /clear /reset [prompt] 新会话\n/status 状态\n/stop /abort 停止\n/model [provider/id] 模型\n/thinking [off|minimal|low|medium|high|xhigh] 思考强度\n/cwd [绝对路径] 工作区\n支持图片、文件、语音与视频附件；音视频理解依赖模型工具，无法解码会明确告知。",
 					}).then(() => true);
 				case "/stop":
 				case "/abort": {
@@ -91,43 +124,50 @@ export const runtime = {
 					break;
 				}
 				case "/clear":
-				case "/new":
-					if (runs.length || this.dispatchingScopes?.has(scope))
-						throw new Error("请先 /stop 并等待任务结束，再开启新会话。");
-					this.userConversations.delete(scope);
-					this.epochs.set(scope, (this.epochs.get(scope) || 0) + 1);
-					answer = "✨ 已开启全新会话（旧会话历史保留）。";
+				case "/reset":
+				case "/new": {
+					const { epoch, cancellation, failed } = await resetContext(this, scope);
+					if (epoch !== this.epochs.get(scope)) return true;
+					if (arg) await this.dispatch(arg, [], { ...ctx, scope, epoch, cancellation });
+					answer = "✨ 已开启全新会话（旧会话历史保留）。" + (failed ? "旧任务停止失败，请在宿主检查。" : "");
 					break;
+				}
 				case "/cwd":
 				case "/workspace":
 					if (arg) {
-						if (!isAbsolute(arg)) throw new Error("请提供工作区绝对路径");
-						if (runs.length || this.dispatchingScopes?.has(scope)) throw new Error("请先停止当前任务");
-						this.userWorkspaces.set(scope, arg);
-						this.userConversations.delete(scope);
-						this.epochs.set(scope, (this.epochs.get(scope) || 0) + 1);
+						if (!isDefault && !isAbsolute(arg)) throw new Error("请提供工作区绝对路径");
+						if (isDefault) this.userWorkspaces.delete(scope);
+						else this.userWorkspaces.set(scope, arg);
+						await resetContext(this, scope);
 					}
 					answer = `📂 当前项目根目录：${this.resolveWorkspace(scope, cfg)}${arg ? "（将在下次投递时由宿主验证）" : ""}`;
 					break;
 				case "/model":
 					if (arg) {
-						const models = await this.host.models.list();
-						if (!models.some((m) => `${m.provider}/${m.id}` === arg))
-							throw new Error("模型不可用，请使用 /model 查看列表");
-						prefs.model = arg;
+						if (!isDefault) {
+							const models = await this.host.models.list();
+							if (initialEpoch !== (this.epochs.get(scope) || 0)) return true;
+							if (!models.some((m) => `${m.provider}/${m.id}` === arg))
+								throw new Error("模型不可用，请使用 /model 查看列表");
+						}
+						if (isDefault) delete prefs.model;
+						else prefs.model = arg;
 						this.preferences.set(scope, prefs);
-						answer = `模型设为 ${arg}（下次投递生效）`;
+						await resetContext(this, scope);
+						answer = `模型设为 ${isDefault ? "跟随宿主" : arg}（已开启新会话）`;
 					} else {
 						const models = (await this.host.models?.list?.()) || [];
 						answer = `当前模型：${prefs.model || cfg.model || "跟随宿主"}\n${models.map((m) => `${m.provider}/${m.id}`).join("\n")}`;
 					}
 					break;
 				case "/thinking":
-					if (arg && !["off", "minimal", "low", "medium", "high", "xhigh"].includes(arg))
+					if (arg && !isDefault && !["off", "minimal", "low", "medium", "high", "xhigh"].includes(arg.toLowerCase()))
 						throw new Error("不支持的思考强度");
 					if (arg) {
-						prefs.thinkingLevel = arg;
+						if (isDefault) delete prefs.thinkingLevel;
+						else prefs.thinkingLevel = arg.toLowerCase();
 						this.preferences.set(scope, prefs);
+						await resetContext(this, scope);
 					}
 					answer = `思考强度：${prefs.thinkingLevel || cfg.thinkingLevel || "跟随宿主"}（由宿主在投递时验证模型支持）`;
 					break;

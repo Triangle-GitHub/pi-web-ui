@@ -2403,7 +2403,6 @@
 		"worktreeSwitch": "切换工作树",
 		"worktreeManage": "管理工作树",
 		"worktreeBadgeLinked": "工作樹",
-		"worktreeBadgeDirtyCount": "{count} 處含修改",
 		"worktreeActionSwitchMain": "切回主儲存庫",
 		"worktreeActionRemove": "移除工作樹",
 		"worktreeActionRemoveConfirm": "確定移除工作樹「{path}」嗎？未提交的修改可能會丟失。",

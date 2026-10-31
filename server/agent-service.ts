@@ -188,16 +188,15 @@ import { fillSkillContents } from "./skill-content-filler.js";
 import { estimateNonSystemTokens, renderMainCompose } from "./prompt-assembler.js";
 import type { SubagentHandoffRecord } from "./subagent-handoff.js";
 import { makeCommunicateTool } from "./communicate-tool.js";
-const communicationAddresses = new WeakMap<object, string>();
-let communicationAddressSequence = 0;
-function communicationAddress(endpoint: object): string {
-	let address = communicationAddresses.get(endpoint);
-	if (!address) {
-		address = `comm-${++communicationAddressSequence}`;
-		communicationAddresses.set(endpoint, address);
-	}
-	return address;
-}
+import {
+	conversationIdentity,
+	bindConversationParent,
+	hasConversationParentBinding,
+	conversationParent,
+	parentConversationIdentity,
+} from "./conversation-identity.js";
+
+const communicationAddress = conversationIdentity;
 import {
 	conversationCommunication,
 	type CommunicationAction,
@@ -206,7 +205,6 @@ import {
 	type CommunicationEnvelope,
 	type CommunicationHost,
 } from "./conversation-communication.js";
-import { executeContextBudgetPruning } from "./context-budget-runner.js";
 import { requestContextExtension, enableRequestEvidence } from "./request-context.js";
 import {
 	removeContextEvidence,
@@ -1427,13 +1425,15 @@ export class ClientSession {
 			// 父对话 = 真正派发它的会话（按会话归属的 host 包装填入）。直接用 active
 			// 会错：后台对话运行时用户可能正看着别的项目对话，孩子会被记到无关
 			// 对话名下、沉到别的项目组底部（issue #95）。缺省才回退到 active。
-			conv.parentId = parent?.id ?? parentId ?? this.activeId ?? undefined;
+			conv.parentId = parent?.id ?? parentId;
+			bindConversationParent(conv, parent);
 			conv.subagentType = type;
 			conv.subagentPrompt = prompt;
 			conv.subagentThinking = thinking;
 			conv.notifyOnDone = notifyOnDone ?? true;
 			conv.subagentTask = createSubagentTask(conv.notifyOnDone);
-			conv.subagentTaskPending = () => this.subagentOwnerOf(conv.id).subagentTaskPending(conv);
+			conv.subagentTaskPending = () =>
+				this.resolveExecution(conversationIdentity(conv))?.session.subagentTaskPending(conv) ?? false;
 			// 安全模式与工具白名单（issue #727）：优先从 extra 取，缺省按 type 与模板自动推导
 			const securityMode = extra?.securityMode ?? resolveSecurityMode(type, apply);
 			conv.subagentSecurityMode = securityMode;
@@ -1666,23 +1666,76 @@ export class ClientSession {
 
 	private getSubagentSnapshot(convId: string): SubagentSnapshot | undefined {
 		const conv = this.convs.get(convId);
-		return conv?.session ? toSubagentSnapshot(conv) : undefined;
+		if (!conv?.session) return undefined;
+		this.parentExecution(conv);
+		return toSubagentSnapshot(conv);
 	}
 
-	/** B20：跨会话解析 —— 本会话没有就去「当前持有方」取（过户把子代理整体搬走后，
-	 *  旧 host 闭包仍指向源会话，按 id 全局查才能看到还在跑的子代理，而不是误判
-	 *  「已移出/不存在」）。findSubagentOwner 按别名表把旧 id 解析成改名后的当前 id。 */
+	/** Resolve a stable execution address through its current holder. */
 	private subagentSnapshotAnywhere(convId: string): SubagentSnapshot | undefined {
-		if (this.convs.has(convId)) return this.getSubagentSnapshot(convId);
-		const found = this.findSubagentOwner?.(convId);
-		return found && found.session !== this ? found.session.getSubagentSnapshot(found.convId) : undefined;
+		const found = this.resolveExecution(convId);
+		return found?.session.getSubagentSnapshot(found.convId);
+	}
+
+	/** One resolver for runtime identities. Bare ids are local, or globally unique. */
+	resolveExecutionAddress(id: string): string | undefined {
+		if (id.startsWith("exec-")) {
+			for (const conv of this.convs.values()) if (conversationIdentity(conv) === id) return conv.id;
+			return undefined;
+		}
+		return this.convs.has(id) ? id : undefined;
+	}
+
+	private resolveExecution(id: string): { session: ClientSession; convId: string; conv: Conversation } | undefined {
+		const owners = new Set([this, ...(this.allSubagentSessions?.() ?? [])]);
+		if (id.startsWith("exec-")) {
+			for (const session of owners) {
+				for (const conv of session.convs.values()) {
+					if (conversationIdentity(conv) === id) return { session, convId: conv.id, conv };
+				}
+			}
+			return undefined;
+		}
+		const local = this.convs.get(id);
+		if (local) return { session: this, convId: local.id, conv: local };
+		const matches = [...owners].flatMap((session) => {
+			const conv = session.convs.get(id);
+			return conv ? [{ session, convId: conv.id, conv }] : [];
+		});
+		return matches.length === 1 ? matches[0] : undefined;
+	}
+
+	/** Bind legacy relations once; an absent parent remains absent even after id reuse. */
+	private parentExecution(
+		child: Conversation,
+	): { session: ClientSession; convId: string; conv: Conversation } | undefined {
+		if (!hasConversationParentBinding(child)) {
+			const home = [...new Set([this, ...(this.allSubagentSessions?.() ?? [])])].find(
+				(owner) => owner.convs.get(child.id) === child,
+			);
+			const parent = child.parentId ? (home ?? this).resolveExecution(child.parentId)?.conv : undefined;
+			bindConversationParent(child, parent);
+		}
+		const parent = conversationParent(child) as Conversation | undefined;
+		return parent ? this.resolveExecution(conversationIdentity(parent)) : undefined;
+	}
+
+	private parentExecutionKey(child: Conversation): string | undefined {
+		this.parentExecution(child);
+		return parentConversationIdentity(child);
+	}
+
+	/** UI parent ids are meaningful only inside this holder's namespace. */
+	private localParentId(child: Conversation): string | undefined {
+		const parent = this.parentExecution(child);
+		return parent?.session === this ? parent.convId : undefined;
 	}
 
 	/** 由该父对话派出的子代理处在主对话下第几层：沿 parentId 链数祖先（主对话派的 = 1）。 */
 	private subagentDepthUnder(parentId: string | undefined): number {
 		let depth = 0;
 		const seen = new Set<string>();
-		for (let id = parentId; id && !seen.has(id); id = this.subagentSnapshotAnywhere(id)?.parentId) {
+		for (let id = parentId; id && !seen.has(id); id = this.subagentSnapshotAnywhere(id)?.parentExecutionId) {
 			seen.add(id);
 			depth++;
 		}
@@ -1697,55 +1750,44 @@ export class ClientSession {
 
 	/** B20：convId 当前由哪个 ClientSession 持有（本会话优先；查不到兜底本会话）。 */
 	private subagentOwnerOf(convId: string | undefined): ClientSession {
-		if (!convId) return this;
-		if (this.convs.has(convId)) return this;
-		return this.findSubagentOwner?.(convId)?.session ?? this;
+		return convId ? (this.resolveExecution(convId)?.session ?? this) : this;
 	}
 
 	/** B20：解析到当前（可能被过户改名）的对话 id；查不到原样返回。 */
 	private subagentCurrentId(convId: string): string {
-		if (this.convs.has(convId)) return convId;
-		return this.findSubagentOwner?.(convId)?.convId ?? convId;
+		return this.resolveExecution(convId)?.convId ?? convId;
 	}
 
 	private listSubagentSnapshots(scope?: "all" | "subagent" | "persistent", forSelfId?: string): SubagentSnapshot[] {
+		for (const conv of this.convs.values()) this.parentExecution(conv);
 		const own = listSubagentSnapshots(this.convs.values(), scope);
 		// B20：带 forSelfId 才并入会话外本族（祖先链能走到 forSelfId 的子代理，
 		// 过户搬走后 wait_all 的「无参展开」与 list 仍能看到它们）；不传 = 只列本会话。
 		if (!forSelfId || !this.allSubagentSessions) return own;
-		const seen = new Set(own.map((s) => s.convId));
+		const seen = new Set(own.map((s) => s.executionId ?? s.convId));
 		const out = [...own];
 		for (const other of this.allSubagentSessions()) {
 			if (other === this) continue;
 			for (const s of other.listSubagentSnapshots(scope)) {
-				if (seen.has(s.convId)) continue;
+				if (seen.has(s.executionId ?? s.convId)) continue;
 				if (!this.subagentInFamilyOf(s, forSelfId)) continue;
-				seen.add(s.convId);
+				seen.add(s.executionId ?? s.convId);
 				out.push(s);
 			}
 		}
 		return out;
 	}
 
-	/** B20：parentId 链向上能否走到 selfId（防环，最多 64 跳）。链上每一跳都按
-	 *  当前持有方 + 别名解析：过户撞 id 改名后，自省 id 与孩子们记录的 parentId
-	 *  都可能还是建时旧 id（c1→c2），不比显式相等，比的是「解析后的当前 id」。 */
+	/** Family membership follows bound object identities, never matching display ids. */
 	private subagentInFamilyOf(s: SubagentSnapshot, selfId: string): boolean {
-		let curId = s.parentId;
-		const seen = new Set<string>();
-		let n = 0;
-		while (curId && n++ < 64 && !seen.has(curId)) {
-			seen.add(curId);
-			if (curId === selfId) return true;
-			const found = this.findSubagentOwner?.(curId);
-			if (!found) return false;
-			if (found.convId === selfId) return true;
-			const snap =
-				found.session === this
-					? this.getSubagentSnapshot(found.convId)
-					: found.session.getSubagentSnapshot(found.convId);
-			if (!snap) return false;
-			curId = snap.parentId;
+		const self = this.resolveExecution(selfId)?.conv;
+		if (!self) return false;
+		let cur = this.resolveExecution(s.executionId ?? s.convId)?.conv;
+		const seen = new Set<Conversation>();
+		while (cur && !seen.has(cur)) {
+			seen.add(cur);
+			cur = this.parentExecution(cur)?.conv;
+			if (cur === self) return true;
 		}
 		return false;
 	}
@@ -1782,7 +1824,10 @@ export class ClientSession {
 		}
 		// B20：parentId 是建时旧 id 时先解析成当前 id（过户撞 id 改名后，新子代理
 		// 的 parentId 必须指向改名后的主对话，否则族展开/lists 都认不出它）。
-		const canonParent = parentId ? (this.findSubagentOwner?.(parentId)?.convId ?? parentId) : parentId;
+		// Runtime-bound callers already supply an id in this holder. A global alias
+		// for another client's cN must never replace an existing local parent.
+		const canonParent = parentId ? this.resolveExecution(parentId)?.convId : undefined;
+		if (parentId && !canonParent) throw new Error("Subagent parent is unavailable or ambiguous");
 		return this.spawnSubagentConversation(
 			prompt,
 			type,
@@ -1805,7 +1850,7 @@ export class ClientSession {
 		const holder = home?.session ?? this;
 		const conv = holder.convs.get(home?.convId ?? ownerId);
 		if (!conv || conv.session !== anchor.session) throw new Error("Subagent parent runtime is no longer current");
-		return conv.id;
+		return conversationIdentity(conv);
 	}
 
 	private subagentRunOutcome(conv: Conversation) {
@@ -1847,7 +1892,7 @@ export class ClientSession {
 
 	private async stopSubagentTask(convId: string): Promise<void> {
 		const owner = this.subagentOwnerOf(convId);
-		const conv = owner.convs.get(owner.subagentCurrentId(convId));
+		const conv = owner.convs.get(this.subagentCurrentId(convId));
 		if (!conv) return;
 		conv.subagentTaskStopped = true;
 		conv.promptInFlight = false;
@@ -1858,10 +1903,12 @@ export class ClientSession {
 				pick(owner.getLang(), "用户停止子代理", "User stopped the subagent", "agent.subagent.stop.user"),
 			);
 		}
-		owner.scheduleSubagentCompletionNotice(conv);
-		owner.emitConversations();
+		const currentOwner = this.resolveExecution(conversationIdentity(conv))?.session;
+		if (!currentOwner) return;
+		currentOwner.scheduleSubagentCompletionNotice(conv);
+		currentOwner.emitConversations();
 		if (conv.subagentWorktree && !conv.subagentWorktree.finalized) {
-			void owner.finalizeSubagentWorktree(conv).catch(() => {});
+			void currentOwner.finalizeSubagentWorktree(conv).catch(() => {});
 		}
 	}
 
@@ -1923,16 +1970,17 @@ export class ClientSession {
 		conv.subagentError = undefined;
 		conv.subagentErrorNotified = undefined;
 		// Remove the previous round from debounce and circuit-breaker buffers.
-		if (conv.parentId) {
-			const pending = this.pendingSubagentNotices.get(conv.parentId);
+		const parentKey = this.parentExecutionKey(conv);
+		if (parentKey) {
+			const pending = this.pendingSubagentNotices.get(parentKey);
 			if (pending) {
 				pending.subagents.delete(conv);
 				if (pending.subagents.size === 0) {
 					clearTimeout(pending.timer);
-					this.pendingSubagentNotices.delete(conv.parentId);
+					this.pendingSubagentNotices.delete(parentKey);
 				}
 			}
-			this.subagentOwnerOf(conv.parentId).convs.get(conv.parentId)?.suspendedSubagents?.delete(conv);
+			this.parentExecution(conv)?.conv.suspendedSubagents?.delete(conv);
 		}
 		conv.promptInFlight = true;
 		const isCurrent = () => conv.session === session && conv.subagentRunGeneration === generation;
@@ -1944,7 +1992,8 @@ export class ClientSession {
 				const error = err instanceof Error ? err.message : String(err);
 				conv.subagentError = error;
 				conv.subagentErrorNotified = error;
-				const holder = this.subagentOwnerOf(conv.id);
+				const holder = this.resolveExecution(conversationIdentity(conv))?.session;
+				if (!holder) return;
 				holder.emit({
 					type: "notice",
 					level: "error",
@@ -1954,8 +2003,8 @@ export class ClientSession {
 			} finally {
 				if (isCurrent()) {
 					conv.promptInFlight = false;
-					const holder = this.subagentOwnerOf(conv.id);
-					if (holder.convs.get(conv.id) === conv) {
+					const holder = this.resolveExecution(conversationIdentity(conv))?.session;
+					if (holder?.convs.get(conv.id) === conv) {
 						holder.scheduleSubagentCompletionNotice(conv);
 						holder.emitConversations();
 					}
@@ -1971,7 +2020,7 @@ export class ClientSession {
 	 * 合并为一条聚合消息唤醒父对话，避免碎片化多次打断父对话。
 	 */
 	scheduleSubagentCompletionNotice(conv: Conversation): void {
-		const parentId = conv.parentId;
+		const parentId = this.parentExecutionKey ? this.parentExecutionKey(conv) : conv.parentId;
 		if (!parentId || conv.notifyOnDone === false || this.subagentTaskPending?.(conv)) return;
 		if (conv.subagentDoneNotified || conv.subagentConsumedByParent) return;
 
@@ -1995,7 +2044,7 @@ export class ClientSession {
 	private refreshCompletionState(parentId: string): void {
 		const owner = this.subagentOwnerOf(parentId);
 		owner.emitConversations();
-		if (owner.activeId === parentId) owner.flushSnapshot();
+		if (owner.activeId === (this.subagentCurrentId?.(parentId) ?? parentId)) owner.flushSnapshot();
 	}
 
 	/**
@@ -2092,7 +2141,7 @@ export class ClientSession {
 			else this.deliveringSubagentNotices.delete(parentId);
 			this.refreshCompletionState(parentId);
 			const owner = this.subagentOwnerOf(parentId);
-			const parent = owner.convs.get(owner.subagentCurrentId?.(parentId) ?? parentId);
+			const parent = owner.convs.get(this.subagentCurrentId?.(parentId) ?? parentId);
 			if (parent?.notifyOnDone === "manual" && !parent.subagentDoneNotified && !parent.subagentConsumedByParent) {
 				owner.scheduleSubagentCompletionNotice(parent);
 			}
@@ -2135,20 +2184,10 @@ export class ClientSession {
 
 		// 寻找父对话（支持跨 ClientSession 查找）
 		const parentOwner = this.subagentOwnerOf(parentId);
-		let targetConv = parentOwner.convs.get(parentId);
-		let isFallback = false;
-
-		// 活跃视口兜底：若原父对话已不在，寻找同 cwd 的活跃非子代理对话
-		if (!targetConv || !targetConv.session) {
-			const projectCwd = toNotify[0]?.cwd ?? this.cwd;
-			for (const c of parentOwner.convs.values()) {
-				if (!c.isSubagent && c.cwd === projectCwd) {
-					targetConv = c;
-					isFallback = true;
-					break;
-				}
-			}
-		}
+		const currentParentId = this.subagentCurrentId?.(parentId) ?? parentId;
+		const targetConv = parentOwner.convs.get(currentParentId);
+		// Completion belongs only to its originating parent. Sharing a project
+		// directory does not authorize injecting it into another conversation.
 
 		// 无存活主对话时优雅降级为系统 Notice，不报错不中断
 		if (!targetConv || !targetConv.session) {
@@ -2215,7 +2254,7 @@ export class ClientSession {
 			c.subagentDoneNotified = true;
 		}
 
-		const noticeText = formatSubagentsCompletionNotice(toNotify, this.getLang(), isFallback ? parentId : undefined);
+		const noticeText = formatSubagentsCompletionNotice(toNotify, this.getLang());
 		if (targetConv.notifyOnDone === "manual") {
 			targetConv.subagentDoneNotified = false;
 			targetConv.subagentConsumedByParent = false;
@@ -3041,13 +3080,14 @@ export class ClientSession {
 	}
 
 	private subagentHost: SubagentToolHost = {
+		resolveConversationId: (id) => this.resolveExecution(id)?.convId,
 		consultParent: (selfId, questions, signal) => this.consultParent(selfId, questions, signal),
 		answerConsult: (selfId, runId, requestId, answers) => this.answerConsult(selfId, runId, requestId, answers),
 		escalateConsult: (selfId, runId, requestId) => this.answerConsult(selfId, runId, requestId),
 		getPendingConsults: (parentId) => this.getPendingConsults(parentId),
 		setConsultWaiting: (parentId, waiting) => {
 			const owner = this.subagentOwnerOf(parentId);
-			const parent = owner.convs.get(owner.subagentCurrentId(parentId));
+			const parent = owner.convs.get(this.subagentCurrentId(parentId));
 			if (parent) {
 				if (waiting) consultWaitingParents.add(parent);
 				else consultWaitingParents.delete(parent);
@@ -3088,7 +3128,7 @@ export class ClientSession {
 		},
 		completeSubagent: (selfId, summary) => {
 			const owner = this.subagentOwnerOf(selfId);
-			const conv = owner.convs.get(owner.subagentCurrentId(selfId));
+			const conv = owner.convs.get(this.subagentCurrentId(selfId));
 			if (!conv?.parentId) throw new Error("Only a child task can complete itself.");
 			conv.subagentTask = requestSubagentCompletion(
 				conv.subagentTask ?? createSubagentTask(conv.notifyOnDone),
@@ -3104,14 +3144,7 @@ export class ClientSession {
 				await owner.finalizeSubagentWorktree(conv);
 			}
 		},
-		getSubagent: (convId) => {
-			// B20：本会话查不到就去「当前持有方」查 —— 过户把子代理整体搬走后，
-			// 旧 host 仍指向源会话（搬不动闭包），不跨会话解析 wait_all/get_result
-			// 会以为子代理「已移出/不存在」而其实还在跑。
-			if (this.convs.has(convId)) return this.getSubagentSnapshot(convId);
-			const found = this.findSubagentOwner?.(convId);
-			return found && found.session !== this ? found.session.getSubagentSnapshot(found.convId) : undefined;
-		},
+		getSubagent: (convId) => this.subagentSnapshotAnywhere(convId),
 		listSubagents: (scope, forSelfId) => this.listSubagentSnapshots(scope, forSelfId),
 		markSubagentsConsumed: (runIds) => {
 			for (const id of runIds) {
@@ -4483,10 +4516,11 @@ export class ClientSession {
 										undefined,
 										// B20：selfId 必须调用时刻解析，不能死用建时旧 id —— 过户撞 id
 										// 改名后 wait_all 的「排除自身/展开后代」要按 runtime 的当前归属查。
-										() =>
-											bridgeAnchor.session
-												? (this.findConversationHome?.(bridgeAnchor.session)?.convId ?? ownerId)
-												: ownerId,
+										() => {
+											const home = bridgeAnchor.session && this.findConversationHome?.(bridgeAnchor.session);
+											const conv = home?.session.convs.get(home.convId);
+											return conv ? conversationIdentity(conv) : undefined;
+										},
 									)
 								: makeSubagentTools(this.subagentHost)),
 						makeCommunicateTool({
@@ -4499,7 +4533,7 @@ export class ClientSession {
 							: ownerId
 								? [
 										makeDelegateTaskTool(
-											withSubagentOwner(this.subagentHost, ownerId, () =>
+											withSubagentOwner(this.communicationBoundSubagentHost(bridgeAnchor), ownerId, () =>
 												this.requireSubagentOwner(bridgeAnchor, ownerId),
 											),
 										),
@@ -4763,6 +4797,7 @@ export class ClientSession {
 			toolWatchdogs: new Map(),
 			workspaceSnapshots: readWorkspaceSnapshotsFromSession(runtime.session.sessionManager),
 		};
+		conversationIdentity(conv);
 		this.restorePlan(conv);
 		return conv;
 	}
@@ -6665,8 +6700,7 @@ export class ClientSession {
 		const seen = new Set<Conversation>();
 		while (root.parentId && !seen.has(root)) {
 			seen.add(root);
-			const owner = this.subagentOwnerOf(root.parentId);
-			const parent = owner.convs.get(owner.subagentCurrentId(root.parentId));
+			const parent = this.parentExecution(root)?.conv;
 			if (!parent || !sameCwd(parent.cwd, conv.cwd)) break;
 			root = parent;
 		}
@@ -6683,8 +6717,7 @@ export class ClientSession {
 				const seen = new Set<Conversation>();
 				while (root.parentId && !seen.has(root)) {
 					seen.add(root);
-					const holder = owner.subagentOwnerOf(root.parentId);
-					const parent = holder.convs.get(holder.subagentCurrentId(root.parentId));
+					const parent = owner.parentExecution(root)?.conv;
 					if (!parent || !sameCwd(parent.cwd, conv.cwd)) break;
 					root = parent;
 				}
@@ -6707,11 +6740,15 @@ export class ClientSession {
 
 	private getPendingConsults(parentId: string): Array<{ runId: string; requestId: string; questions: UiQuestion[] }> {
 		const parentOwner = this.subagentOwnerOf(parentId);
-		const currentParentId = parentOwner.subagentCurrentId(parentId);
+		const currentParentId = this.subagentCurrentId(parentId);
 		const parent = parentOwner.convs.get(currentParentId);
 		if (!parent) return [];
-		const result: Array<{ runId: string; requestId: string; questions: UiQuestion[] }> =
-			conversationCommunication.incomingRequests(parent);
+		const result: Array<{ runId: string; requestId: string; questions: UiQuestion[] }> = conversationCommunication
+			.incomingRequests(parent)
+			.map((request) => {
+				const source = conversationCommunication.requestSource(request.requestId);
+				return { ...request, runId: source ? conversationIdentity(source) : request.runId };
+			});
 		for (const owner of new Set([this, ...(this.allSubagentSessions?.() ?? [])])) {
 			for (const request of owner.pendingQuestions.values()) {
 				const child = owner.convs.get(request.conversationId);
@@ -6719,10 +6756,11 @@ export class ClientSession {
 				if (
 					!request.settled &&
 					request.audience === "parent" &&
-					child?.parentId === parent.id &&
+					child &&
+					owner.parentExecution(child)?.conv === parent &&
 					sameCwd(child.cwd, parent.cwd)
 				) {
-					result.push({ runId: child.id, requestId: request.id, questions: request.questions });
+					result.push({ runId: conversationIdentity(child), requestId: request.id, questions: request.questions });
 				}
 			}
 		}
@@ -6739,26 +6777,23 @@ export class ClientSession {
 
 	private resolveCommunicationTarget(senderId: string, to: string): Conversation | undefined {
 		const owner = this.subagentOwnerOf(senderId);
-		const sender = owner.convs.get(owner.subagentCurrentId(senderId));
+		const sender = owner.convs.get(this.subagentCurrentId(senderId));
 		if (!sender) return undefined;
 		if (to === "parent") {
-			if (!sender.parentId) return undefined;
-			const parentOwner = owner.subagentOwnerOf(sender.parentId);
-			return parentOwner.convs.get(parentOwner.subagentCurrentId(sender.parentId));
+			return owner.parentExecution(sender)?.conv;
 		}
 		if (to === "root") {
 			let root = sender;
 			const seen = new Set<Conversation>();
 			while (root.parentId && !seen.has(root)) {
 				seen.add(root);
-				const parentOwner = owner.subagentOwnerOf(root.parentId);
-				const parent = parentOwner.convs.get(parentOwner.subagentCurrentId(root.parentId));
+				const parent = owner.parentExecution(root)?.conv;
 				if (!parent) break;
 				root = parent;
 			}
 			return root;
 		}
-		if (to.startsWith("comm-")) {
+		if (to.startsWith("exec-")) {
 			for (const candidate of new Set([this, ...(this.allSubagentSessions?.() ?? [])])) {
 				for (const conv of candidate.convs.values()) if (communicationAddress(conv) === to) return conv;
 			}
@@ -6784,6 +6819,18 @@ export class ClientSession {
 		};
 		return {
 			...this.subagentHost,
+			resolveConversationId: (id) => current().session.resolveExecution(id)?.convId,
+			getSubagent: (id) => current().session.subagentHost.getSubagent(id),
+			listSubagents: (scope, self) => current().session.subagentHost.listSubagents(scope, self),
+			steerSubagent: (id, message) => current().session.subagentHost.steerSubagent(id, message),
+			stopSubagent: (id) => current().session.subagentHost.stopSubagent(id),
+			markSubagentsConsumed: (ids) => current().session.subagentHost.markSubagentsConsumed?.(ids),
+			finalizeSubagentWorktree: (id) =>
+				current().session.subagentHost.finalizeSubagentWorktree?.(id) ?? Promise.resolve(),
+			dismissSubagent: (id, options) =>
+				current().session.subagentHost.dismissSubagent?.(id, options) ??
+				Promise.resolve({ ok: false, reason: "unsupported" }),
+			getActiveConversationId: () => current().session.activeId,
 			spawnSubagent: (
 				prompt,
 				type,
@@ -6822,15 +6869,24 @@ export class ClientSession {
 			},
 			consultParent: (_self, questions, signal) => {
 				const home = current();
-				return home.session.consultParent(home.convId, questions, signal);
+				return home.session.consultParent(
+					conversationIdentity(home.session.convs.get(home.convId)!),
+					questions,
+					signal,
+				);
 			},
 			answerConsult: (_self, runId, requestId, answers) => {
 				const home = current();
-				return home.session.answerConsult(home.convId, runId, requestId, answers);
+				return home.session.answerConsult(
+					conversationIdentity(home.session.convs.get(home.convId)!),
+					runId,
+					requestId,
+					answers,
+				);
 			},
 			escalateConsult: (_self, runId, requestId) => {
 				const home = current();
-				return home.session.answerConsult(home.convId, runId, requestId);
+				return home.session.answerConsult(conversationIdentity(home.session.convs.get(home.convId)!), runId, requestId);
 			},
 			completeSubagent: (_self, summary) => {
 				const home = current();
@@ -6838,7 +6894,7 @@ export class ClientSession {
 			},
 			getPendingConsults: () => {
 				const home = current();
-				return home.session.getPendingConsults(home.convId);
+				return home.session.getPendingConsults(conversationIdentity(home.session.convs.get(home.convId)!));
 			},
 			setConsultWaiting: (_self, waiting) => {
 				const home = current();
@@ -6868,8 +6924,7 @@ export class ClientSession {
 			if (conv.subagentWorktree && isSameOrSubpath(conv.cwd, conv.subagentWorktree.worktreePath))
 				return normalizePathKey(conv.subagentWorktree.mainRepoPath);
 			if (!conv.parentId) break;
-			const parentOwner = this.subagentOwnerOf(conv.parentId);
-			const parent = parentOwner.convs.get(parentOwner.subagentCurrentId(conv.parentId));
+			const parent = this.parentExecution(conv)?.conv;
 			if (!parent) break;
 			conv = parent;
 		}
@@ -7042,11 +7097,11 @@ export class ClientSession {
 
 	private answerConsult(selfId: string, runId: string, requestId: string, answers?: QuestionAnswer[]): unknown {
 		const parentOwner = this.subagentOwnerOf(selfId);
-		const parent = parentOwner.convs.get(parentOwner.subagentCurrentId(selfId));
+		const parent = parentOwner.convs.get(this.subagentCurrentId(selfId));
 		const owner = this.subagentOwnerOf(runId);
-		const child = owner.convs.get(owner.subagentCurrentId(runId));
+		const child = owner.convs.get(this.subagentCurrentId(runId));
 		if (parent && child && conversationCommunication.requestSource(requestId) === child) {
-			if (child.parentId !== parent.id)
+			if (owner.parentExecution(child)?.conv !== parent)
 				return { ok: false, error: "Only the direct parent may use the compatibility answer action." };
 			return this.communicate(parent.id, answers ? "reply" : "escalate", {
 				requestId,
@@ -7057,7 +7112,7 @@ export class ClientSession {
 		if (
 			!parent ||
 			!child ||
-			child.parentId !== parent.id ||
+			owner.parentExecution(child)?.conv !== parent ||
 			!sameCwd(parent.cwd, child.cwd) ||
 			!request ||
 			request.settled ||
@@ -7076,7 +7131,7 @@ export class ClientSession {
 
 	private async consultParent(selfId: string, questions: UiQuestion[], signal?: AbortSignal): Promise<QuestionResult> {
 		const owner = this.subagentOwnerOf(selfId);
-		const child = owner.convs.get(owner.subagentCurrentId(selfId));
+		const child = owner.convs.get(this.subagentCurrentId(selfId));
 		if (!child?.isSubagent || owner.disposed || signal?.aborted) return Promise.resolve(null);
 		const parent = child.parentId ? owner.resolveCommunicationTarget(child.id, "parent") : undefined;
 		if (!parent) return owner.askUser(questions, signal ?? { aborted: false }, child.id);
@@ -7094,7 +7149,8 @@ export class ClientSession {
 				if (
 					!request.settled &&
 					request.audience === "parent" &&
-					child?.parentId === parentId &&
+					child &&
+					owner.parentExecution(child)?.conv === parent &&
 					sameCwd(parent.cwd, child.cwd)
 				) {
 					request.audience = "user";
@@ -8068,10 +8124,8 @@ export class ClientSession {
 	 *  实例，而 `runtime.session` 与本工厂的 `created.session` 是同一个对象。） */
 	findConversationHome:
 		((sdkSession: AgentSession) => { session: ClientSession; convId: string } | undefined) | undefined = undefined;
-	/** B20 跨会话子代理归属（attach 时由 AgentService 接线，见 findConversationHome 同款）：
-	 *  - findSubagentOwner：按 convId 找当前持有它的 ClientSession —— 过户把对话（含子代理
-	 *    后代）整体搬去另一会话后，旧 host 闭包仍指向源会话，subagent 工具族靠它现查持有方；
-	 *  - allSubagentSessions：全部客户端会话（wait_all/list 的「本族跨会话展开」用）。 */
+	/** Legacy lookup rejects globally ambiguous ids. Runtime routing uses resolveExecution
+	 *  over live holders; allSubagentSessions also supplies cross-holder family traversal. */
 	findSubagentOwner: ((convId: string) => { session: ClientSession; convId: string } | undefined) | undefined =
 		undefined;
 	allSubagentSessions: (() => ClientSession[]) | undefined = undefined;
@@ -8798,6 +8852,11 @@ export class ClientSession {
 	 *  settings change. */
 	pushSettings(): void {
 		this.settingsSvc.push();
+	}
+
+	/** Explicit resource discovery for the settings panel; never reloads the runtime. */
+	refreshSettings(): void {
+		this.settingsSvc.refreshResources();
 	}
 
 	/**
@@ -9954,7 +10013,11 @@ export class ClientSession {
 								this.requireSubagentOwner({ session }, ownerId),
 							),
 							undefined,
-							() => this.requireSubagentOwner({ session }, ownerId),
+							() => {
+								const home = this.findConversationHome?.(session);
+								const conv = home?.session.convs.get(home.convId);
+								return conv ? conversationIdentity(conv) : undefined;
+							},
 						)
 					: makeSubagentTools(this.subagentHost)),
 				makeConversationReadTool(this.conversationReadHost(), () => this.getLang()),
@@ -10787,7 +10850,7 @@ export class ClientSession {
 		let pendingQuestions = false;
 		for (const owner of owners) {
 			for (const child of owner.convs.values()) {
-				if (child.parentId !== conv.id) continue;
+				if (owner.parentExecution(child)?.conv !== conv) continue;
 				if (
 					owner.subagentTaskPending(child, new Set(seen)) ||
 					(child.notifyOnDone !== false && !child.subagentDoneNotified && !child.subagentConsumedByParent)
@@ -10795,7 +10858,7 @@ export class ClientSession {
 					activeChildren = true;
 			}
 			for (const request of owner.pendingQuestions?.values() ?? []) {
-				if (!request.settled && request.conversationId === conv.id) pendingQuestions = true;
+				if (!request.settled && owner.convs.get(request.conversationId) === conv) pendingQuestions = true;
 			}
 		}
 		return isSubagentTaskPending(task, {
@@ -10812,7 +10875,13 @@ export class ClientSession {
 		if (conv.promptInFlight || conv.queueSteering?.length || conv.queueFollowUp?.length) return true;
 		const owners = new Set([this, ...(this.allSubagentSessions?.() ?? [])]);
 		for (const owner of owners) {
-			if (owner.pendingSubagentNotices.has(conv.id) || owner.deliveringSubagentNotices.has(conv.id)) return true;
+			const key = conversationIdentity(conv);
+			if (owner.pendingSubagentNotices.has(key) || owner.deliveringSubagentNotices.has(key)) return true;
+			if (
+				owner.convs.get(conv.id) === conv &&
+				(owner.pendingSubagentNotices.has(conv.id) || owner.deliveringSubagentNotices.has(conv.id))
+			)
+				return true;
 		}
 		return false;
 	}
@@ -11265,7 +11334,7 @@ export class ClientSession {
 					.map((c) => {
 						let label: string;
 						if (c.isSubagent) {
-							const parent = c.parentId ? this.convs.get(c.parentId) : undefined;
+							const parent = this.parentExecution(c)?.conv;
 							label = parent ? `本窗口「${parent.title}」的子代理「${c.title}」` : `本窗口子代理「${c.title}」`;
 						} else {
 							label = `本窗口「${c.title}」`;
@@ -12192,7 +12261,7 @@ export class ClientSession {
 							conv.id,
 							undefined,
 							undefined,
-							conv.isSubagent && this.subagentAtDepthLimit(conv.parentId),
+							conv.isSubagent && this.subagentAtDepthLimit(this.parentExecutionKey(conv)),
 						),
 						{
 							cwd: sessionBaseDir,
@@ -12734,7 +12803,9 @@ export class ClientSession {
 		// Also retain a parent while any live first-party subagent conversation
 		// points at it: dropping an idle in-memory parent orphans the child row
 		// (the child vanishes from Running Chats with no result available).
-		const hasLiveChild = [...this.convs.values()].some((child) => child.parentId === conv.id);
+		const hasLiveChild = [...new Set([this, ...(this.allSubagentSessions?.() ?? [])])].some((owner) =>
+			[...owner.convs.values()].some((child) => owner.parentExecution(child)?.conv === conv),
+		);
 		// Ephemeral transcripts have no history fallback: once started, only an
 		// explicit close may discard them, even after revisiting without a prompt.
 		const retainFinished =
@@ -12884,7 +12955,7 @@ export class ClientSession {
 				id: c.id,
 				title: c.title,
 				cwd: c.cwd,
-				...(c.parentId ? { parentId: c.parentId } : {}),
+				...(this.localParentId(c) ? { parentId: this.localParentId(c) } : {}),
 				isSubagent: c.isSubagent,
 				isEphemeral: !!c.isEphemeral,
 				...(sessionFile ? { sessionFile } : {}),
@@ -12906,6 +12977,7 @@ export class ClientSession {
 		const set = new Set(ids);
 		const convs = [...this.convs.values()].filter((c) => set.has(c.id));
 		if (convs.length === 0) return { ok: false, reason: "missing" };
+		for (const conv of this.convs.values()) this.parentExecution(conv);
 		for (const conv of convs) conv.transferring = true;
 		try {
 			if (set.has(this.activeId)) {
@@ -12992,16 +13064,37 @@ export class ClientSession {
 	insertTakeoverConvs(payload: TakeoverPayload): string {
 		if (this.botExecution) throw new Error("Bot sessions cannot receive transferred conversations");
 		const remap = new Map<string, string>();
+		const incomingIds = new Set(payload.convs.map((conv) => conv.id));
+		const reserved = new Set([...this.convs.keys(), ...incomingIds]);
+		// Resolve legacy parent links before any ids mutate or destination ids collide.
+		for (const conv of payload.convs) {
+			if (!hasConversationParentBinding(conv)) {
+				bindConversationParent(
+					conv,
+					payload.convs.find((candidate) => candidate.id === conv.parentId),
+				);
+			}
+		}
 		for (const conv of payload.convs) {
 			if (this.convs.has(conv.id)) {
-				remap.set(conv.id, this.nextConversationId());
+				let next: string;
+				do next = this.nextConversationId();
+				while (reserved.has(next));
+				reserved.add(next);
+				remap.set(conv.id, next);
 			}
 		}
 		const fix = (id: string): string => remap.get(id) ?? id;
+		const parentDisplayIds = new Map(
+			payload.convs.map((conv) => {
+				const parent = conversationParent(conv) as Conversation | undefined;
+				return [conv, parent ? (payload.convs.includes(parent) ? fix(parent.id) : parent.id) : undefined];
+			}),
+		);
 		let mainId = "";
 		for (const conv of payload.convs) {
 			conv.id = fix(conv.id);
-			if (conv.parentId) conv.parentId = fix(conv.parentId);
+			conv.parentId = parentDisplayIds.get(conv);
 			if (!conv.isSubagent && !mainId) {
 				mainId = conv.id;
 				// 过户是用户显式动作：这条对话必须在某一页看得见。`listed` 一旦置位就进本页的
@@ -13270,7 +13363,7 @@ export class ClientSession {
 		const visibleParents = new Set(
 			[...this.convs.values()]
 				.filter((conv) => conv.listed)
-				.map((conv) => conv.parentId)
+				.map((conv) => this.localParentId(conv))
 				.filter(Boolean),
 		);
 		for (const conv of this.convs.values()) {
@@ -13312,7 +13405,7 @@ export class ClientSession {
 					const pq = this.getPendingQuestionForConv(conv.id);
 					return pq ? { hasQuestion: true as const, questionId: pq.id, questionTitle: pq.title } : {};
 				})(),
-				parentId: conv.parentId,
+				parentId: this.localParentId(conv),
 				model: conv.session.model
 					? `${conv.session.model.provider}/${conv.session.model.id}`
 					: (conv.subagentTemplate?.model ?? undefined),
@@ -14072,10 +14165,14 @@ export class ClientSession {
 			}
 		};
 		const descendants = collectSubagentDescendantIds(
-			[...this.convs.values()].map((c) => ({ id: c.id, parentId: c.parentId, isSubagent: c.isSubagent })),
-			id,
+			[...this.convs.values()].map((c) => ({
+				id: conversationIdentity(c),
+				parentId: this.parentExecutionKey(c),
+				isSubagent: c.isSubagent,
+			})),
+			conversationIdentity(conv),
 		)
-			.map((did) => this.convs.get(did))
+			.map((did) => this.resolveExecution(did)?.conv)
 			.filter((c): c is Conversation => !!c);
 		if (force) {
 			await this.forceDismissConversation(conv, descendants, isStreaming);
@@ -14201,7 +14298,7 @@ export class ClientSession {
 				return;
 			}
 		}
-		this.removeConversation(id);
+		if (this.convs.get(conv.id) === conv && conv.id !== this.activeId) this.removeConversation(conv.id);
 		this.emitConversations();
 		this.flushSnapshot();
 	}
@@ -14233,7 +14330,7 @@ export class ClientSession {
 			if (this.convs.get(d.id) !== d) continue;
 			if (isStreaming(d)) {
 				try {
-					await this.subagentHost.stopSubagent(d.id);
+					await this.subagentHost.stopSubagent(conversationIdentity(d));
 					stopped++;
 				} catch {
 					// best effort — removal below disposes the runtime anyway.
@@ -14249,7 +14346,7 @@ export class ClientSession {
 		const deferred: Conversation[] = [];
 		for (const d of descendants) {
 			const cur = this.convs.get(d.id);
-			if (!cur || cur.id === conv.id) continue;
+			if (cur !== d || cur === conv) continue;
 			if (cur.id === this.activeId) {
 				deferred.push(cur);
 				continue;
@@ -14319,12 +14416,12 @@ export class ClientSession {
 			let d = 0;
 			let cur = this.convs.get(id);
 			const seen = new Set<string>([id]);
-			while (cur?.parentId) {
-				if (seen.has(cur.parentId)) break;
-				seen.add(cur.parentId);
+			while (cur) {
+				const parent = this.parentExecution(cur);
+				if (!parent || seen.has(conversationIdentity(parent.conv))) break;
+				seen.add(conversationIdentity(parent.conv));
 				d++;
-				cur = this.convs.get(cur.parentId);
-				if (!cur) break;
+				cur = parent.conv;
 			}
 			return d;
 		};
@@ -14336,12 +14433,12 @@ export class ClientSession {
 			if (conv.id === root) return true;
 			let cur: Conversation | undefined = conv;
 			const seen = new Set<string>();
-			while (cur?.parentId) {
-				if (cur.parentId === root) return true;
-				if (seen.has(cur.parentId)) return false;
-				seen.add(cur.parentId);
-				cur = this.convs.get(cur.parentId);
-				if (!cur) return false;
+			while (cur) {
+				const parent = this.parentExecution(cur);
+				if (!parent || seen.has(conversationIdentity(parent.conv))) return false;
+				if (parent.conv === this.convs.get(root)) return true;
+				seen.add(conversationIdentity(parent.conv));
+				cur = parent.conv;
 			}
 			return false;
 		};
@@ -14394,7 +14491,9 @@ export class ClientSession {
 			}
 			// Re-check live children: earlier removals in this same batch may
 			// have cleared the guard; still-running children block the parent.
-			const liveChild = [...this.convs.values()].some((child) => child.parentId === cur.id && isStreaming(child));
+			const liveChild = [...this.convs.values()].some(
+				(child) => this.parentExecution(child)?.conv === cur && isStreaming(child),
+			);
 			if (liveChild) {
 				skippedRunning++;
 				continue;

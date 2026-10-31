@@ -120,6 +120,14 @@ HTTP MCP 卡片的 OAuth 登录通过 `mcp_oauth_start {reqId,name,scope}` 发�
 | 新 kind（toggle/input/progress 等）        | 开关态/输入值/进度经 `host.ui.update` 刷新，progress 越界宿主钳制（语义见 `tests/unit/plugin-extensions.test.ts`）                                                                                                                                                                                                                         | `ui`                                       | 不认识的 kind 按缺省 action 画                                                                                                                                                                                                                      |
 | messageWidget（plugin-fence 消息级挂件）   | 在指定消息下挂小部件（renderer 的消息级形态，不共享 React 实例）                                                                                                                                                                                                                                                                           | `ui`                                       | 不挂载（消息原文不受影响）                                                                                                                                                                                                                          |
 
+### 外部通道会话重置
+
+微信、QQ、Telegram、Discord、Slack、Matrix、飞书、钉钉、企业微信、WhatsApp 和 iMessage 的 `/new`、`/clear`、`/reset` 共用各通道自己的会话切换流程。命令词支持大小写和全角形式；参数原文保留，重置命令后的提示词直接进入新会话，不再次作为命令解析。已有数字快捷方式使用同一流程。
+
+切换上下文必须同时轮换 `accountId` 中的会话代次并移除旧 `conversationId`，仅删除本地映射不能保证宿主创建空白会话。微信、QQ 的显式新建还须脱离旧网页投递绑定。工作区（`/cwd`、`/workspace`）、模型和思考强度的成功修改同样切换上下文；无参数查询保留当前上下文。
+
+下载、排队和 `host.chat` 请求持有启动时的代次。重置后的迟到回执、结束事件和异步设置验证不得覆盖新会话状态；迟到的旧运行按真实 `runId` 中止。运行中不能切换的通道必须明确提示先停止，不能回报重置成功。历史记录保留，中止失败须告知用户。回归见 `tests/unit/channel-plugins.test.ts` 和各通道的行为、重置测试。
+
 ### 宿主设施（plugin-facilities.ts）
 
 | 设施         | 说明                                                                 |

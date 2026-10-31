@@ -104,7 +104,7 @@ for (const channel of channels) {
 			expect(host.abortRun).toHaveBeenCalledWith("run");
 		});
 
-		for (const command of ["/new", "/clear"]) {
+		for (const command of ["/new", "/clear", "/reset", "／NEW", "/ClEaR"]) {
 			it(`${command} changes the daemon account so history really resets`, async () => {
 				const { bridge, host } = setup();
 				await channel.inbound(bridge, "first", "1");

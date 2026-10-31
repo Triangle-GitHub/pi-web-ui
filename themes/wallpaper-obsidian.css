@@ -5,6 +5,12 @@
  * 纯粹深邃的黑曜石质感、冷白银辉高光，专配水墨、武士、冷色调、极简黑白艺术壁纸。
  */
 :root {
+	--switch-bg-off: #424754;
+	--switch-border-off: #8791a3;
+	--switch-knob: #ffffff;
+	--switch-bg-on: #e2e8f0;
+	--switch-border-on: #e2e8f0;
+	--switch-knob-on: #1a1a1a;
 	color-scheme: dark;
 	--bg: #050507;
 	--bg-elev: #0c0d11;
