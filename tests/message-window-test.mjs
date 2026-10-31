@@ -237,13 +237,16 @@ check("set_settings 能关回去", settings?.reversePagination === false, `value
 // ── 7. 自描述翻页：切回长会话后携带 conversationId + beforeId 精准定位 ─────
 const pagesLenBefore7 = earlierPages.length;
 ws.send(JSON.stringify({ type: "switch_session", path: seedFile }));
-for (let i = 0; i < 100 && state?.historyStart !== 30; i++) await sleep(50);
+for (let i = 0; i < 100 && (state?.conversationId === beforeNew || state?.messages?.length !== TOTAL); i++)
+	await sleep(50);
+check("切回会话保留已展开的历史窗口", state?.historyStart === 0 && state?.messages?.length === TOTAL);
 const seedConvId = state?.conversationId;
-const firstMsgId = state?.messages?.[0]?.id;
+const firstMsgId = state?.messages?.[30 - state.historyStart]?.id;
 ws.send(
 	JSON.stringify({
 		type: "load_earlier_messages",
 		conversationId: seedConvId,
+		historyGeneration: state.historyGeneration,
 		beforeId: firstMsgId,
 		before: 30,
 		count: 5,
@@ -261,6 +264,27 @@ check(
 	page7?.messages?.at(-1)?.content?.[0]?.text === "assistant message 30",
 	page7?.messages?.at(-1)?.content?.[0]?.text,
 );
+
+const pagesBeforeInvalid = earlierPages.length;
+ws.send(
+	JSON.stringify({
+		type: "load_earlier_messages",
+		conversationId: seedConvId,
+		historyGeneration: state.historyGeneration,
+		beforeId: "missing-anchor",
+		before: 30,
+		count: 5,
+	}),
+);
+for (let i = 0; i < 100 && earlierPages.length === pagesBeforeInvalid; i++) await sleep(50);
+const invalidPage = earlierPages.at(-1);
+check(
+	"无效锚点要求重新同步",
+	earlierPages.length > pagesBeforeInvalid &&
+		invalidPage?.resyncRequired === true &&
+		invalidPage?.messages?.length === 0,
+);
+check("无效锚点保留已展开窗口", invalidPage?.historyStart === 0);
 
 try {
 	ws.close();

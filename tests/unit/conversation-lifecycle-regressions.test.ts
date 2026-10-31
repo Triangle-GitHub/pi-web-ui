@@ -321,14 +321,16 @@ describe("toolOverrideSpecs approval ownership after takeover", () => {
 					getExecutionIdentity: () => undefined,
 					acquireExecution: () => () => {},
 				},
-				bashKills: new Set<AbortController>(),
 			});
 			// Object.create does not initialize #lateGuard; no plugin hooks are needed here.
 			Object.defineProperty(owner, "lateToolGuard", { value: undefined });
 			Object.defineProperty(owner, "roots", { value: [a.cwd] });
 		}
 		const execute = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "executed" }] });
-		const specs = source.toolOverrideSpecs(a.id, a.cwd, undefined, { session: a.session });
+		// Runtime tools are constructed before the Conversation and session anchor are registered.
+		const anchor: { session?: typeof a.session } = {};
+		source.convs.delete(a.id);
+		const specs = source.toolOverrideSpecs(a.id, a.cwd, undefined, anchor);
 		const tool = specs
 			.find((spec: any) => spec.name === toolName)
 			.composeWith({
@@ -338,6 +340,9 @@ describe("toolOverrideSpecs approval ownership after takeover", () => {
 				parameters: { type: "object", properties: {} },
 				execute,
 			});
+		expect(a.bashKills).toBeUndefined();
+		anchor.session = a.session;
+		source.convs.set(a.id, a);
 		const params = { command: "echo lifecycle", path: "sample.txt", content: "new", oldText: "old", newText: "new" };
 		const lookup = source.findConversationHome as ReturnType<
 			typeof vi.fn<NonNullable<ClientSession["findConversationHome"]>>
@@ -410,6 +415,33 @@ describe("toolOverrideSpecs approval ownership after takeover", () => {
 			expect(execute).toHaveBeenCalledTimes(2);
 		},
 	);
+
+	it("cancels an extension bash already running before takeover, then releases its registration", async () => {
+		const { source, destination, a, tool, params, execute, transfer } = fixture("bash");
+		a.permissionPreset = "danger-full-access";
+		source.approvalRules.list = () => [];
+		destination.approvalRules.list = () => [];
+		a.session.sendUserMessage = vi.fn().mockResolvedValue(undefined);
+		let signal!: AbortSignal;
+		execute.mockImplementation((_id: string, _params: unknown, cancellation: AbortSignal) => {
+			signal = cancellation;
+			return new Promise((_resolve, reject) => {
+				cancellation.addEventListener("abort", () => reject(new Error("cancelled")), { once: true });
+			});
+		});
+		const running = tool.execute("running", params, undefined, undefined, {} as any);
+		const stopped = expect(running).rejects.toThrow("cancelled");
+		await vi.waitFor(() => expect(execute).toHaveBeenCalledOnce());
+		expect(a.bashKills.size).toBe(1);
+		transfer();
+		await source.abortBash("A");
+		expect(signal.aborted).toBe(false);
+		await destination.abortBash(a.id);
+		await stopped;
+		expect(signal.aborted).toBe(true);
+		expect(a.bashKills.size).toBe(0);
+		expect(a.session.sendUserMessage).toHaveBeenCalledOnce();
+	});
 
 	it("applies the destination conversation's plan mode rather than the old owner's permissions", async () => {
 		const { source, destination, a, tool, params, execute, transfer } = fixture("write");

@@ -2535,7 +2535,10 @@ export function App() {
 												liveOutputs={chat.liveOutputs}
 												toolStatuses={chat.toolStatuses}
 												onEdit={onEditMessage}
-												onKillBash={() => send({ type: "abort_bash" })}
+												onKillBash={() => {
+													const conversationId = chat.state?.conversationId;
+													if (conversationId && !chat.transition) send({ type: "abort_bash", conversationId });
+												}}
 												onRetry={() => {
 													// 重试沿用当前模型续跑上一轮请求，同样算一次模型使用（下拉按次数排序）。
 													if (send({ type: "retry_last" })) {

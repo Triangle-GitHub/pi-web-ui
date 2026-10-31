@@ -1510,7 +1510,8 @@ export interface DispatchSession {
 	 *  DSH sessions don't implement it — dispatch uses `?.` so it's skipped there). */
 	saveDraft?(sessionId: string, text: string, ts: number): void;
 	abort(): Promise<void>;
-	abortBash(): Promise<void>;
+	/** 停止某个对话正在跑的 bash 命令；省略 id = 当前对话（DSH / claude 引擎忽略该参数）。 */
+	abortBash(conversationId?: string): Promise<void>;
 	/** 手动重试上次失败的模型调用（自动重试次数用完、已停止标红后）。 */
 	retryLast(): Promise<void>;
 	killBackgroundServer(port?: number, taskId?: string): Promise<boolean>;
@@ -3282,7 +3283,7 @@ wss.on("connection", (ws) => {
 					void cs.abort();
 					break;
 				case "abort_bash":
-					void cs.abortBash();
+					void cs.abortBash(msg.conversationId);
 					break;
 				case "retry_last":
 					void cs.retryLast();

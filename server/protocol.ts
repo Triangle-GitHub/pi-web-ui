@@ -812,8 +812,9 @@ export type ClientMessage =
 	| { type: "list_commands" }
 	| { type: "save_commands"; commands: CommandDef[] }
 	| { type: "abort" }
-	/** Kill only the running bash command(s) — the agent run itself continues. */
-	| { type: "abort_bash" }
+	/** Kill only the running bash command(s) — the agent run itself continues.
+	 *  `conversationId` scopes it to one conversation (omitted = the active one). */
+	| { type: "abort_bash"; conversationId?: string }
 	/** Manually retry the last failed model call after the auto-retry budget
 	 *  (settings retryMaxAttempts) ran out: the turn ended with a red error
 	 *  and is idle. Server re-triggers one LLM turn without adding a new user
