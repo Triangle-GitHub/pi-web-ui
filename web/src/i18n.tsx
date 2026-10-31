@@ -124,6 +124,7 @@ export const zh = {
 	contextUsed: "已用空间",
 	contextFree: "剩余空间",
 	contextBreakdownUnavailable: "当前引擎仅提供总用量。",
+	contextBreakdownEstimate: "分类按会话内容估算并校准到总用量；请求中的去重、工具结果外置或扩展转换可能改变实际占比。",
 	contextUsageUnavailable: "暂无上下文用量数据。",
 	contextSoftCap: "压缩软上限：{cap} · 模型容量：{max}",
 	cumulativeCost: "累计成本",
@@ -2790,6 +2791,8 @@ export const en: Record<keyof typeof zh, string> = {
 	contextUsed: "Used space",
 	contextFree: "Free space",
 	contextBreakdownUnavailable: "This engine only reports total usage.",
+	contextBreakdownEstimate:
+		"Categories estimate conversation content and are adjusted to total usage. Request deduplication, externalized tool results or extension changes can alter the actual proportions.",
 	contextUsageUnavailable: "Context usage is not available yet.",
 	contextSoftCap: "Compaction soft cap: {cap} · Model capacity: {max}",
 	cumulativeCost: "Cumulative cost",

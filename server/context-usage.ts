@@ -39,7 +39,11 @@ export function estimateBaseContext(
 	return { tokens: prompt + schema, weights };
 }
 
-/** Reads the live model context, so compacted/branched-away transcript entries are not counted. */
+/**
+ * Estimate proportions from live session messages, excluding compacted/branched-away entries.
+ * These are transcript weights, not an exact breakdown of a provider request: request-local
+ * deduplication, evidence externalization and extensions can change the submitted messages.
+ */
 export function estimateContextWeights(
 	base: ContextWeights,
 	messages: unknown[],
@@ -49,6 +53,8 @@ export function estimateContextWeights(
 	const weights = { ...base };
 	const add = (value: unknown, settled = false) => {
 		if (!value || typeof value !== "object") return;
+		// A former prefix may become the mutable tail after truncation; discard its old estimate.
+		if (!settled) cache?.delete(value);
 		const cached = settled ? cache?.get(value) : undefined;
 		if (cached) {
 			for (const category of Object.keys(weights) as ContextCategory[]) weights[category] += cached[category];
@@ -72,12 +78,15 @@ export function estimateContextWeights(
 		if (settled) cache?.set(value, contribution);
 		for (const category of Object.keys(weights) as ContextCategory[]) weights[category] += contribution[category];
 	};
-	for (const message of messages) add(message, message !== streamingMessage);
+	// Agent-core appends message_end and clears streamingMessage before AgentSession awaits
+	// extensions, which may replace the final message in place. Cache only the earlier prefix.
+	const lastMessage = messages[messages.length - 1];
+	for (const message of messages) add(message, message !== streamingMessage && message !== lastMessage);
 	if (streamingMessage && !messages.includes(streamingMessage)) add(streamingMessage);
 	return weights;
 }
 
-/** Keep the provider's total authoritative; allocate integer tokens without rounding drift. */
+/** Keep the provider's total authoritative; integer allocation does not make the estimated proportions exact. */
 export function reconcileContextCategories(weights: ContextWeights, usedTokens: number): ContextCategoryUsage[] {
 	const total = Math.max(0, Math.round(Number.isFinite(usedTokens) ? usedTokens : 0));
 	const entries = (Object.keys(weights) as ContextCategory[]).map((category) => ({

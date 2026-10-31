@@ -121,6 +121,15 @@ describe("context usage popover", () => {
 		expect(panel()?.textContent).toContain("压缩软上限：200K · 模型容量：1M");
 	});
 
+	it("explains that request transformations can change estimated category proportions", () => {
+		click(render());
+		expect(panel()?.textContent).toContain("分类按会话内容估算并校准到总用量");
+		expect(panel()?.textContent).toContain("去重、工具结果外置或扩展转换");
+		render({ ...usage, categories: undefined });
+		expect(panel()?.textContent).not.toContain("分类按会话内容估算");
+		expect(panel()?.textContent).toContain("当前引擎仅提供总用量");
+	});
+
 	it("handles engines that provide only a total without inventing a breakdown", () => {
 		click(render({ ...usage, categories: undefined }));
 		expect(panel()?.textContent).toContain("当前引擎仅提供总用量");

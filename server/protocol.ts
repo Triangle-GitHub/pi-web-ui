@@ -373,7 +373,9 @@ export interface UiState {
 			estimated?: boolean;
 			/** 当前模型的生效压缩软上限（tokens；null = 关闭，底栏不画标记线）。 */
 			softCap?: number | null;
-			/** Estimated categories, reconciled to tokens; absent when the engine supplies only a total. */
+			/** Conversation-content estimates reconciled to tokens, not a provider request breakdown.
+			 * Request deduplication, evidence externalization and extensions can change proportions.
+			 * Absent when the engine supplies only a total. */
 			categories?: ContextCategoryUsage[];
 		};
 	};

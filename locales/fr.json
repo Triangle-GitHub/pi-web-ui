@@ -104,6 +104,7 @@
 		"contextUsed": "Used space",
 		"contextFree": "Free space",
 		"contextBreakdownUnavailable": "This engine only reports total usage.",
+		"contextBreakdownEstimate": "Categories estimate conversation content and are adjusted to total usage. Request deduplication, externalized tool results or extension changes can alter the actual proportions.",
 		"contextUsageUnavailable": "Context usage is not available yet.",
 		"contextSoftCap": "Compaction soft cap: {cap} · Model capacity: {max}",
 		"cumulativeCost": "Coût cumulé",

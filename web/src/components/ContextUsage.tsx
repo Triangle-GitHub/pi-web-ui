@@ -128,7 +128,9 @@ export function ContextUsage({
 										</span>
 									</li>
 								</ul>
-								{!hasCategories && <p className="context-usage-note">{t("contextBreakdownUnavailable")}</p>}
+								<p className="context-usage-note">
+									{t(hasCategories ? "contextBreakdownEstimate" : "contextBreakdownUnavailable")}
+								</p>
 								{cap > 0 && (
 									<p className="context-usage-note">
 										{t("contextSoftCap", { cap: formatTokens(cap), max: formatTokens(contextWindow) })}
