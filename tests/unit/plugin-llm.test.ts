@@ -87,6 +87,23 @@ describe("host.llm.complete 门控（permissions llm 族 + llmProvider 注入）
 		const r = await h.llm.complete({ prompt: "hi" });
 		expect(r).toEqual({ ok: false, error: "宿主未提供 LLM 直调（llmProvider 未接入）" });
 	});
+	it("advertises image support and forwards images and the host-only signal unchanged", async () => {
+		makePlugin("vision", { permissions: ["llm"] });
+		const h = await hostOf("vision");
+		const req = {
+			prompt: "describe",
+			images: [{ data: "iVBORw0KGgo=", mimeType: "image/png" }],
+			signal: new AbortController().signal,
+		};
+		let received: unknown;
+		mgr.llmProvider = async (_id, input) => {
+			received = input;
+			return { ok: true, text: "seen" };
+		};
+		expect(h.llm.supportsImages).toBe(true);
+		expect(await h.llm.complete(req)).toMatchObject({ ok: true });
+		expect(received).toBe(req);
+	});
 	it("注入后直通 provider 回执；provider 抛错转 {ok:false}", async () => {
 		makePlugin("yes", { permissions: ["llm"] });
 		const h = await hostOf("yes");

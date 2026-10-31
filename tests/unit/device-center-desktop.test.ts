@@ -607,8 +607,7 @@ describe("device desktop native route", () => {
 				if (response.status() >= 400) errors.push(response.url() + ":" + response.status());
 			});
 			await page.goto(f.url + "/nested/desktop", { timeout: 5000 });
-			expect(await page.locator("#viewonly").isChecked()).toBe(true);
-			await page.locator("#connect").click();
+			expect(await page.locator("#viewonly").isChecked()).toBe(false);
 			await vi.waitFor(() => expect(f.sessions).toHaveLength(1));
 			f.sessions[0].options.onFrame(tinyImage);
 			await page.waitForFunction(
@@ -626,7 +625,7 @@ describe("device desktop native route", () => {
 				await page.screenshot({ path: "artifacts/device-center/desktop-native.png", fullPage: true });
 			}
 			expect(requests[0]).toContain("/nested/desktop-ws");
-			expect(f.sessions[0].options.readOnly).toBe(true);
+			expect(f.sessions[0].options.readOnly).toBe(false);
 			expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
 			await page.locator("#disconnect").click();
 			await vi.waitFor(() => expect(f.sessions[0].close).toHaveBeenCalledTimes(1));

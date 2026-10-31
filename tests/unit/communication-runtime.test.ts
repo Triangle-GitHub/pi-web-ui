@@ -71,6 +71,93 @@ describe("ClientSession communication runtime", () => {
 		expect(target.session.sendUserMessage.mock.calls[0][0]).toContain("Review output");
 		expect(a.communicationPending(target)).toBe(false);
 	});
+	it("routes independent-checkout descendants through their registered project after takeover", async () => {
+		const a = holder("a"),
+			b = holder("b"),
+			c = holder("c");
+		const root = endpoint(a, "root"),
+			child = endpoint(b, "child", root.id),
+			grandchild = endpoint(c, "grandchild", child.id),
+			peer = endpoint(a, "peer");
+		child.cwd = "/review-checkout";
+		grandchild.cwd = "/nested-checkout";
+		a.convs.delete(root.id);
+		c.convs.set(root.id, root);
+		await expect(b.communicate(child.id, "send", { to: "parent", message: "review" })).resolves.toMatchObject({
+			status: "queued",
+		});
+		await expect(c.communicate(root.id, "send", { to: child.id, message: "continue" })).resolves.toMatchObject({
+			status: "queued",
+		});
+		await expect(c.communicate(grandchild.id, "send", { to: "root", message: "nested review" })).resolves.toMatchObject(
+			{ status: "queued" },
+		);
+		await expect(c.communicate(grandchild.id, "send", { to: peer.id, message: "same project" })).resolves.toMatchObject(
+			{ status: "queued" },
+		);
+		expect(root.session.sendUserMessage).toHaveBeenCalledTimes(2);
+		expect(child.session.sendUserMessage).toHaveBeenCalledOnce();
+	});
+	it("does not authorize unrelated projects or orphaned descendants by checkout similarity", async () => {
+		const a = holder("a"),
+			b = holder("b");
+		const root = endpoint(a, "root"),
+			child = endpoint(b, "child", root.id),
+			other = endpoint(b, "other");
+		child.cwd = "/review-checkout";
+		other.cwd = child.cwd;
+		await expect(b.communicate(other.id, "send", { to: child.id, message: "unrelated" })).rejects.toThrow(
+			"Cross-project",
+		);
+		a.convs.delete(root.id);
+		const peer = endpoint(a, "peer");
+		await expect(b.communicate(child.id, "send", { to: peer.id, message: "missing parent" })).rejects.toThrow(
+			"Cross-project",
+		);
+		expect(child.session.sendUserMessage).not.toHaveBeenCalled();
+		expect(peer.session.sendUserMessage).not.toHaveBeenCalled();
+	});
+	it("retains Bot and sandbox boundaries for independent-checkout children", async () => {
+		const a = holder("a"),
+			b = holder("b");
+		const root = endpoint(a, "root"),
+			child = endpoint(b, "child", root.id);
+		child.cwd = "/review-checkout";
+		b.botExecution = {};
+		await expect(b.communicate(child.id, "send", { to: "parent", message: "blocked" })).rejects.toThrow(
+			"Bot execution boundaries",
+		);
+		b.botExecution = undefined;
+		b.sandboxes.getExecutionIdentity = () => ({ id: "sandbox" });
+		await expect(b.communicate(child.id, "send", { to: "parent", message: "blocked" })).rejects.toThrow(
+			"sandbox boundaries",
+		);
+		expect(root.session.sendUserMessage).not.toHaveBeenCalled();
+	});
+	it("normalizes Windows project paths before the coordinator compares them", async () => {
+		const a = holder("a"),
+			b = holder("b");
+		const from = endpoint(a, "from"),
+			target = endpoint(b, "target");
+		from.cwd = "E:/Pi-Web-UI";
+		target.cwd = "e:\\pi-web-ui";
+		await expect(a.communicate(from.id, "send", { to: target.id, message: "same path" })).resolves.toMatchObject({
+			status: "queued",
+		});
+	});
+	it("maps descendants of a registered worktree back to its main project", async () => {
+		const a = holder("a"),
+			b = holder("b");
+		const root = endpoint(a, "root"),
+			child = endpoint(b, "child", root.id),
+			peer = endpoint(a, "peer");
+		root.cwd = "/managed-worktree";
+		root.subagentWorktree = { worktreePath: root.cwd, mainRepoPath: peer.cwd };
+		child.cwd = "/independent-checkout";
+		await expect(b.communicate(child.id, "send", { to: peer.id, message: "review" })).resolves.toMatchObject({
+			status: "queued",
+		});
+	});
 	it("keeps queued inbox pending until read, and read consumes it once", async () => {
 		const a = holder("a"),
 			b = holder("b");

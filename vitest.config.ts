@@ -1,3 +1,4 @@
+import "./tests/lib/hide-windows.mjs";
 import { defineConfig } from "vitest/config";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";

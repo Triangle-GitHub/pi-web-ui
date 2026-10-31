@@ -121,7 +121,7 @@ jpeg.writeUInt16BE(0xffd8, 0);
 jpeg.writeUInt16BE(0xffd9, jpeg.length - 2);
 
 describe("desktop page macOS permission guidance", () => {
-	async function page(os: string, language: string) {
+	async function page(os: string, language: string, enabled = true) {
 		const dom = new JSDOM(desktopPage(), { url: "http://localhost/desktop", runScripts: "outside-only" });
 		cleanups.push(() => dom.window.close());
 		const { window } = dom;
@@ -134,25 +134,34 @@ describe("desktop page macOS permission guidance", () => {
 			readyState = 1;
 			onmessage: ((event: { data: string }) => void) | null = null;
 			close = vi.fn();
-			constructor() {
+			constructor(public url: string) {
 				sockets.push(this);
 			}
 		}
-		const fetch = vi.fn(async () => ({
-			ok: true,
-			json: async () => ({
-				enabled: true,
-				available: true,
-				environmentEnabled: false,
-				supported: true,
-				os,
-			}),
-		}));
+		const fetch = vi.fn(async (_url: unknown, options?: { body?: string }) => {
+			if (options?.body) enabled = JSON.parse(options.body).enabled;
+			return {
+				ok: true,
+				json: async () => ({
+					enabled,
+					available: true,
+					environmentEnabled: false,
+					supported: true,
+					os,
+				}),
+			};
+		});
 		Object.assign(window, { fetch, WebSocket: Socket });
 		const script = window.document.querySelector('script[type="module"]')!.textContent!;
 		window.eval(script);
 		const connect = window.document.getElementById("connect") as HTMLButtonElement;
-		await vi.waitFor(() => expect(connect.disabled).toBe(false));
+		await vi.waitFor(() => expect((window.document.getElementById("check") as HTMLButtonElement).disabled).toBe(false));
+		expect(sockets).toHaveLength(enabled ? 1 : 0);
+		if (enabled) expect(String(sockets[0].url)).toContain("viewOnly=0");
+		expect(connect.disabled).toBe(true);
+		expect((window.document.getElementById("viewonly") as HTMLInputElement).checked).toBe(false);
+		expect((window.document.getElementById("settings") as HTMLDetailsElement).open).toBe(!enabled);
+		expect((window.document.getElementById("text-panel") as HTMLDetailsElement).open).toBe(false);
 		return { window, sockets, connect, fetch, guide: window.document.getElementById("mac-permission-guide")! };
 	}
 
@@ -197,7 +206,7 @@ describe("desktop page macOS permission guidance", () => {
 			],
 			["Unrelated backend error", "Unrelated backend error"],
 		]) {
-			p.connect.click();
+			if (!p.connect.disabled) p.connect.click();
 			const socket = p.sockets.at(-1)!;
 			socket.onmessage({
 				data: JSON.stringify({
@@ -213,6 +222,18 @@ describe("desktop page macOS permission guidance", () => {
 		}
 		expect(p.sockets).toHaveLength(3);
 		expect(p.fetch).toHaveBeenCalledOnce();
+	});
+
+	it("waits for explicit enable and does not reconnect after a manual disconnect and status refresh", async () => {
+		const p = await page("linux", "en", false);
+		(p.window.document.getElementById("enable") as HTMLButtonElement).click();
+		await vi.waitFor(() => expect(p.sockets).toHaveLength(1));
+		expect(String(p.sockets[0].url)).toContain("viewOnly=0");
+		(p.window.document.getElementById("disconnect") as HTMLButtonElement).click();
+		expect(p.sockets[0].close).toHaveBeenCalledOnce();
+		(p.window.document.getElementById("check") as HTMLButtonElement).click();
+		await vi.waitFor(() => expect(p.fetch).toHaveBeenCalledTimes(4));
+		expect(p.sockets).toHaveLength(1);
 	});
 
 	it.each(["win32", "linux"])("hides Mac guidance on %s", async (os) => {
@@ -236,8 +257,8 @@ describe("native desktop through device relay and connector", () => {
 			const page = await browser.newPage({ extraHTTPHeaders: { authorization: "Bearer local-secret" } });
 			await page.goto(`http://127.0.0.1:${f.localPort}/desktop`);
 			expect(await page.locator("#text").getAttribute("maxlength")).toBe("2048");
-			await page.locator("#viewonly").uncheck();
-			await page.locator("#connect").click();
+			expect(await page.locator("#viewonly").isChecked()).toBe(false);
+			expect(await page.locator("#settings").getAttribute("open")).toBeNull();
 			await vi.waitFor(() => expect(f.sessions).toHaveLength(1));
 			const session = f.sessions[0];
 			expect(session.options.readOnly).toBe(false);
@@ -259,7 +280,22 @@ describe("native desktop through device relay and connector", () => {
 			);
 			expect(session.input.mock.calls.find(([event]) => event.type === "pointer")![0]).not.toHaveProperty("button", -1);
 			expect(session.close).not.toHaveBeenCalled();
+			for (const viewport of [
+				{ width: 1166, height: 700 },
+				{ width: 390, height: 740 },
+			]) {
+				await page.setViewportSize(viewport);
+				const toolbar = await page.locator("#toolbar").boundingBox();
+				const screen = await page.locator("#screen").boundingBox();
+				expect(toolbar!.height).toBeLessThanOrEqual(48);
+				expect(screen!.height).toBeGreaterThanOrEqual(viewport.height - 48);
+			}
+			await page.locator("#viewonly").check();
+			await vi.waitFor(() => expect(f.sessions).toHaveLength(2));
+			expect(f.sessions[1].options.readOnly).toBe(true);
+			await vi.waitFor(() => expect(session.close).toHaveBeenCalledTimes(1));
 			await page.locator("#disconnect").click();
+			await vi.waitFor(() => expect(f.sessions[1].close).toHaveBeenCalledTimes(1));
 			await vi.waitFor(() => expect(session.close).toHaveBeenCalledTimes(1));
 		},
 		30_000,

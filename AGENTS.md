@@ -68,6 +68,10 @@ pi-web-ui 是 pi 编码智能体（`@earendil-works/pi-coding-agent` SDK）的 W
 | 计划模式              | `server/plan-mode.ts`              | 目标条展开行「只规划」触发；动态剔除写工具并施加硬闸门拦截；禁倾倒大段代码；必须通过计划看板「开始实施」退出；回归 `plan-mode-test`。                                                                                                              |
 | 审查者模式            | `server/delegate-mode.ts`          | 开启后主会话只审不干，Prompt 自动投递常驻执行对话；硬闸门拦截一切写类与派发工具；计划模式优先级高于委派；回归 `delegate-mode-test`。                                                                                                               |
 
+### 工作树入口
+
+Git 工作树使用顶栏 `host:worktrees` 图标、数量与改动状态点，点击进入 `worktrees` 页内列表，禁止恢复自动弹窗或常驻横幅。完整分支名与路径换行，切换等待服务端确认后返回聊天，移除收在管理详情并保留确认及非强制删除。刷新独立于视图挂载。详见 `docs/architecture-core.md`。
+
 ### 对话通信
 
 `communicate` 统一同项目的 send/request/reply/escalate/read，父/root 别名由服务端解析；发送者绑定实际执行会话，跨 await/过户按稳定对象查持有方。通信内容不扩张权限，项目/沙盒/Bot 边界必须在执行前校验。`conversation complete` 登记任务完成，manual 子代理仍有下级/问卷/通信时不得提前通知或结算工作树。旧交接与请示入口复用统一服务。详见 `docs/architecture-core.md`。

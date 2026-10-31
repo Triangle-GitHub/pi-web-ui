@@ -58,6 +58,25 @@ function fileCard(
 }
 
 describe("collectQuestionAttachments", () => {
+	it("restores attachment-store images on the first question and its file cards", () => {
+		const url = `/api/attachment/${"a".repeat(64)}`;
+		const messages = [
+			{ ...user("u1", "question"), content: [{ type: "image", dataUrl: url, mimeType: "image/png" }] },
+			{
+				id: "f1",
+				role: "custom",
+				customType: "file",
+				content: [{ type: "image", dataUrl: url, mimeType: "image/png" }],
+				details: { name: "pasted.png" },
+			},
+		];
+		expect(collectQuestionAttachments(messages).get("u1")).toEqual([
+			{ path: "", imageUrl: url, mimeType: "image/png", name: "image" },
+		]);
+		expect(collectQuestionAttachments([...messages.slice(1), user("u2", "question")]).get("u2")).toEqual([
+			{ path: "", imageUrl: url, mimeType: "image/png", name: "pasted.png" },
+		]);
+	});
 	it("restores a canvas id and title without downgrading it to a file", () => {
 		const map = collectQuestionAttachments([
 			user("u1", "inspect"),

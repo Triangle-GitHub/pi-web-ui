@@ -9,6 +9,7 @@
  */
 :root {
 	color-scheme: light;
+	--flow-shadow: rgba(17, 24, 39, 0.22);
 	--bg: #ffffff;
 	--bg-elev: #f8f9fa;
 	--bg-elev2: #f1f3f5;
@@ -18,6 +19,7 @@
 	--text-dim: #4b5563;
 	--text-faint: #6b7280;
 	--accent: #111827;
+	--accent-contrast: #ffffff;
 	--accent-soft: rgba(17, 24, 39, 0.08);
 	--green: #047d58;
 	--on-green: #ffffff;

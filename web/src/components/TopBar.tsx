@@ -317,6 +317,7 @@ export function TopBar({
 	const FALLBACK_TOPBAR_IDS = [
 		"host:history",
 		"host:brand",
+		"host:worktrees",
 		"host:engine",
 		"host:open-project",
 		"host:chat",
@@ -407,6 +408,9 @@ export function TopBar({
 				return true;
 			case "host:zen-mode":
 				onToggleZenMode?.();
+				return true;
+			case "host:worktrees":
+				onViewChange("worktrees");
 				return true;
 			case "host:device-center":
 				onViewChange("devices");
@@ -1010,6 +1014,17 @@ export function TopBar({
 	 */
 	const hostNodes: Record<string, ReactNode> = {
 		"host:brand": <BrandDeviceMenu />,
+		"host:worktrees": chat.state?.worktree ? (
+			<button
+				type="button"
+				className={`tb-tab${view === "worktrees" ? " active" : ""}`}
+				title={t("worktreeViewTitle")}
+				onClick={() => onViewChange("worktrees")}
+			>
+				<FiGitBranch />
+				<span>{t("worktreeViewTitle")}</span>
+			</button>
+		) : null,
 		// 打开项目：切整个工作区（set_cwd），与视图无关 —— 终端 / Git / 插件视图里同样常驻可点。
 		"host:open-project": (
 			<button
@@ -1518,6 +1533,7 @@ export function TopBar({
 	for (const it of topEntries) {
 		if (it.entry?.hidden) continue; // uiPrimary 已滤过 hidden；这里只防脏数据（插件 arrange 会改）
 		if (isTabGatedOff(it.id)) continue;
+		if (it.id === "host:worktrees" && !chat.state?.worktree) continue;
 		let node: ReactNode = null;
 		if (it.entry) {
 			node = (
@@ -1654,7 +1670,7 @@ export function TopBar({
 			flow.clientWidth,
 			gap,
 			0,
-			REQUIRED_TOPBAR_ITEM_IDS,
+			new Set([...REQUIRED_TOPBAR_ITEM_IDS, "host:worktrees"]),
 		);
 		setDroppedIds((prev) => (prev.size === next.size && [...next].every((id) => prev.has(id)) ? prev : next));
 	};

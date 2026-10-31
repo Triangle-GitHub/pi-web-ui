@@ -38,7 +38,7 @@ import { EnginePicker } from "./EnginePicker";
 import { ContextUsage } from "./ContextUsage";
 import { formatTokens } from "../format-tokens";
 
-export type ViewName = "chat" | "terminal" | "git" | "canvas" | "devices" | `plugin:${string}`;
+export type ViewName = "chat" | "terminal" | "git" | "canvas" | "devices" | "worktrees" | `plugin:${string}`;
 
 export interface BarItemTheme {
 	id: string;
@@ -835,6 +835,28 @@ export function BarItem({
 			isTab = true;
 			onClick = () => onViewChange?.("terminal");
 			break;
+		case "host:worktrees": {
+			const worktree = chat.state?.worktree;
+			if (!worktree) return null;
+			const paths = new Set(worktree.linkedWorktrees.map((row) => row.path));
+			if (worktree.isLinkedWorktree) paths.add(worktree.currentPath);
+			iconNode = <FiGitBranch className="bar-item-icon" />;
+			labelText = named(t("worktreeViewTitle"));
+			extraClasses = "chip worktree-entry";
+			isActive = view === "worktrees";
+			isTab = true;
+			tipOverride = t("worktreeEntryTip", { count: paths.size });
+			badgeNode = (
+				<>
+					<span className="worktree-count bar-item-badge">{paths.size}</span>
+					{worktree.linkedWorktrees.some((row) => row.isDirty) && (
+						<span className="worktree-dirty-dot" aria-label={t("worktreeHasChanges")} />
+					)}
+				</>
+			);
+			onClick = () => onViewChange?.(view === "worktrees" ? "chat" : "worktrees");
+			break;
+		}
 		case "host:git":
 			iconNode = <FiGitBranch className="bar-item-icon" />;
 			labelText = named(t("scmTab"));
@@ -1044,7 +1066,9 @@ export function BarItem({
 			data-bar-item={id}
 		>
 			{iconNode}
-			<span className="bar-item-text">{labelText}</span>
+			{!(id === "host:worktrees" && bar === "top" && !entry.labelExplicit) && (
+				<span className="bar-item-text">{labelText}</span>
+			)}
 			{badgeNode}
 		</button>
 	);

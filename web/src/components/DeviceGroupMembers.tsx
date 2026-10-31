@@ -89,29 +89,31 @@ export function DeviceGroupMembers({ botIds, roomId }: { botIds: string[]; roomI
 										<FiAtSign aria-hidden />
 									</button>
 								)}
+								{member?.deviceId && data.deviceId && member.deviceId !== data.deviceId && (
+									<div className="dg-side-member-actions">
+										<button
+											type="button"
+											className="dg-side-toggle"
+											title={zh ? "远程桌面" : "Remote desktop"}
+											aria-label={zh ? "远程桌面" : "Remote desktop"}
+											disabled={busy || !member?.deviceId}
+											onClick={() => member && void open(member, true)}
+										>
+											<FiMonitor aria-hidden />
+										</button>
+										<button
+											type="button"
+											className="dg-side-toggle"
+											title={zh ? "访问设备" : "Open device"}
+											aria-label={zh ? "访问设备" : "Open device"}
+											disabled={busy || !member?.deviceId}
+											onClick={() => member && void open(member, false)}
+										>
+											<FiExternalLink aria-hidden />
+										</button>
+									</div>
+								)}
 							</div>
-							{member?.deviceId && data.deviceId && member.deviceId !== data.deviceId && (
-								<div className="dg-side-member-actions">
-									<button
-										type="button"
-										className="dc-button"
-										disabled={busy || !member?.deviceId}
-										onClick={() => member && void open(member, true)}
-									>
-										<FiMonitor aria-hidden />
-										{zh ? "远程桌面" : "Remote desktop"}
-									</button>
-									<button
-										type="button"
-										className="dc-button"
-										disabled={busy || !member?.deviceId}
-										onClick={() => member && void open(member, false)}
-									>
-										<FiExternalLink aria-hidden />
-										{zh ? "访问设备" : "Open device"}
-									</button>
-								</div>
-							)}
 						</div>
 					);
 				})}

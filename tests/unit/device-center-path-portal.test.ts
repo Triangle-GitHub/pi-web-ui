@@ -28,11 +28,11 @@ async function listen(server: Server) {
 	});
 	return (server.address() as { port: number }).port;
 }
-async function fixture() {
+async function fixture(deviceName?: string) {
 	const received: http.IncomingHttpHeaders[] = [];
 	const local = http.createServer((req, res) => {
 		received.push(req.headers);
-		if (req.url?.split("?")[0] === "/") {
+		if (["/", "/desktop"].includes(req.url?.split("?")[0] ?? "")) {
 			res.writeHead(200, {
 				"content-type": "text/html",
 				"set-cookie": "device=bad; Path=/",
@@ -108,6 +108,7 @@ async function fixture() {
 		authenticateDevice: (id, key) => id === "dev1" && key === "credential",
 		getAccount: (req) => (req.headers.cookie?.includes("hub=secret") ? "account" : null),
 		ownsDevice: (account, id) => account === "account" && id === "dev1",
+		getDeviceName: () => deviceName,
 	});
 	cleanup.push(() => relay.close());
 	const connector = createDeviceConnector({
@@ -136,11 +137,19 @@ async function fixture() {
 }
 
 describe("single-port device path portal", () => {
+	it("uses the device name and ID in the tab title and escapes HTML", async () => {
+		const f = await fixture('办公机 </title><script>alert("x")</script>&');
+		const expected =
+			"<title>办公机 &lt;/title&gt;&lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt;&amp; (dev1) · pi-web-ui</title>";
+		expect((await f.request("/device/dev1/", { cookie: "hub=secret" })).body).toContain(expected);
+		expect((await f.open()).wrapper.body).toContain(expected);
+	});
 	it("requires Hub account or one-use device ticket; wrapper never grants same origin", async () => {
 		const f = await fixture();
 		expect((await f.request("/device/dev1/")).status).toBe(401);
 		const direct = await f.request("/device/dev1/", { cookie: "hub=secret" });
 		expect(direct.status).toBe(200);
+		expect(direct.body).toContain("<title>dev1 · pi-web-ui</title>");
 		const { wrapper, ticketPath } = await f.open();
 		expect(wrapper.body).toContain('sandbox="allow-scripts allow-forms allow-downloads"');
 		expect(wrapper.body).not.toContain("allow-same-origin");
@@ -151,6 +160,34 @@ describe("single-port device path portal", () => {
 		expect((await f.request(ticketPath)).status).toBe(403);
 		expect((await f.request("/device/dev1/", { cookie: "hub=secret", origin: "null" })).status).toBe(401);
 	});
+	it("embeds a ticket desktop from another origin with both frames opaque", async () => {
+		const chromeHelper = "../lib/chrome.mjs";
+		const { CHROME_PATH } = await import(chromeHelper);
+		if (!CHROME_PATH) throw new Error("Chrome required: set PI_WEB_CHROME");
+		const f = await fixture();
+		const ticket = await f.request("/open", { cookie: "hub=secret", origin: f.origin }, "POST");
+		const url = new URL(JSON.parse(ticket.body).url);
+		url.searchParams.set("next", "/desktop");
+		const parent = http.createServer((_req, res) => {
+			res.setHeader("content-type", "text/html");
+			res.end(
+				`<iframe sandbox="allow-scripts allow-forms allow-pointer-lock" allowfullscreen src="${url.href}"></iframe>`,
+			);
+		});
+		const parentPort = await listen(parent);
+		const browser = await chromium.launch({ executablePath: CHROME_PATH!, headless: true, args: ["--no-sandbox"] });
+		cleanup.push(() => browser.close());
+		const page = await browser.newPage();
+		await page.goto(`http://127.0.0.1:${parentPort}`);
+		const frame = page.frameLocator("iframe").frameLocator("iframe");
+		await expect.poll(() => frame.locator("body").textContent()).toContain('"ws":true');
+		const result = JSON.parse((await frame.locator("body").textContent())!);
+		expect(result).toMatchObject({ module: "loaded", opaque: true, fetch: true, ws: true, hubBlocked: true });
+		await expect.poll(() => page.frameLocator("iframe").locator("#loading").isHidden()).toBe(true);
+		expect(f.hubHits()).toBe(0);
+		expect((await f.request(url.pathname + url.search)).status).toBe(403);
+	});
+
 	it("serves minimal account binding for current and older remote device UIs", async () => {
 		const f = await fixture();
 		const { base } = await f.open();

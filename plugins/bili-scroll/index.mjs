@@ -4,22 +4,14 @@
  */
 
 import { spawn } from "node:child_process";
-import {
-	appendFileSync,
-	existsSync,
-	mkdirSync,
-	readFileSync,
-	readdirSync,
-	rmSync,
-	statSync,
-	writeFileSync,
-} from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { BilibiliApiClient } from "./bilibili-api.mjs?v=2.0.1";
 import { BiliCredentialManager } from "./credentials.mjs?v=2.0.1";
 import { BiliDutyEngine, todayStr } from "./duty.mjs?v=2.0.1";
-import { fetchMsgs, listSessions } from "./lib/dm.mjs?v=2.0.1";
+import { DmService } from "./lib/dm-service.mjs";
+import { readVideoContent } from "./lib/video-content.mjs";
 import { BiliFavOps } from "./lib/favops.mjs?v=2.0.1";
 import { resolveUid } from "./lib/uid.mjs?v=2.0.1";
 import { ensureUv } from "./lib/uvfetch.mjs?v=2.0.1";
@@ -278,7 +270,7 @@ export default {
 						appendAsr(`检测到已存在的转写环境: ${asrDir}\n`);
 					}
 
-					const asrPkgs = ["faster-whisper", "yt-dlp"];
+					const asrPkgs = ["faster-whisper", "yt-dlp", "av", "Pillow", "rapidocr-onnxruntime"];
 					const asrPy = asrPython();
 					let code = 1;
 
@@ -760,12 +752,12 @@ export default {
 
 			// 4. 私信收件人
 			const cfg = loadLocalCfg();
-			const dmOk = cfg.dmMode === "off" || Number(cfg.dmUid) > 0 || Boolean(String(cfg.mentionName || "").trim());
+			const dmOk = true;
 			put(
 				"投递目标确定",
 				dmOk,
-				cfg.dmMode === "off" ? "公开评论模式" : `私信模式 (UID: ${cfg.dmUid || "靠昵称查"})`,
-				"在偏好/互动页填写你的 B站 UID 或昵称",
+				Number(cfg.dmUid) > 0 ? `速报投递至 UID ${cfg.dmUid}` : "使用当前登录账号；速报默认保存在本地，无需主人 UID",
+				"可选配置速报收件人；私信查询和自动回复直接使用当前账号",
 			);
 
 			// 5. 虚拟环境
@@ -889,6 +881,18 @@ export default {
 					} else if (type === "bili:get-subtitle") {
 						const r = await apiClient.getVideoSubtitle(msg.bvid);
 						reply(r);
+					} else if (type === "bili:dm-sessions") {
+						reply({
+							ok: true,
+							...(await dmService.list({ cursor: msg.cursor, size: msg.size, signal: lifetime.signal })),
+						});
+					} else if (type === "bili:dm-messages") {
+						reply({
+							ok: true,
+							...(await dmService.read(msg.uid, { cursor: msg.cursor, size: msg.size, signal: lifetime.signal })),
+						});
+					} else if (type === "bili:dm-send") {
+						reply(await dmService.send(msg.uid, msg.text, { signal: lifetime.signal }));
 					} else if (type === "bili:get-log") {
 						reply({ ok: true, log: dutyEngine.getRecentLog(100) });
 					}
@@ -900,111 +904,28 @@ export default {
 		}
 
 		// ── 8. 双向私信监听守护进程 (dmTick) ──
-		const dmSeenFile = join(storageDir, "dm-seen.json");
-		const dmQuotaFile = join(storageDir, "dm-quota.json");
+		const dmService = new DmService({
+			api: apiClient,
+			host,
+			storageDir,
+			loadConfig: () => ({ dmWatch: true, dmAutoReply: true, ...loadLocalCfg() }),
+			readVideoContent: (bvid, options = {}) =>
+				readVideoContent({ api: apiClient, host, storageDir, bvid, settings: loadLocalCfg(), ...options }),
+		});
+		const lifetime = new AbortController();
 		let dmTimer = null;
-		let dmBusy = false;
-
 		const dmTick = async () => {
-			if (dmBusy) return;
-			dmBusy = true;
 			try {
-				const cfg = loadLocalCfg();
-				if (cfg.dmWatch === false) return;
-				const cred = credManager.load();
-				if (!cred?.sessdata) return;
-
-				let ownerUid = Number(cfg.dmOwnerUid) || Number(cfg.dmUid) || 0;
-				if (!ownerUid && cfg.mentionName) {
-					ownerUid = await resolveUid(storageDir, cfg.mentionName);
-				}
-				if (!ownerUid) return;
-
-				const sessions = await listSessions(cred);
-				const mine = sessions.filter((s) => s.uid === ownerUid && s.unread > 0);
-				if (!mine.length) return;
-
-				let seen = {};
-				try {
-					seen = JSON.parse(readFileSync(dmSeenFile, "utf8"));
-				} catch {
-					seen = {};
-				}
-
-				let quota = { day: "", n: 0 };
-				try {
-					quota = JSON.parse(readFileSync(dmQuotaFile, "utf8"));
-				} catch {
-					quota = { day: "", n: 0 };
-				}
-
-				const today = todayStr();
-				if (quota.day !== today) {
-					quota.day = today;
-					quota.n = 0;
-				}
-
-				for (const s of mine) {
-					const msgs = await fetchMsgs(cred, s.uid, 5);
-					const last = [...msgs].reverse().find((m) => !m.fromMe);
-					if (!last) continue;
-					if (seen[String(s.uid)] === last.key) continue;
-
-					seen[String(s.uid)] = last.key;
-					try {
-						writeFileSync(dmSeenFile, JSON.stringify(seen, null, 2), "utf8");
-					} catch {
-						// ignore
-					}
-
-					const maxReplies = Number(cfg.dmReplyPerDay) || 20;
-					if (maxReplies > 0 && quota.n >= maxReplies) {
-						dutyEngine.appendLog(`私信监听：今日回复限额已达 (${quota.n})，跳过回复`);
-						continue;
-					}
-
-					dutyEngine.appendLog(`私信监听：收到主人消息: ${last.text.slice(0, 40)}`);
-
-					// 如果消息中包含视频 BV 号，读字幕后回
-					let replyText = "";
-					if (last.bvid) {
-						try {
-							const sub = await apiClient.getVideoSubtitle(last.bvid);
-							if (sub && sub.fullText) {
-								const summarySnippet = (sub.summary || sub.fullText).slice(0, 70);
-								replyText = `看完了《${sub.title || last.bvid}》原文字幕：核心在讲 ${summarySnippet}，挺有意思的。`;
-							} else {
-								replyText = `看了下这个视频《${sub.title || last.bvid}》，可惜目前没字幕轨，我记下啦。`;
-							}
-						} catch {
-							replyText = `收到你分享的视频啦，我抽空读一下字幕告诉你。`;
-						}
-					} else {
-						replyText = `收到啦！我今天还在按时替你盯 B站 视频，有真干货会直接私信发你。`;
-					}
-
-					try {
-						await apiClient.sendMessage(s.uid, replyText);
-						dutyEngine.appendLog(`私信监听：已回复主人 UID ${s.uid}`);
-						quota.n++;
-						writeFileSync(dmQuotaFile, JSON.stringify(quota, null, 2), "utf8");
-					} catch (err) {
-						dutyEngine.appendLog(`私信监听回复失败: ${err.message}`);
-					}
-				}
+				await dmService.tick({ signal: lifetime.signal });
 			} catch (err) {
-				dutyEngine.appendLog(`私信监听轮询异常: ${err.message}`);
-			} finally {
-				dmBusy = false;
+				if (!lifetime.signal.aborted) dutyEngine.appendLog("私信监听异常: " + err.message);
 			}
 		};
-
 		const startDmWatcher = () => {
 			if (dmTimer) clearInterval(dmTimer);
-			const cfg = loadLocalCfg();
-			const mins = Math.max(1, Number(cfg.dmWatchMinutes) || 1);
-			dmTimer = setInterval(() => dmTick(), mins * 60000);
-			if (typeof dmTimer?.unref === "function") dmTimer.unref();
+			const mins = Math.max(1, Number(loadLocalCfg().dmWatchMinutes) || 1);
+			dmTimer = setInterval(() => void dmTick(), mins * 60000);
+			dmTimer.unref?.();
 		};
 		startDmWatcher();
 
@@ -1304,8 +1225,10 @@ export default {
 				},
 				required: ["receiver_uid", "text"],
 			},
-			async execute(args) {
-				return await apiClient.sendMessage(args.receiver_uid, args.text);
+			async execute(args, _id, signal) {
+				return await dmService.send(args.receiver_uid, args.text, {
+					signal: signal ? AbortSignal.any([signal, lifetime.signal]) : lifetime.signal,
+				});
 			},
 		});
 
@@ -1449,9 +1372,70 @@ export default {
 			},
 		});
 
-		host.log?.("info", `[bili-scroll] 插件 2.0.0 激活成功，存储目录: ${storageDir}`);
+		host.log?.("info", `[bili-scroll] 插件激活成功，存储目录: ${storageDir}`);
+
+		registerTool({
+			name: "bili_video_content",
+			label: "B站视频内容",
+			description:
+				"Read actual video evidence from subtitles, audio transcription and sampled frames. Reports sources and coverage limits.",
+			promptSnippet: "understanding the spoken and visual content of a Bilibili video",
+			promptGuidelines: [
+				"Use evidence coverage when describing a video; never claim full viewing from a description or summary.",
+			],
+			parameters: { type: "object", properties: { bvid: { type: "string" } }, required: ["bvid"] },
+			async execute(args, _id, signal) {
+				return await readVideoContent({
+					api: apiClient,
+					host,
+					storageDir,
+					bvid: args.bvid,
+					settings: loadLocalCfg(),
+					signal: signal ? AbortSignal.any([signal, lifetime.signal]) : lifetime.signal,
+				});
+			},
+		});
+		registerTool({
+			name: "bili_dm_sessions",
+			label: "B站私信列表",
+			description: "List the logged-in account's private-message conversations with unread counts and pagination.",
+			promptSnippet: "checking the current Bilibili account inbox",
+			parameters: { type: "object", properties: { cursor: { type: "string" }, size: { type: "number" } } },
+			async execute(args, _id, signal) {
+				return {
+					ok: true,
+					...(await dmService.list({
+						...args,
+						signal: signal ? AbortSignal.any([signal, lifetime.signal]) : lifetime.signal,
+					})),
+				};
+			},
+		});
+		registerTool({
+			name: "bili_dm_messages",
+			label: "B站私信历史",
+			description: "Read a conversation from the logged-in Bilibili account, including older messages using a cursor.",
+			promptSnippet: "reading Bilibili private-message history",
+			parameters: {
+				type: "object",
+				properties: { uid: { type: "number" }, cursor: { type: "string" }, size: { type: "number" } },
+				required: ["uid"],
+			},
+			async execute(args, _id, signal) {
+				return {
+					ok: true,
+					...(await dmService.read(args.uid, {
+						...args,
+						signal: signal ? AbortSignal.any([signal, lifetime.signal]) : lifetime.signal,
+					})),
+				};
+			},
+		});
 
 		return () => {
+			lifetime.abort();
+			dmService.dispose();
+			dutyEngine.dispose();
 			if (dmTimer) clearInterval(dmTimer);
 			if (schedTimer) clearInterval(schedTimer);
 			for (const unreg of unregisterFns) {

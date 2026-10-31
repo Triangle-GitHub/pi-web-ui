@@ -410,6 +410,7 @@ export interface DeviceRelayOptions {
 		req: IncomingMessage,
 	) => string | { id: string } | null | undefined | Promise<string | { id: string } | null | undefined>;
 	ownsDevice: (accountId: string, deviceId: string) => boolean | Promise<boolean>;
+	getDeviceName?: (deviceId: string) => string | undefined;
 	onTaskEvent?: (deviceId: string, event: any) => void | Promise<void>;
 }
 export function createDeviceRelay(options: DeviceRelayOptions) {
@@ -468,8 +469,14 @@ export function createDeviceRelay(options: DeviceRelayOptions) {
 	const tickets = new Map<string, { deviceId: string; accountId: string; generation: number; expiresAt: number }>();
 	const sessions = new Map<string, { deviceId: string; expiresAt: number }>();
 	const capabilities = new Map<string, { deviceId: string; accountId: string; expiresAt: number }>();
-	const pathRequest = (req: IncomingMessage) =>
-		options.pathAccess && req.headers.host?.toLowerCase() === hub.host.toLowerCase() ? parseDevicePath(req.url) : null;
+	const pathRequest = (req: IncomingMessage) => {
+		if (req.headers.host?.toLowerCase() !== hub.host.toLowerCase()) return null;
+		const path = parseDevicePath(req.url);
+		// Desktop embedding uses an opaque capability on the Hub even with legacy device origins.
+		return options.pathAccess || path?.tail === "/__open" || (path?.token && capabilities.has(path.token))
+			? path
+			: null;
+	};
 	function pathAuthorized(req: IncomingMessage, id: string, websocket = false) {
 		const path = pathRequest(req);
 		const session = path?.token ? capabilities.get(path.token) : undefined;
@@ -617,7 +624,14 @@ export function createDeviceRelay(options: DeviceRelayOptions) {
 		}
 		const token = randomBytes(32).toString("hex");
 		capabilities.set(token, { deviceId: id, accountId, expiresAt: Date.now() + 8 * 60 * 60_000 });
-		const wrapper = wrapperHtml(capabilityBase(id, token), initialPath);
+		const name = options.getDeviceName?.(id)?.trim();
+		const label = name && name !== id ? `${name} (${id})` : id;
+		const wrapper = wrapperHtml(
+			capabilityBase(id, token),
+			initialPath,
+			initialPath === "desktop" ? hub : undefined,
+			label,
+		);
 		res
 			.writeHead(200, {
 				"content-type": "text/html; charset=utf-8",
@@ -689,6 +703,19 @@ export function createDeviceRelay(options: DeviceRelayOptions) {
 				return true;
 			}
 			tickets.delete(key);
+			if (url.searchParams.get("next") === "/desktop" && !path) {
+				// Exchange the one-use legacy ticket for a fresh one on the Hub origin.
+				const desktopTicket = randomBytes(32).toString("hex");
+				tickets.set(desktopTicket, ticket);
+				res
+					.writeHead(302, {
+						location: `${hub.origin}/device/${id}/__open?ticket=${desktopTicket}&next=/desktop`,
+						"cache-control": "no-store",
+						"referrer-policy": "no-referrer",
+					})
+					.end();
+				return true;
+			}
 			if (path) {
 				sendWrapper(res, id, ticket.accountId, url.searchParams.get("next") === "/desktop" ? "desktop" : "");
 				return true;

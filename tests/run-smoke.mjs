@@ -24,6 +24,7 @@
  * - 全量 = CORE + 慢/重插件（ssh 现场 npm 装、vscode 大插件等）+ 各家回归，~9 分钟；
  * - 新测试默认进 ALL；只有「零 token、自包含、跑得快（<20s）、稳」才进 CORE。
  */
+import "./lib/hide-windows.mjs";
 import { execSync, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";

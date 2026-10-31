@@ -496,7 +496,7 @@ export class BilibiliApiClient {
 	}
 
 	// ── 发表评论/回复 ──
-	async replyVideo(bvid, message, { rpid = 0, root = 0, parent = 0 } = {}) {
+	async replyVideo(bvid, message, { rpid = 0, root = 0, parent = 0, signal } = {}) {
 		const cred = this.cred.load();
 		if (!cred || !cred.sessdata || !cred.bili_jct) {
 			throw new Error("发表评论需要先扫码登录获取凭证 (SESSDATA & bili_jct)");
@@ -508,6 +508,7 @@ export class BilibiliApiClient {
 			throw new Error(`获取视频 aid 失败: ${err instanceof Error ? err.message : String(err)}`);
 		}
 
+		signal?.throwIfAborted();
 		const body = new URLSearchParams();
 		body.append("type", "1");
 		body.append("oid", String(aid));
@@ -519,6 +520,7 @@ export class BilibiliApiClient {
 		}
 
 		const res = await this._fetch("https://api.bilibili.com/x/v2/reply/add", {
+			signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(15000)]) : undefined,
 			method: "POST",
 			headers: {
 				...this.cred.getHeaders({ "Content-Type": "application/x-www-form-urlencoded" }),

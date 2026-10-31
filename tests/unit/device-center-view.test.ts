@@ -1,4 +1,5 @@
 // @vitest-environment jsdom
+import { closeDesktopAccess, getDesktopAccess } from "../../web/src/device-access.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { act, createElement } from "react";
 import { createRoot } from "react-dom/client";
@@ -133,8 +134,10 @@ describe("native device workspace", () => {
 			expect.stringContaining("/api/device-center/devices/mac/open"),
 			expect.objectContaining({ method: "POST" }),
 		);
-		expect(tab.opener).toBeNull();
-		expect(replace).toHaveBeenCalledWith("https://hub.example.com/device/mac/__open?ticket=access&next=%2Fdesktop");
+		expect(window.open).not.toHaveBeenCalled();
+		expect(replace).not.toHaveBeenCalled();
+		expect(getDesktopAccess()?.url).toBe("https://hub.example.com/device/mac/__open?ticket=access&next=%2Fdesktop");
+		closeDesktopAccess(getDesktopAccess()!);
 		expect(tab.close).not.toHaveBeenCalled();
 	});
 	it("aborts an in-flight request on unmount", async () => {

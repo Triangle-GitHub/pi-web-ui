@@ -479,7 +479,8 @@ export interface PluginHost {
 	 *  需要能力 "llm"（manifest.permissions，花的是用户自己的模型额度）。
 	 *  宿主未接 llmProvider（如 DSH 引擎）时回 {ok:false}，绝不抛错。 */
 	llm: {
-		complete(req: { prompt: string; system?: string; model?: string; maxChars?: number; timeoutMs?: number }): Promise<{
+		readonly supportsImages: true;
+		complete(req: import("./plugin-llm.js").PluginLlmRequest): Promise<{
 			ok: boolean;
 			text?: string;
 			model?: string;
@@ -2610,7 +2611,7 @@ export class PluginManager {
 	llmProvider:
 		| ((
 				pluginId: string,
-				req: { prompt?: string; system?: string; model?: string; maxChars?: number; timeoutMs?: number },
+				req: Partial<import("./plugin-llm.js").PluginLlmRequest>,
 		  ) => Promise<{
 				ok: boolean;
 				text?: string;
@@ -4291,6 +4292,7 @@ export class PluginManager {
 				}
 			},
 			llm: {
+				supportsImages: true,
 				complete: async (req) => {
 					if (!can("llm")) return { ok: false, error: `插件未声明能力 "llm"（manifest.permissions）——请求被拒` };
 					// 有模型作用域授权时收紧到批准的模型（无授权=声明即全开，向后兼容）。

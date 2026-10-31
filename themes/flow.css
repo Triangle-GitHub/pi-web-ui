@@ -9,6 +9,7 @@
  */
 :root {
 	color-scheme: dark;
+	--flow-shadow: #000000;
 	--bg: #171717;
 	--bg-elev: #212121;
 	--bg-elev2: #282828;

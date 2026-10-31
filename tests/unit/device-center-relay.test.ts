@@ -223,7 +223,17 @@ describe("device reverse relay", () => {
 			url.searchParams.set("next", next);
 			const opened = await request(f.port, f.host, url.pathname + url.search);
 			expect(opened.status).toBe(302);
-			expect(opened.headers.location).toBe(expected);
+			if (expected === "/desktop") {
+				const desktop = new URL(String(opened.headers.location));
+				expect(desktop.origin).toBe(`http://127.0.0.1:${f.port}`);
+				expect(desktop.pathname).toBe("/device/dev1/__open");
+				expect(desktop.searchParams.get("next")).toBe("/desktop");
+				const wrapper = await request(f.port, `127.0.0.1:${f.port}`, desktop.pathname + desktop.search);
+				expect(wrapper.status).toBe(200);
+				expect(wrapper.body).toContain("sandbox=");
+				expect(wrapper.body).not.toContain("allow-same-origin");
+				expect((await request(f.port, `127.0.0.1:${f.port}`, desktop.pathname + desktop.search)).status).toBe(403);
+			} else expect(opened.headers.location).toBe(expected);
 			expect((await request(f.port, f.host, url.pathname + url.search)).status).toBe(403);
 		}
 	});

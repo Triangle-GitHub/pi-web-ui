@@ -69,6 +69,49 @@ function renderBarItem(
 }
 
 describe("上下左右四栏通用 BarItem 渲染测试", () => {
+	it("工作树入口显示数量与改动点，点击进入页内视图且尊重显式改名", () => {
+		const state = chatStub.state!;
+		const original = state.worktree;
+		state.worktree = {
+			isLinkedWorktree: true,
+			currentPath: "/repo/current",
+			mainPath: "/repo",
+			linkedWorktrees: [
+				{ path: "/repo/other", branch: "feature", isMain: false, isCurrent: false, isDirty: true, uncommittedCount: 1 },
+			],
+		};
+		try {
+			for (const labelExplicit of [false, true]) {
+				const onViewChange = vi.fn();
+				const entry: UiSlotEntry = {
+					id: "host:worktrees",
+					slot: "topbar.primary",
+					source: "host",
+					label: "项目分支",
+					labelExplicit,
+					kind: "action",
+					order: 4,
+					align: "start",
+					hidden: false,
+					userOverrides: [],
+					arrangedBy: [],
+				};
+				const { container, root } = renderBarItem(entry, "top", onViewChange);
+				try {
+					expect(container.querySelector(".worktree-count")?.textContent).toBe("2");
+					expect(container.querySelector(".worktree-dirty-dot")).not.toBeNull();
+					expect(container.querySelector(".bar-item-text")?.textContent).toBe(labelExplicit ? "项目分支" : undefined);
+					act(() => container.querySelector<HTMLButtonElement>("button")!.click());
+					expect(onViewChange).toHaveBeenCalledWith("worktrees");
+				} finally {
+					act(() => root.unmount());
+					container.remove();
+				}
+			}
+		} finally {
+			state.worktree = original;
+		}
+	});
 	it.each(["top", "bottom", "left", "right"] as const)("设备中心在 %s 栏显示图标和名称", (bar) => {
 		const entry: UiSlotEntry = {
 			id: "host:device-center",

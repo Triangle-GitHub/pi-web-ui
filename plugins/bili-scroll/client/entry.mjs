@@ -84,6 +84,18 @@ export default {
 		el.innerHTML = `
 			<div class="bili-root" style="display: flex; flex-direction: column; height: 100%; box-sizing: border-box; background: var(--bg); color: var(--text); font-size: 13px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;">
 				<style>
+					/* Inbox styles share the host theme. */
+					.bili-inbox { min-width: 0; max-width: 100%; display: flex; flex-direction: column; gap: 10px; }
+					.bili-inbox button, .bili-inbox textarea { padding: 7px 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--text); font: inherit; }
+					.bili-inbox button { cursor: pointer; }
+					.bili-inbox button:disabled { opacity: .5; cursor: default; }
+					.bili-inbox .bili-dm-send { background: var(--accent); color: var(--accent-contrast, #fff); }
+					.bili-inbox-list { display: flex; flex-direction: column; gap: 6px; max-height: 300px; overflow: auto; overscroll-behavior: contain; }
+					.bili-inbox-list button { text-align: left; }
+					.bili-inbox-list button[aria-pressed="true"] { border-color: var(--accent); }
+					.bili-inbox-list button, .bili-dm-message, .bili-dm-selected { min-width: 0; max-width: 100%; overflow-wrap: anywhere; word-break: break-word; white-space: pre-wrap; }
+					.bili-dm-message { padding: 8px; border: 1px solid var(--border); border-radius: 6px; }
+					.bili-dm-compose { width: 100%; box-sizing: border-box; resize: vertical; }
 					/* bili-scroll 开关按钮及交互增强 */
 					.bili-switch-wrap {
 						position: relative;
@@ -160,7 +172,7 @@ export default {
 								<span class="bili-badge-ver" style="font-size: 10px; padding: 1px 6px; border-radius: 10px; background: color-mix(in srgb, var(--accent) 15%, transparent); color: var(--accent); border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);">v2.0.1</span>
 								<span class="bili-status-badge" style="font-size: 11px; padding: 1px 6px; border-radius: 4px; background: color-mix(in srgb, var(--green, #22c55e) 15%, transparent); color: var(--green, #22c55e);">就绪</span>
 							</div>
-							<div style="font-size: 11px; color: var(--text-dim); margin-top: 1px;">通读原文字幕深度排雷 · 默认私信投递 · 双向看片聊天 · 视频卡片墙</div>
+							<div style="font-size: 11px; color: var(--text-dim); margin-top: 1px;">当前登录账号自主漫游 · 字幕 / 音频 / 抽样画面理解 · 随时查看私信</div>
 						</div>
 					</div>
 					<div style="display: flex; gap: 6px;">
@@ -296,7 +308,7 @@ export default {
 						<div style="border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; background: var(--bg-elev);">
 							<div style="font-weight: 600; font-size: 14px;">🤖 模型、思考强度与工作目录</div>
 							<div style="font-size: 12px; color: var(--text-dim); margin-top: 2px;">
-								指定大模型、调整字幕排雷的思考深度，并可指定本地工作区（自动将单篇笔记镜像同步至该目录下的 bili-notes/）。
+								使用当前登录账号自主浏览，结合字幕、音频转写与抽样视觉帧理解视频内容。抽样画面和可获得的音频 / 字幕可能仅覆盖部分视频；结论应注明依据与覆盖范围。可指定笔记工作目录。
 							</div>
 							<div style="margin-top: 10px; display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
 								<div>
@@ -316,6 +328,13 @@ export default {
 										<option value="low">轻度敏捷 (low - 快速提炼干货点)</option>
 										<option value="off">关闭思考 (off - 快速结论)</option>
 									</select>
+								</div>
+								<div style="grid-column: 1 / -1; display: flex; flex-direction: column; gap: 8px;">
+									<label>视觉模型（可选，provider/model）
+										<input class="bili-cfg-vision-model" type="text" placeholder="留空使用配置的研读模型" style="width: 100%; box-sizing: border-box; padding: 7px; background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 6px;" />
+									</label>
+									<label style="display: flex; align-items: center; gap: 8px;"><input type="checkbox" class="bili-cfg-transcribe" checked />启用音频转写（默认开，需本地转写依赖）</label>
+									<div style="font-size: 12px; color: var(--text-dim);">视觉模型需支持图片输入；研读模型未指定时跟随当前会话模型。无法获取某种内容时应明确说明，避免把部分理解当作完整观看。</div>
 								</div>
 								<div style="grid-column: 1 / -1;">
 									<div style="font-size: 12px; font-weight: 600; margin-bottom: 4px;">指定工作区目录 (Workspace 绝对路径)</div>
@@ -384,9 +403,9 @@ export default {
 					<!-- ═══════════ TAB 3: 互动 (Social) ═══════════ -->
 					<div class="bili-tab-page bili-page-social" style="display: none; flex-direction: column; gap: 14px;">
 						<div style="border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; background: var(--bg-elev);">
-							<div style="font-weight: 600; font-size: 14px;">📬 投递方式（2.0 默认私信）</div>
+							<div style="font-weight: 600; font-size: 14px;">📬 精选速报投递方式</div>
 							<div style="font-size: 12px; color: var(--text-dim); margin-top: 2px;">
-								只私信 = 结果发送到你的 B站 私信，公开评论区一条都不发，不打扰别人。
+								使用当前登录账号浏览和互动。速报私信仅在配置可选接收者后投递；收件箱读取和自动回复无需填写接收者 UID 或昵称。
 							</div>
 							<div style="margin-top: 10px; display: flex; flex-direction: column; gap: 8px;">
 								<label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
@@ -405,14 +424,14 @@ export default {
 						</div>
 
 						<div style="border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; background: var(--bg-elev);">
-							<div style="font-weight: 600; font-size: 14px;">👤 私信发给谁 & 昵称自动查</div>
+							<div style="font-weight: 600; font-size: 14px;">👤 速报接收者（可选，不影响收件箱）</div>
 							<div style="margin-top: 10px; display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
 								<div>
-									<div style="font-size: 12px; font-weight: 600; margin-bottom: 4px;">私信接收者 UID (数字)</div>
-									<input type="number" class="bili-cfg-dm-uid" placeholder="留空则按右侧昵称自动搜索查 UID" style="width: 100%; box-sizing: border-box; padding: 7px 10px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 12px;" />
+									<div style="font-size: 12px; font-weight: 600; margin-bottom: 4px;">速报接收者 UID（可选）</div>
+									<input type="number" class="bili-cfg-dm-uid" placeholder="可留空；无需设置主人 UID" style="width: 100%; box-sizing: border-box; padding: 7px 10px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 12px;" />
 								</div>
 								<div>
-									<div style="font-size: 12px; font-weight: 600; margin-bottom: 4px;">你的 B站 昵称 (用于自动查 UID 或 @)</div>
+									<div style="font-size: 12px; font-weight: 600; margin-bottom: 4px;">速报接收者昵称 / 评论 @（可选）</div>
 									<input type="text" class="bili-cfg-mention-name" placeholder="例如：张三" style="width: 100%; box-sizing: border-box; padding: 7px 10px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 12px;" />
 								</div>
 							</div>
@@ -421,18 +440,20 @@ export default {
 						<div style="border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; background: var(--bg-elev);">
 							<div style="display: flex; justify-content: space-between; align-items: center;">
 								<div>
-									<div style="font-weight: 600; font-size: 14px;">🔄 私信双向（看片与回信）</div>
+									<div style="font-weight: 600; font-size: 14px;">🔄 当前账号私信监听</div>
 									<div style="font-size: 12px; color: var(--text-dim); margin-top: 2px;">
-										纯代码轮询主人发来的私信，主人发视频链接时自动读字幕后回信，陌生人发的消息一律不回。
+										监听当前登录账号的新私信，不按主人 UID 筛选。关闭监听也可随时手动查看收件箱和历史记录。
 									</div>
 								</div>
-								<label class="bili-switch-wrap" title="点击切换私信双向开关">
+								<label class="bili-switch-wrap" title="监听当前登录账号的新私信">
 									<input type="checkbox" class="bili-cfg-dm-watch" checked />
 									<span class="bili-toggle-slider"></span>
 								</label>
 							</div>
 							<div style="margin-top: 10px; display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
 								<div>
+									<label style="display: flex; align-items: center; gap: 8px; margin-bottom: 8px;"><input type="checkbox" class="bili-cfg-dm-auto-reply" checked />自动回复新私信（默认开）</label>
+									<div style="font-size: 12px; color: var(--text-dim); margin-bottom: 8px;">监听开启时，仅收到新私信才调用模型并消耗模型 tokens；自动回复不使用工具。读取列表和历史不调用模型。</div>
 									<div style="font-size: 12px; font-weight: 600; margin-bottom: 4px;">监听间隔 (分钟)</div>
 									<input type="number" class="bili-cfg-dm-minutes" value="1" min="1" max="60" style="width: 100%; box-sizing: border-box; padding: 6px 10px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 12px;" />
 								</div>
@@ -457,6 +478,20 @@ export default {
 							</div>
 						</div>
 
+						<div class="bili-inbox" style="border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; background: var(--bg-elev);">
+							<div style="font-weight: 600; font-size: 14px;">📥 当前登录账号收件箱</div>
+							<div style="color: var(--text-dim);">无需主人 UID。点击刷新即可查看全部私信会话，再选择会话读取历史。</div>
+							<button class="bili-dm-refresh" type="button">刷新私信会话</button>
+							<div class="bili-dm-status" role="status" aria-live="polite">尚未加载收件箱</div>
+							<div class="bili-inbox-list bili-dm-sessions" aria-label="私信会话"></div>
+							<button class="bili-dm-more-sessions" type="button" hidden>加载更多会话</button>
+							<div class="bili-dm-selected">当前未选择会话</div>
+							<button class="bili-dm-refresh-messages" type="button" disabled>刷新当前会话历史</button>
+							<div class="bili-inbox-list bili-dm-messages" aria-label="私信历史"></div>
+							<button class="bili-dm-more-messages" type="button" hidden>加载更早消息</button>
+							<label>手动回复（发送前请核对上方 UID）<textarea class="bili-dm-compose" rows="3" disabled placeholder="输入要发送的文字"></textarea></label>
+							<button class="bili-dm-send" type="button" disabled>发送到所选 UID</button>
+						</div>
 						<div>
 							<button class="bili-btn-save-social" style="padding: 8px 24px; border-radius: 6px; border: none; background: var(--accent); color: var(--accent-contrast, #fff); font-weight: 600; cursor: pointer; font-size: 13px;">💾 保存互动设置</button>
 						</div>
@@ -559,6 +594,8 @@ export default {
 		const cfgModel = el.querySelector(".bili-cfg-model");
 		const btnPickModel = el.querySelector(".bili-btn-pick-model");
 		const cfgReasoningEffort = el.querySelector(".bili-cfg-reasoning-effort");
+		const cfgVisionModel = el.querySelector(".bili-cfg-vision-model");
+		const cfgTranscribe = el.querySelector(".bili-cfg-transcribe");
 		const cfgWorkspace = el.querySelector(".bili-cfg-workspace");
 		const btnPickWorkspace = el.querySelector(".bili-btn-pick-workspace");
 		const cfgPersona = el.querySelector(".bili-cfg-persona");
@@ -575,11 +612,145 @@ export default {
 		const cfgDmUid = el.querySelector(".bili-cfg-dm-uid");
 		const cfgMentionName = el.querySelector(".bili-cfg-mention-name");
 		const cfgDmWatch = el.querySelector(".bili-cfg-dm-watch");
+		const cfgDmAutoReply = el.querySelector(".bili-cfg-dm-auto-reply");
 		const cfgDmMinutes = el.querySelector(".bili-cfg-dm-minutes");
 		const cfgDmReplyLimit = el.querySelector(".bili-cfg-dm-reply-limit");
 		const cfgAutoComment = el.querySelector(".bili-cfg-auto-comment");
 		const cfgReplyComments = el.querySelector(".bili-cfg-reply-comments");
 		const btnSaveSocial = el.querySelector(".bili-btn-save-social");
+
+		// Inbox requests use the logged-in account, independently of digest settings.
+		const dmSessions = el.querySelector(".bili-dm-sessions");
+		const dmMessages = el.querySelector(".bili-dm-messages");
+		const dmStatus = el.querySelector(".bili-dm-status");
+		const dmSelected = el.querySelector(".bili-dm-selected");
+		const dmCompose = el.querySelector(".bili-dm-compose");
+		const dmSend = el.querySelector(".bili-dm-send");
+		const dmRefresh = el.querySelector(".bili-dm-refresh");
+		const dmRefreshMessages = el.querySelector(".bili-dm-refresh-messages");
+		const dmMoreSessions = el.querySelector(".bili-dm-more-sessions");
+		const dmMoreMessages = el.querySelector(".bili-dm-more-messages");
+		let selectedUid = "";
+		let sessions = [];
+		let messages = [];
+		let sessionsCursor;
+		let messagesCursor;
+		let sessionsBusy = false;
+		let messagesBusy = false;
+		let sending = false;
+		let messageGeneration = 0;
+		const drafts = new Map();
+
+		function renderSessions() {
+			dmSessions.innerHTML = sessions
+				.map(
+					(s) =>
+						`<button type="button" data-uid="${esc(String(s.uid))}" aria-pressed="${String(s.uid) === selectedUid}">UID: ${esc(String(s.uid))} · 未读: ${esc(String(s.unread ?? 0))} · 时间戳: ${esc(String(s.lastTs ?? ""))}\n${esc(String(s.preview ?? ""))}</button>`,
+				)
+				.join("");
+		}
+
+		function renderMessages() {
+			dmMessages.innerHTML =
+				messages
+					.map(
+						(m) =>
+							`<div class="bili-dm-message">${m.fromMe ? "我" : `UID: ${esc(selectedUid)}`} · 时间戳: ${esc(String(m.ts ?? ""))} · 类型: ${esc(String(m.kind ?? ""))}\n${esc(String(m.text ?? ""))}${m.bvid ? `\n视频: ${esc(String(m.bvid))}` : ""}</div>`,
+					)
+					.join("") || "暂无消息";
+		}
+
+		async function loadSessions(more = false) {
+			if (sessionsBusy) return;
+			sessionsBusy = true;
+			dmRefresh.disabled = dmMoreSessions.disabled = true;
+			dmStatus.textContent = "正在读取私信会话…";
+			try {
+				const res = await sendMsg("bili:dm-sessions", { size: 20, ...(more ? { cursor: sessionsCursor } : {}) });
+				if (!res?.ok || !Array.isArray(res.sessions)) throw new Error(res?.error || "私信会话响应无效");
+				sessions = [...new Map([...(more ? sessions : []), ...res.sessions].map((s) => [String(s.uid), s])).values()];
+				sessionsCursor = res.nextCursor;
+				dmMoreSessions.hidden = !(res.hasMore && res.nextCursor != null);
+				renderSessions();
+				dmStatus.textContent = sessions.length ? `已加载 ${sessions.length} 个会话` : "暂无私信会话";
+			} catch (err) {
+				dmStatus.textContent = `读取失败: ${err.message}`;
+			} finally {
+				sessionsBusy = false;
+				dmRefresh.disabled = dmMoreSessions.disabled = false;
+			}
+		}
+
+		async function loadMessages(more = false) {
+			if (!selectedUid || messagesBusy) return;
+			const uid = selectedUid;
+			const generation = ++messageGeneration;
+			messagesBusy = true;
+			dmRefreshMessages.disabled = dmMoreMessages.disabled = true;
+			dmStatus.textContent = `正在读取 UID ${uid} 的历史…`;
+			try {
+				const res = await sendMsg("bili:dm-messages", { uid, size: 30, ...(more ? { cursor: messagesCursor } : {}) });
+				if (generation !== messageGeneration) return;
+				if (!res?.ok || !Array.isArray(res.messages)) throw new Error(res?.error || "私信历史响应无效");
+				messages = [
+					...new Map([...(more ? messages : []), ...res.messages].map((m) => [String(m.key), m])).values(),
+				].sort((a, b) => Number(a.ts) - Number(b.ts));
+				messagesCursor = res.nextCursor;
+				dmMoreMessages.hidden = !(res.hasMore && res.nextCursor != null);
+				renderMessages();
+				dmStatus.textContent = `UID ${uid}: 已加载 ${messages.length} 条消息`;
+			} catch (err) {
+				if (generation === messageGeneration) dmStatus.textContent = `读取失败: ${err.message}`;
+			} finally {
+				if (generation === messageGeneration) {
+					messagesBusy = false;
+					dmRefreshMessages.disabled = dmMoreMessages.disabled = false;
+				}
+			}
+		}
+
+		dmRefresh.addEventListener("click", () => loadSessions());
+		dmMoreSessions.addEventListener("click", () => loadSessions(true));
+		dmRefreshMessages.addEventListener("click", () => loadMessages());
+		dmMoreMessages.addEventListener("click", () => loadMessages(true));
+		dmSessions.addEventListener("click", (event) => {
+			const button = event.target.closest("button[data-uid]");
+			if (!button || sending) return;
+			if (selectedUid) drafts.set(selectedUid, dmCompose.value);
+			selectedUid = button.dataset.uid;
+			++messageGeneration;
+			messagesBusy = false;
+			messages = [];
+			messagesCursor = undefined;
+			dmMessages.textContent = "";
+			dmMoreMessages.hidden = true;
+			dmSelected.textContent = `当前所选 UID: ${selectedUid}`;
+			dmSend.textContent = `发送到 UID ${selectedUid}`;
+			dmCompose.disabled = dmSend.disabled = false;
+			dmCompose.value = drafts.get(selectedUid) || "";
+			renderSessions();
+			loadMessages();
+		});
+		dmSend.addEventListener("click", async () => {
+			const uid = selectedUid;
+			const text = dmCompose.value.trim();
+			if (!uid || !text || sending) return;
+			sending = true;
+			dmSend.disabled = dmCompose.disabled = true;
+			dmStatus.textContent = `正在发送到 UID ${uid}…`;
+			try {
+				const res = await sendMsg("bili:dm-send", { uid, text });
+				if (!res?.ok) throw new Error(res?.error || "发送失败");
+				dmCompose.value = "";
+				drafts.delete(uid);
+				dmStatus.textContent = `已发送到 UID ${uid}，可刷新历史查看`;
+			} catch (err) {
+				dmStatus.textContent = `UID ${uid}: ${err.message}。未确认成功，请先刷新历史核对，再决定是否重发。`;
+			} finally {
+				sending = false;
+				dmSend.disabled = dmCompose.disabled = false;
+			}
+		});
 
 		// Advanced
 		const avatar = el.querySelector(".bili-avatar");
@@ -665,7 +836,7 @@ export default {
 				color = "#ff4d4f";
 			}
 
-			line.innerHTML = `<span style="color: #666;">[${time}]</span> <span style="color: ${color};">${esc(act.message || "")}</span>`;
+			line.innerHTML = `<span style="color: #666;">[${esc(String(time))}]</span> <span style="color: ${color};">${esc(act.message || "")}</span>`;
 			terminalBody.appendChild(line);
 			terminalBody.scrollTop = terminalBody.scrollHeight;
 		}
@@ -692,6 +863,8 @@ export default {
 
 			// 偏好表单回填
 			populateModelOptions(res.config?.model || "");
+			if (!cfgVisionModel.dataset.dirty) cfgVisionModel.value = res.config?.visionModel || "";
+			if (!cfgTranscribe.dataset.dirty) cfgTranscribe.checked = res.config?.transcribe !== false;
 			if (cfgReasoningEffort) cfgReasoningEffort.value = res.config?.reasoningEffort || "medium";
 			if (cfgWorkspace && !cfgWorkspace.value) cfgWorkspace.value = res.config?.workspace || "";
 			if (cfgPersona && !cfgPersona.value) cfgPersona.value = res.config?.personaPrompt || "";
@@ -705,7 +878,8 @@ export default {
 			});
 			if (cfgDmUid && !cfgDmUid.value) cfgDmUid.value = res.config?.dmUid || "";
 			if (cfgMentionName && !cfgMentionName.value) cfgMentionName.value = res.config?.mentionName || "";
-			if (cfgDmWatch) cfgDmWatch.checked = res.config?.dmWatch !== false;
+			if (cfgDmWatch && !cfgDmWatch.dataset.dirty) cfgDmWatch.checked = res.config?.dmWatch !== false;
+			if (!cfgDmAutoReply.dataset.dirty) cfgDmAutoReply.checked = res.config?.dmAutoReply !== false;
 			if (cfgDmMinutes) cfgDmMinutes.value = res.config?.dmWatchMinutes || 1;
 			if (cfgDmReplyLimit) cfgDmReplyLimit.value = res.config?.dmReplyPerDay || 20;
 			if (cfgAutoComment) cfgAutoComment.checked = Boolean(res.config?.autoComment);
@@ -966,10 +1140,18 @@ export default {
 			}
 		});
 
+		for (const input of [cfgVisionModel, cfgTranscribe, cfgDmWatch, cfgDmAutoReply]) {
+			input.addEventListener("input", () => {
+				input.dataset.dirty = "true";
+			});
+		}
+
 		// ── 保存偏好 ──
 		btnSaveTaste.addEventListener("click", async () => {
 			const patch = {
 				model: cfgModel.value.trim(),
+				visionModel: cfgVisionModel.value.trim(),
+				transcribe: cfgTranscribe.checked,
 				reasoningEffort: cfgReasoningEffort.value,
 				workspace: cfgWorkspace.value.trim(),
 				personaPrompt: cfgPersona.value.trim(),
@@ -1007,6 +1189,7 @@ export default {
 				dmUid: Number(cfgDmUid.value) || 0,
 				mentionName: cfgMentionName.value.trim(),
 				dmWatch: cfgDmWatch.checked,
+				dmAutoReply: cfgDmAutoReply.checked,
 				dmWatchMinutes: Math.max(1, Number(cfgDmMinutes.value) || 1),
 				dmReplyPerDay: Number(cfgDmReplyLimit.value) || 20,
 				autoComment: cfgAutoComment.checked,

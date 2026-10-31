@@ -1,11 +1,11 @@
 {
 	"id": "bili-scroll",
 	"name": "bili-scroll",
-	"version": "2.0.6",
+	"version": "2.1.0",
 	"icon": "📺",
 	"iconSvg": "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><rect x=\"2\" y=\"7\" width=\"20\" height=\"15\" rx=\"3\"/><polyline points=\"17 2 12 7 7 2\"/><line x1=\"8\" y1=\"12\" x2=\"8\" y2=\"12.01\"/><line x1=\"16\" y1=\"12\" x2=\"16\" y2=\"12.01\"/></svg>",
-	"description": "每天替你刷一轮 B 站：通读原文字幕深度排雷、三档位精选、默认私信投递、支持私信双向对话与分享看片、视频卡片墙与自动收藏。",
-	"descriptionEn": "Autonomous Bilibili duty agent: reads raw subtitles to filter fluff, delivers curated video digests directly to private DMs, supports bidirectional DM chat, video card wall, and auto-favorite.",
+	"description": "使用当前账号浏览 B 站，以字幕、音频和抽样画面理解视频，整理精选、发表评论、查询私信历史并自动交流，无需主人 UID。",
+	"descriptionEn": "Browse Bilibili with the current account, analyze subtitles, audio and sampled frames, curate videos, comment, query the inbox and reply to new DMs.",
 	"apiVersion": 2,
 	"permissions": ["tools", "http", "ui", "storage", "net", "chat", "llm"],
 	"view": true,
@@ -61,10 +61,10 @@
 		{
 			"key": "dmUid",
 			"type": "number",
-			"label": "私信发给谁（UID）",
+			"label": "速报收件人 UID（可选）",
 			"labelEn": "Target Receiver UID for DM",
 			"default": 0,
-			"hint": "接收速报私信的 B站 用户 UID（可留空，将自动根据下方昵称查询）",
+			"hint": "仅用于投递速报，可留空；与当前账号私信查询和自动回复无关",
 			"hintEn": "Target Bilibili user UID; leave empty to resolve from username automatically"
 		},
 		{
@@ -82,8 +82,26 @@
 			"label": "私信双向对话（看片与回信）",
 			"labelEn": "Bidirectional DM Watcher",
 			"default": true,
-			"hint": "默认开启。纯代码轮询主人发来的私信，主人发视频链接时自动读字幕后回信，零成本不花多余 token",
-			"hintEn": "Watch master's DMs and reply; analyzes shared videos via subtitles"
+			"hint": "监听当前登录账号的收件箱，无需主人 UID。自动回复独立控制，仅新消息调用模型并产生费用。",
+			"hintEn": "Monitor the logged-in account inbox without an owner UID. Automatic replies use model tokens for new messages."
+		},
+		{
+			"key": "dmAutoReply",
+			"type": "boolean",
+			"label": "自动回复新私信",
+			"labelEn": "Automatically reply to new DMs",
+			"default": true,
+			"hint": "使用当前账号与新消息发送者交流；首次启用只建立基线，不补发旧消息。",
+			"hintEn": "Reply using the current account. Initial activation baselines the inbox without replying to old messages."
+		},
+		{
+			"key": "visionModel",
+			"type": "string",
+			"label": "画面理解模型（须支持图片）",
+			"labelEn": "Vision model (image support required)",
+			"default": "",
+			"hint": "留空跟随研读模型；抽样分析视频画面，无法覆盖所有瞬间。",
+			"hintEn": "Defaults to the analysis model. Sampled frames do not cover every moment."
 		},
 		{
 			"key": "dmWatchMinutes",
@@ -93,8 +111,8 @@
 			"default": 1,
 			"min": 1,
 			"max": 60,
-			"hint": "私信轮询频率，默认每 1 分钟检测一次主人未读私信",
-			"hintEn": "Frequency to poll for new DMs from the owner"
+			"hint": "默认每分钟检查当前账号的新私信",
+			"hintEn": "Frequency to poll the current account inbox"
 		},
 		{
 			"key": "dmReplyPerDay",
@@ -104,8 +122,8 @@
 			"default": 20,
 			"min": 0,
 			"max": 100,
-			"hint": "防止私信频繁刷屏或超支，0 为不限",
-			"hintEn": "Max auto-replies sent via DM per day (0 for unlimited)"
+			"hint": "每天最多自动回复 1–100 条，0 按默认 20 条处理",
+			"hintEn": "Daily automatic reply budget, 1–100; zero uses the default of 20"
 		},
 		{
 			"key": "model",
@@ -226,7 +244,7 @@
 			"type": "boolean",
 			"label": "本地 Whisper 转写（无字幕备选）",
 			"labelEn": "Local Whisper Transcription",
-			"default": false,
+			"default": true,
 			"hint": "对无字幕视频使用本地 Whisper 提取音频并转写；需在高级页安装转写依赖",
 			"hintEn": "Use local Whisper to transcribe videos without subtitles"
 		},

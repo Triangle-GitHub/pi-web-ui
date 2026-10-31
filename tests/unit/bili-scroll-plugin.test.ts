@@ -10,8 +10,8 @@ describe("bili-scroll plugin 2.0 verification", () => {
 		const manifest = JSON.parse(readFileSync(join(pluginDir, "manifest.json"), "utf8"));
 		const pkg = JSON.parse(readFileSync(join(pluginDir, "package.json"), "utf8"));
 
-		expect(manifest.version).toBe("2.0.6");
-		expect(pkg.version).toBe("2.0.6");
+		expect(manifest.version).toBe("2.1.0");
+		expect(pkg.version).toBe(manifest.version);
 		expect(manifest.apiVersion).toBe(2);
 		expect(manifest.permissions).toContain("tools");
 		expect(manifest.permissions).toContain("ui");
@@ -82,6 +82,9 @@ describe("bili-scroll plugin 2.0 verification", () => {
 			expect(registeredTools).toContain("bili_whoami");
 			expect(registeredTools).toContain("bili_search");
 			expect(registeredTools).toContain("bili_subtitle");
+			expect(registeredTools).toContain("bili_video_content");
+			expect(registeredTools).toContain("bili_dm_sessions");
+			expect(registeredTools).toContain("bili_dm_messages");
 			expect(registeredTools).toContain("bili_send_message");
 			expect(registeredTools).toContain("bili_status");
 			expect(registeredTools).toContain("bili_duty_run");

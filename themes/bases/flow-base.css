@@ -39,7 +39,7 @@
 .topbar {
 	background: var(--topbar-bg, var(--bg-elev));
 	border-bottom: 1px solid var(--border-soft);
-	box-shadow: 0 1px 3px var(--sunken-bg, rgba(0, 0, 0, 0.15));
+	box-shadow: 0 1px 3px var(--sunken-bg, color-mix(in srgb, var(--flow-shadow) 15%, transparent));
 	backdrop-filter: none;
 	-webkit-backdrop-filter: none;
 	z-index: 50;
@@ -49,7 +49,7 @@
 .statusbar {
 	background: var(--statusbar-bg, var(--bg-elev));
 	border-top: 1px solid var(--border-soft);
-	box-shadow: 0 -1px 3px var(--sunken-bg, rgba(0, 0, 0, 0.15));
+	box-shadow: 0 -1px 3px var(--sunken-bg, color-mix(in srgb, var(--flow-shadow) 15%, transparent));
 	backdrop-filter: none;
 	-webkit-backdrop-filter: none;
 	z-index: 50;
@@ -303,7 +303,7 @@
 	white-space: nowrap;
 	box-shadow:
 		inset 0 0.5px 0.5px color-mix(in srgb, var(--text) 22%, transparent),
-		0 2px 5px rgba(0, 0, 0, 0.35);
+		0 2px 5px color-mix(in srgb, var(--flow-shadow) 35%, transparent);
 	backdrop-filter: blur(12px) saturate(140%);
 	-webkit-backdrop-filter: blur(12px) saturate(140%);
 	transition:
@@ -321,8 +321,8 @@
 	background: var(--border);
 	border-color: color-mix(in srgb, var(--text) 22%, transparent);
 	box-shadow:
-		inset 0 1px 1px rgba(255, 255, 255, 0.35),
-		0 4px 10px rgba(0, 0, 0, 0.45);
+		inset 0 1px 1px color-mix(in srgb, var(--text) 35%, transparent),
+		0 4px 10px color-mix(in srgb, var(--flow-shadow) 45%, transparent);
 	transform: translateY(-1px);
 	transition:
 		background 0.15s cubic-bezier(0.16, 1, 0.3, 1),
@@ -335,7 +335,7 @@
 .toolcall.run {
 	border-color: rgba(245, 158, 11, 0.45);
 	box-shadow:
-		inset 0 0.5px 0.5px rgba(255, 255, 255, 0.25),
+		inset 0 0.5px 0.5px color-mix(in srgb, var(--text) 25%, transparent),
 		0 0 10px rgba(245, 158, 11, 0.25);
 }
 .toolcall.ok {
@@ -344,7 +344,7 @@
 .toolcall.err {
 	border-color: rgba(248, 113, 113, 0.45);
 	box-shadow:
-		inset 0 0.5px 0.5px rgba(255, 255, 255, 0.25),
+		inset 0 0.5px 0.5px color-mix(in srgb, var(--text) 25%, transparent),
 		0 0 10px rgba(239, 68, 68, 0.25);
 }
 
@@ -357,7 +357,7 @@
 .thinking.run {
 	border-color: rgba(192, 132, 252, 0.5);
 	box-shadow:
-		inset 0 0.5px 0.5px rgba(255, 255, 255, 0.25),
+		inset 0 0.5px 0.5px color-mix(in srgb, var(--text) 25%, transparent),
 		0 0 10px rgba(192, 132, 252, 0.25);
 }
 
@@ -457,7 +457,7 @@
 	line-height: 1;
 	font-size: 11px;
 	font-weight: 500;
-	color: #f1f5f9;
+	color: var(--text);
 	padding: 0;
 	margin: 0;
 	flex: none;
@@ -467,43 +467,43 @@
 }
 
 .thinking .thinking-name {
-	color: #f1f5f9;
+	color: var(--text);
 }
 .thinking .thinking-icon,
 .thinking .thinking-status {
-	color: #c084fc;
+	color: var(--plugin-purple);
 	filter: drop-shadow(0 0 4px rgba(192, 132, 252, 0.75));
 }
 
 /* 语义化工具微光宝石呼吸灯 */
 .toolcall-icon.tc-tone-exec {
-	color: #38bdf8;
+	color: var(--info-blue);
 	filter: drop-shadow(0 0 4px rgba(56, 189, 248, 0.75));
 }
 .toolcall-icon.tc-tone-read,
 .toolcall-icon.tc-tone-search {
-	color: #34d399;
+	color: var(--green);
 	filter: drop-shadow(0 0 4px rgba(52, 211, 153, 0.75));
 }
 .toolcall-icon.tc-tone-edit {
-	color: #fbbf24;
+	color: var(--amber);
 	filter: drop-shadow(0 0 4px rgba(251, 191, 36, 0.75));
 }
 .toolcall-icon.tc-tone-code {
-	color: #e879f9;
+	color: var(--plugin-purple);
 	filter: drop-shadow(0 0 4px rgba(232, 121, 249, 0.75));
 }
 .toolcall-icon.tc-tone-agent {
-	color: #f87171;
+	color: var(--red);
 	filter: drop-shadow(0 0 4px rgba(248, 113, 113, 0.75));
 }
 
 .toolcall.ok .toolcall-status {
-	color: #34d399;
+	color: var(--green);
 	filter: drop-shadow(0 0 3px rgba(52, 211, 153, 0.6));
 }
 .toolcall.err .toolcall-status {
-	color: #f87171;
+	color: var(--red);
 	filter: drop-shadow(0 0 4px rgba(248, 113, 113, 0.8));
 }
 
@@ -554,10 +554,10 @@
 	opacity: 0.85;
 }
 .toolcall-out-badge.img {
-	color: #3b82f6;
+	color: var(--info-blue);
 }
 .toolcall-out-badge.md {
-	color: #a78bfa;
+	color: var(--plugin-purple);
 }
 .toolcall-out-badge svg {
 	width: 10px;
@@ -642,7 +642,7 @@
 	border: none;
 	border-radius: 14px;
 	padding: 8px 14px;
-	box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+	box-shadow: 0 2px 8px color-mix(in srgb, var(--flow-shadow) 25%, transparent);
 	backdrop-filter: none;
 	-webkit-backdrop-filter: none;
 	color: var(--text);
@@ -656,8 +656,8 @@
 	border: 1px solid var(--border);
 	border-radius: 18px;
 	box-shadow:
-		0 4px 24px rgba(0, 0, 0, 0.45),
-		0 1px 2px rgba(0, 0, 0, 0.3);
+		0 4px 24px color-mix(in srgb, var(--flow-shadow) 45%, transparent),
+		0 1px 2px color-mix(in srgb, var(--flow-shadow) 30%, transparent);
 	backdrop-filter: none;
 	-webkit-backdrop-filter: none;
 	transition:
@@ -666,9 +666,9 @@
 }
 
 .inputbox:focus-within {
-	border-color: rgba(255, 255, 255, 0.2);
+	border-color: color-mix(in srgb, var(--text) 20%, transparent);
 	box-shadow:
-		0 6px 32px rgba(0, 0, 0, 0.55),
+		0 6px 32px color-mix(in srgb, var(--flow-shadow) 55.00000000000001%, transparent),
 		0 0 0 1px var(--border);
 }
 
@@ -685,7 +685,7 @@
 }
 
 .composer-tools .chip {
-	background: #181818;
+	background: var(--control-bg);
 	border: 1px solid var(--border);
 	color: var(--control-fg, var(--text));
 	box-shadow: none;
@@ -697,8 +697,8 @@
 }
 
 .composer-tools .chip:hover {
-	background: #282828;
-	border-color: rgba(255, 255, 255, 0.16);
+	background: var(--bg-elev2);
+	border-color: color-mix(in srgb, var(--text) 16%, transparent);
 	color: var(--md-strong, var(--text));
 }
 
@@ -737,7 +737,7 @@
 	display: inline-flex;
 	align-items: center;
 	justify-content: center;
-	box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+	box-shadow: 0 2px 8px color-mix(in srgb, var(--flow-shadow) 30%, transparent);
 }
 .inputbox .btn.send svg {
 	stroke: var(--accent-contrast, #fff);
@@ -765,7 +765,7 @@
 .inputbox .split-send {
 	background: var(--accent);
 	border-color: var(--accent);
-	box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+	box-shadow: 0 2px 8px color-mix(in srgb, var(--flow-shadow) 30%, transparent);
 	border-radius: 18px;
 }
 .inputbox .split-send button {
@@ -779,29 +779,29 @@
 	background: color-mix(in srgb, var(--accent-contrast, #000) 10%, transparent);
 }
 .inputbox .split-send button + button {
-	border-left: 1px solid rgba(0, 0, 0, 0.15);
+	border-left: 1px solid color-mix(in srgb, var(--flow-shadow) 15%, transparent);
 }
 .inputbox .split-send:hover {
-	background: #f4f4f4;
+	background: var(--accent);
 	border-color: var(--md-strong, var(--text));
-	box-shadow: 0 0 14px rgba(255, 255, 255, 0.3);
+	box-shadow: 0 0 14px color-mix(in srgb, var(--text) 30%, transparent);
 }
 .inputbox .split-send button:hover:not(:disabled) {
-	background: rgba(0, 0, 0, 0.08);
+	background: color-mix(in srgb, var(--flow-shadow) 8%, transparent);
 }
 
 /* 快捷指令/快捷短语胶囊：悬浮、背景透明、磨砂毛玻璃浮空质感 */
 .quick-chip {
-	background: rgba(33, 33, 33, 0.48);
+	background: var(--chip-bg);
 	border: 1px solid var(--border);
 	border-radius: 999px;
 	box-shadow:
-		0 4px 16px rgba(0, 0, 0, 0.28),
-		0 1px 3px rgba(0, 0, 0, 0.2),
+		0 4px 16px color-mix(in srgb, var(--flow-shadow) 28.000000000000004%, transparent),
+		0 1px 3px color-mix(in srgb, var(--flow-shadow) 20%, transparent),
 		inset 0 1px 0 var(--border);
 	backdrop-filter: blur(14px) saturate(140%);
 	-webkit-backdrop-filter: blur(14px) saturate(140%);
-	color: #e0e0e0;
+	color: var(--text);
 	transition:
 		transform 0.18s cubic-bezier(0.16, 1, 0.3, 1),
 		box-shadow 0.18s cubic-bezier(0.16, 1, 0.3, 1),
@@ -812,11 +812,11 @@
 
 .quick-chip:hover:not(:disabled) {
 	transform: translateY(-2px);
-	background: rgba(45, 45, 45, 0.72);
-	border-color: rgba(255, 255, 255, 0.28);
+	background: var(--bg-elev2);
+	border-color: color-mix(in srgb, var(--text) 28.000000000000004%, transparent);
 	box-shadow:
-		0 8px 24px rgba(0, 0, 0, 0.42),
-		0 2px 6px rgba(0, 0, 0, 0.25),
+		0 8px 24px color-mix(in srgb, var(--flow-shadow) 42%, transparent),
+		0 2px 6px color-mix(in srgb, var(--flow-shadow) 25%, transparent),
 		inset 0 1px 0 color-mix(in srgb, var(--text) 14%, transparent);
 	color: var(--md-strong, var(--text));
 }
@@ -824,22 +824,22 @@
 .quick-chip:active:not(:disabled) {
 	transform: translateY(0) scale(0.97);
 	box-shadow:
-		0 2px 8px rgba(0, 0, 0, 0.24),
+		0 2px 8px color-mix(in srgb, var(--flow-shadow) 24%, transparent),
 		inset 0 1px 0 color-mix(in srgb, var(--text) 5%, transparent);
 }
 
 /* 底部候选操作建议（同属快捷指令交互）：悬浮透明毛玻璃 */
 .action-suggestion-chip {
-	background: rgba(33, 33, 33, 0.48);
+	background: var(--chip-bg);
 	border: 1px solid var(--border);
 	border-radius: 999px;
 	box-shadow:
-		0 4px 16px rgba(0, 0, 0, 0.28),
-		0 1px 3px rgba(0, 0, 0, 0.2),
+		0 4px 16px color-mix(in srgb, var(--flow-shadow) 28.000000000000004%, transparent),
+		0 1px 3px color-mix(in srgb, var(--flow-shadow) 20%, transparent),
 		inset 0 1px 0 var(--border);
 	backdrop-filter: blur(14px) saturate(140%);
 	-webkit-backdrop-filter: blur(14px) saturate(140%);
-	color: #e0e0e0;
+	color: var(--text);
 	transition:
 		transform 0.18s cubic-bezier(0.16, 1, 0.3, 1),
 		box-shadow 0.18s cubic-bezier(0.16, 1, 0.3, 1),
@@ -850,11 +850,11 @@
 
 .action-suggestion-chip:hover:not(:disabled) {
 	transform: translateY(-2px);
-	background: rgba(45, 45, 45, 0.72);
-	border-color: rgba(255, 255, 255, 0.28);
+	background: var(--bg-elev2);
+	border-color: color-mix(in srgb, var(--text) 28.000000000000004%, transparent);
 	box-shadow:
-		0 8px 24px rgba(0, 0, 0, 0.42),
-		0 2px 6px rgba(0, 0, 0, 0.25),
+		0 8px 24px color-mix(in srgb, var(--flow-shadow) 42%, transparent),
+		0 2px 6px color-mix(in srgb, var(--flow-shadow) 25%, transparent),
 		inset 0 1px 0 color-mix(in srgb, var(--text) 14%, transparent);
 	color: var(--md-strong, var(--text));
 }
@@ -871,7 +871,7 @@
 	background: var(--card-bg, var(--bg-elev));
 	border: 1px solid var(--border);
 	box-shadow:
-		0 16px 40px rgba(0, 0, 0, 0.65),
+		0 16px 40px color-mix(in srgb, var(--flow-shadow) 65%, transparent),
 		inset 0 1px 0 color-mix(in srgb, var(--text) 4%, transparent);
 }
 
@@ -880,7 +880,7 @@
 	background: var(--card-bg, var(--bg-elev));
 	border: 1px solid var(--border);
 	box-shadow:
-		0 12px 32px rgba(0, 0, 0, 0.55),
+		0 12px 32px color-mix(in srgb, var(--flow-shadow) 55.00000000000001%, transparent),
 		inset 0 1px 0 color-mix(in srgb, var(--text) 4%, transparent);
 	color: var(--text);
 }
@@ -918,7 +918,7 @@
 	border: 1px solid color-mix(in srgb, var(--text) 18%, transparent);
 	border-radius: 14px;
 	box-shadow:
-		0 20px 50px rgba(0, 0, 0, 0.85),
+		0 20px 50px color-mix(in srgb, var(--flow-shadow) 85%, transparent),
 		0 0 20px var(--border);
 	color: var(--text);
 	font-family:
@@ -971,7 +971,7 @@
 	font-size: 14.5px;
 	color: var(--text);
 	white-space: nowrap;
-	text-shadow: 0 1px 2px rgba(0, 0, 0, 0.9);
+	text-shadow: none;
 }
 
 .pi-we-inspector-badge {
@@ -980,7 +980,7 @@
 	padding: 2px 7px;
 	border-radius: 4px;
 	background: color-mix(in srgb, var(--text) 8%, transparent);
-	border: 1px solid rgba(255, 255, 255, 0.15);
+	border: 1px solid color-mix(in srgb, var(--text) 15%, transparent);
 	color: var(--text-dim);
 	white-space: nowrap;
 }
@@ -1022,12 +1022,12 @@
 	align-items: center;
 	gap: 5px;
 	transition: all 0.15s ease;
-	text-shadow: 0 1px 1px rgba(0, 0, 0, 0.8);
+	text-shadow: none;
 }
 
 .pi-we-inspector-btn:hover {
 	background: color-mix(in srgb, var(--text) 16%, transparent);
-	border-color: rgba(255, 255, 255, 0.35);
+	border-color: color-mix(in srgb, var(--text) 35%, transparent);
 	color: var(--text);
 }
 
@@ -1056,7 +1056,7 @@
 .pi-we-inspector-label {
 	font-size: 12px;
 	font-weight: 600;
-	color: #94a3b8;
+	color: var(--text-dim);
 	text-transform: uppercase;
 	letter-spacing: 0.05em;
 	display: flex;
@@ -1065,7 +1065,7 @@
 }
 
 .pi-we-inspector-codeblock {
-	background: rgba(4, 6, 12, 0.85);
+	background: var(--code-bg);
 	border: 1px solid var(--border);
 	border-radius: 8px;
 	padding: 12px 14px;
@@ -1078,11 +1078,11 @@
 	overflow-x: auto;
 	max-height: 40vh;
 	margin: 0;
-	text-shadow: 0 1px 1px rgba(0, 0, 0, 0.9);
+	text-shadow: none;
 }
 
 .pi-we-inspector-thinking-text {
-	background: rgba(18, 14, 28, 0.65);
+	background: color-mix(in srgb, var(--card-bg) 95%, var(--plugin-purple));
 	border: 1px solid rgba(168, 85, 247, 0.25);
 	border-radius: 8px;
 	padding: 14px 16px;
@@ -1094,7 +1094,7 @@
 	max-height: 55vh;
 	overflow-y: auto;
 	margin: 0;
-	text-shadow: 0 1px 1.5px rgba(0, 0, 0, 0.9);
+	text-shadow: none;
 }
 
 /* 富媒体文件展示预览（针对 present_files 与文件交付） */
@@ -1138,7 +1138,7 @@
 	display: flex;
 	flex-direction: column;
 	gap: 10px;
-	box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
+	box-shadow: 0 4px 16px color-mix(in srgb, var(--flow-shadow) 25%, transparent);
 }
 
 .pi-we-ins-preview-head {
@@ -1187,7 +1187,7 @@
 
 .pi-we-ins-btn-sm {
 	background: color-mix(in srgb, var(--text) 8%, transparent);
-	border: 1px solid rgba(255, 255, 255, 0.15);
+	border: 1px solid color-mix(in srgb, var(--text) 15%, transparent);
 	border-radius: 4px;
 	color: var(--text);
 	font-size: 11px;
@@ -1202,7 +1202,7 @@
 
 .pi-we-ins-btn-sm:hover {
 	background: color-mix(in srgb, var(--text) 18%, transparent);
-	border-color: rgba(255, 255, 255, 0.3);
+	border-color: color-mix(in srgb, var(--text) 30%, transparent);
 }
 
 .pi-we-ins-preview-media {
@@ -1210,7 +1210,7 @@
 	display: flex;
 	justify-content: center;
 	align-items: center;
-	background: rgba(0, 0, 0, 0.35);
+	background: color-mix(in srgb, var(--flow-shadow) 35%, transparent);
 	border-radius: 6px;
 	padding: 8px;
 	overflow: hidden;
@@ -1237,7 +1237,7 @@
 
 /* 角标防白底白字：当 --accent 为纯白时，顶栏实体胶囊角标反色为深色，后台任务保持红底白字（底栏透明徽标保持 var(--accent) 纯白高亮） */
 .topbar .bar-item-badge:not(.bg-task-badge) {
-	color: #000000;
+	color: var(--accent-contrast, #000);
 }
 
 /* ========================================================

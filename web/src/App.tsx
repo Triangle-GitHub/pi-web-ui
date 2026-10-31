@@ -10,13 +10,14 @@ import {
 	type PointerEvent as ReactPointerEvent,
 } from "react";
 import { TopBar } from "./components/TopBar";
+import { RemoteDesktopWindow } from "./components/RemoteDesktopWindow";
 import { LeftPanel } from "./components/LeftPanel";
 import { RightPanel } from "./components/RightPanel";
 import { MessageList } from "./components/MessageList";
 import { ChatInput } from "./components/ChatInput";
 import { GoalBar } from "./components/GoalBar";
 import { SandboxModal } from "./components/SandboxModal";
-import { WorktreeBanner } from "./components/WorktreeBanner";
+import { WorktreeView, useWorktreeRefresh } from "./components/WorktreeBanner";
 import { FiRefreshCw, FiFeather } from "react-icons/fi";
 import { useEscapeKey } from "./shortcut-stack";
 
@@ -485,9 +486,28 @@ export function App() {
 	   or a panel's "open this in a terminal" button. The server refuses those
 	   messages anyway, so the pane would sit there empty. No list means every
 	   tab, which is the default. */
-	const tabOn = (tab: string) => !chat.tabs || tab === "chat" || tab === "devices" || chat.tabs.includes(tab);
+	const tabOn = (tab: string) =>
+		!chat.tabs || tab === "chat" || tab === "devices" || tab === "worktrees" || chat.tabs.includes(tab);
 	const viewTab = viewChosen.startsWith("plugin:") ? "plugins" : viewChosen;
 	const view: ViewName = tabOn(viewTab) ? viewChosen : "chat";
+	const refreshWorktrees = useCallback(() => send({ type: "refresh_worktrees" }), [send]);
+	useWorktreeRefresh(chat.state?.worktree?.mainPath, refreshWorktrees);
+	const pendingWorktreeSwitch = useRef<{ source: string; target: string } | null>(null);
+	useEffect(() => {
+		const pending = pendingWorktreeSwitch.current;
+		if (!pending || !chat.state?.cwd) return;
+		if (view !== "worktrees") {
+			pendingWorktreeSwitch.current = null;
+			return;
+		}
+		if (chat.state.cwd === pending.target || chat.state.worktree?.currentPath === pending.target) {
+			pendingWorktreeSwitch.current = null;
+			setView("chat");
+			focusComposer();
+		} else if (chat.state.cwd !== pending.source) {
+			pendingWorktreeSwitch.current = null;
+		}
+	}, [chat.state?.cwd, chat.state?.worktree?.currentPath, view]);
 	// 已安装且未在设置面板禁用的插件（决定 tab 与视图加载）。
 	const enabledPlugins = useMemo(
 		() => chat.plugins.filter((p) => !chat.settings?.disabledPlugins?.includes(p.id)),
@@ -2114,6 +2134,7 @@ export function App() {
 				if (others.length > 0) void addLocalFiles(others);
 			}}
 		>
+			<RemoteDesktopWindow />
 			{zenMode && (
 				<button
 					type="button"
@@ -2481,14 +2502,7 @@ export function App() {
 													</div>
 												</div>
 											)}
-											{chat.state.worktree && (
-												<WorktreeBanner
-													worktree={chat.state.worktree}
-													onRefresh={() => send({ type: "refresh_worktrees" })}
-													onSwitch={(path) => send({ type: "switch_worktree", path })}
-													onRemove={(path, force) => send({ type: "remove_worktree", path, force })}
-												/>
-											)}
+
 											{chat.state.isEphemeral && (
 												<div className="ephemeral-banner">
 													<span>🎭 {t("ephemeralBannerText")}</span>
@@ -2910,6 +2924,23 @@ export function App() {
 							/>
 						</DeferredMount>
 					</div>
+					{view === "worktrees" && (
+						<div className="view-pane">
+							<WorktreeView
+								worktree={chat.state?.worktree}
+								onRefresh={refreshWorktrees}
+								onSwitch={(path) => {
+									pendingWorktreeSwitch.current = { source: chat.state?.cwd ?? "", target: path };
+									send({ type: "switch_worktree", path });
+								}}
+								onRemove={(path) => send({ type: "remove_worktree", path })}
+								onBack={() => {
+									setView("chat");
+									focusComposer();
+								}}
+							/>
+						</div>
+					)}
 					<div className={`view-pane ${view === "devices" ? "" : "hidden"}`}>
 						<DeferredMount active={view === "devices"}>
 							<DeviceCenter pathCompletions={chat.pathCompletions} />

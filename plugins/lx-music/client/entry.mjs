@@ -1,6 +1,6 @@
 /**
  * 洛雪音乐 (LX Music) 客户端入口 —— 全功能专业音乐播放器
- * 特性：多源搜索、热歌榜单、收藏夹持久化、播放队列抽屉、画中画桌面浮动歌词、音质切换、歌曲下载、快捷键
+ * 特性：一键播放全部、静默添加队列(无阻断弹窗)、多源搜索、热歌榜单、收藏夹持久化、播放队列抽屉、画中画桌面浮动歌词、音质切换、歌曲下载、快捷键
  */
 
 let globalAudio = null;
@@ -22,6 +22,28 @@ let globalState = {
 	activeViewTab: "search", // search | top | favorites | queue
 	topChartType: "hot", // hot | soar | new
 };
+
+// ==============================
+// 轻量无阻断 Toast 提示系统 (不弹 alert)
+// ==============================
+let toastTimer = null;
+function showToast(message, duration = 1800) {
+	if (!activeRootEl) return;
+	let toast = activeRootEl.querySelector("#lx-toast");
+	if (!toast) {
+		toast = document.createElement("div");
+		toast.id = "lx-toast";
+		toast.className = "lx-toast";
+		activeRootEl.appendChild(toast);
+	}
+	toast.textContent = message;
+	toast.classList.add("show");
+
+	clearTimeout(toastTimer);
+	toastTimer = setTimeout(() => {
+		toast.classList.remove("show");
+	}, duration);
+}
 
 // ==============================
 // 画中画桌面歌词 (Picture-in-Picture)
@@ -62,19 +84,16 @@ function updatePipLyric(mainText, subText = "") {
 	pipCtx.fillStyle = "#14161d";
 	pipCtx.fillRect(0, 0, 640, 140);
 
-	// 边框装饰
 	pipCtx.strokeStyle = "rgba(255,255,255,0.08)";
 	pipCtx.lineWidth = 2;
 	pipCtx.strokeRect(1, 1, 638, 138);
 
-	// 主歌词
 	pipCtx.fillStyle = "#88c0d0";
 	pipCtx.font = "bold 24px -apple-system, BlinkMacSystemFont, sans-serif";
 	pipCtx.textAlign = "center";
 	pipCtx.textBaseline = "middle";
 	pipCtx.fillText(mainText || "洛雪音乐", 320, 52);
 
-	// 副标题或歌手
 	pipCtx.fillStyle = "#7e8798";
 	pipCtx.font = "15px sans-serif";
 	pipCtx.fillText(
@@ -97,7 +116,7 @@ async function togglePictureInPicture() {
 			await pipVideo.requestPictureInPicture();
 		}
 	} catch (err) {
-		alert(`画中画启动失败: ${err.message}`);
+		showToast(`画中画启动失败: ${err.message}`);
 	}
 }
 
@@ -228,7 +247,6 @@ function updateCurrentLyric(currentTime) {
 		const curLine = globalState.lyrics[idx];
 		const nextLine = globalState.lyrics[idx + 1];
 
-		// 更新画中画歌词
 		updatePipLyric(curLine.text, nextLine ? nextLine.text : "");
 
 		const lrcContainer = activeRootEl.querySelector("#lx-lyrics-scroll");
@@ -306,7 +324,7 @@ async function playSong(song, addToQueue = true) {
 	}
 	renderLyrics();
 
-	// 2. 获取真实音频链接 (携带所选音质)
+	// 2. 获取真实音频链接
 	try {
 		const urlRes = await fetch(
 			`${apiBaseUrl}/song-url?source=${song.source}&songId=${encodeURIComponent(song.id)}&name=${encodeURIComponent(song.name)}&singer=${encodeURIComponent(song.singer)}&album=${encodeURIComponent(song.album || "")}&quality=${globalState.quality}`,
@@ -318,7 +336,7 @@ async function playSong(song, addToQueue = true) {
 			audio.src = streamUrl;
 			await audio.play();
 		} else {
-			alert(`无法获取歌曲播放链接: ${song.name}`);
+			showToast(`无法获取播放链接: ${song.name}`);
 		}
 	} catch (err) {
 		console.error("Play error:", err);
@@ -362,12 +380,13 @@ async function toggleFavorite(song) {
 	const idx = globalState.favorites.findIndex((f) => f.id === song.id && f.source === song.source);
 	if (idx >= 0) {
 		globalState.favorites.splice(idx, 1);
+		showToast(`已从收藏夹移除: ${song.name}`);
 	} else {
 		globalState.favorites.push(song);
+		showToast(`已收藏: ${song.name}`);
 	}
 	renderCurrentTable();
 
-	// 持久化到服务端
 	try {
 		await fetch(`${apiBaseUrl}/favorites`, {
 			method: "POST",
@@ -386,8 +405,9 @@ async function downloadCurrentSong(song) {
 			).then((r) => r.json());
 			if (urlRes.ok && urlRes.url) url = urlRes.url;
 		}
-		if (!url) return alert("获取下载链接失败");
+		if (!url) return showToast("获取下载链接失败");
 
+		showToast(`正在开始下载: ${song.name}`);
 		const downloadUrl = `${apiBaseUrl}/download?url=${encodeURIComponent(url)}&name=${encodeURIComponent(song.name)}&singer=${encodeURIComponent(song.singer)}`;
 		const a = document.createElement("a");
 		a.href = downloadUrl;
@@ -396,8 +416,78 @@ async function downloadCurrentSong(song) {
 		a.click();
 		document.body.removeChild(a);
 	} catch (err) {
-		alert(`下载出错: ${err.message}`);
+		showToast(`下载出错: ${err.message}`);
 	}
+}
+
+// ==============================
+// 列表与队列批量操作核心
+// ==============================
+function getCurrentViewSongs() {
+	if (globalState.activeViewTab === "search") {
+		return globalState.searchResults || [];
+	} else if (globalState.activeViewTab === "top") {
+		return globalState.topChartSongs || [];
+	} else if (globalState.activeViewTab === "favorites") {
+		return globalState.favorites || [];
+	} else if (globalState.activeViewTab === "queue") {
+		return globalState.queue || [];
+	}
+	return [];
+}
+
+/** 一键播放整个列表 */
+function playAllCurrentList() {
+	const songs = getCurrentViewSongs();
+	if (!songs || songs.length === 0) {
+		return showToast("当前列表没有可播放的歌曲");
+	}
+
+	// 将当前整个列表载入播放队列并立即从第 1 首播放
+	globalState.queue = [...songs];
+	updateQueueBadge();
+	playSong(songs[0], false);
+	showToast(`开始播放全部 (共 ${songs.length} 首)`);
+}
+
+/** 全部直接加入队列（静默添加，无阻断确认框） */
+function addAllCurrentToQueue() {
+	const songs = getCurrentViewSongs();
+	if (!songs || songs.length === 0) {
+		return showToast("当前列表没有歌曲");
+	}
+
+	let addedCount = 0;
+	songs.forEach((s) => {
+		const exists = globalState.queue.find((item) => item.id === s.id && item.source === s.source);
+		if (!exists) {
+			globalState.queue.push(s);
+			addedCount++;
+		}
+	});
+
+	updateQueueBadge();
+	showToast(`已追加 ${addedCount} 首歌曲至播放队列`);
+}
+
+/** 直接添加单曲到队列（无任何 confirm/alert 阻断弹窗） */
+function addSingleToQueueDirectly(song) {
+	const exists = globalState.queue.find((item) => item.id === song.id && item.source === song.source);
+	if (exists) {
+		showToast(`该歌曲已在队列中: ${song.name}`);
+	} else {
+		globalState.queue.push(song);
+		updateQueueBadge();
+		showToast(`已加入播放队列: ${song.name}`);
+	}
+}
+
+/** 清空当前播放队列 */
+function clearQueue() {
+	globalState.queue = [];
+	updateQueueBadge();
+	renderCurrentTable();
+	showToast("播放队列已清空");
 }
 
 function renderPlayerBarInfo() {
@@ -461,25 +551,24 @@ function updateUserApiBadge() {
 
 function updateQueueBadge() {
 	if (!activeRootEl) return;
-	const btn = activeRootEl.querySelector("#lx-queue-btn");
-	if (btn) {
-		btn.innerHTML = `<span>📋</span><span>队列 (${globalState.queue.length})</span>`;
+	const queueNavTab = activeRootEl.querySelector(".lx-nav-tab[data-tab='queue']");
+	if (queueNavTab) {
+		queueNavTab.innerHTML = `<span>📋 播放队列</span><span class="lx-badge-count">${globalState.queue.length}</span>`;
 	}
 }
 
 function renderCurrentTable() {
 	if (!activeRootEl) return;
 	const tbody = activeRootEl.querySelector("#lx-song-table-body");
-	let songs = [];
+	const listCountEl = activeRootEl.querySelector("#lx-list-count");
+	const clearQueueBtn = activeRootEl.querySelector("#lx-clear-queue-btn");
+	const songs = getCurrentViewSongs();
 
-	if (globalState.activeViewTab === "search") {
-		songs = globalState.searchResults;
-	} else if (globalState.activeViewTab === "top") {
-		songs = globalState.topChartSongs || [];
-	} else if (globalState.activeViewTab === "favorites") {
-		songs = globalState.favorites;
-	} else if (globalState.activeViewTab === "queue") {
-		songs = globalState.queue;
+	if (listCountEl) {
+		listCountEl.textContent = `共 ${songs.length} 首歌曲`;
+	}
+	if (clearQueueBtn) {
+		clearQueueBtn.style.display = globalState.activeViewTab === "queue" && songs.length > 0 ? "inline-flex" : "none";
 	}
 
 	if (!songs || songs.length === 0) {
@@ -487,7 +576,7 @@ function renderCurrentTable() {
 			search: "输入关键词开始搜索音乐",
 			top: "正在加载排行榜...",
 			favorites: "暂无收藏歌曲，点击歌曲行 ❤️ 即可收藏",
-			queue: "播放队列为空，搜索并点击播放歌曲将自动入队",
+			queue: "播放队列为空，点击歌曲直接入队",
 		};
 		tbody.innerHTML = `<tr><td colspan="6" style="text-align: center; color: var(--text-faint, #7e8798); padding: 40px;">${tips[globalState.activeViewTab] || "无数据"}</td></tr>`;
 		return;
@@ -524,7 +613,7 @@ function renderCurrentTable() {
 					<button class="lx-icon-btn btn-play" title="立即播放">
 						<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>
 					</button>
-					<button class="lx-icon-btn btn-add" title="加入播放列表">
+					<button class="lx-icon-btn btn-add" title="直接加入播放队列(不弹窗)">
 						<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
 					</button>
 					<button class="lx-icon-btn btn-down" title="下载音频">
@@ -535,11 +624,8 @@ function renderCurrentTable() {
 		`;
 
 		tr.querySelector(".btn-play").addEventListener("click", () => playSong(song));
-		tr.querySelector(".btn-add").addEventListener("click", () => {
-			globalState.queue.push(song);
-			updateQueueBadge();
-			alert(`已加入播放列表: ${song.name}`);
-		});
+		// 直接静默加入队列，不弹任何 alert 确认窗！
+		tr.querySelector(".btn-add").addEventListener("click", () => addSingleToQueueDirectly(song));
 		tr.querySelector(".btn-down").addEventListener("click", () => downloadCurrentSong(song));
 		tr.querySelector(".lx-fav-btn").addEventListener("click", () => toggleFavorite(song));
 		tbody.appendChild(tr);
@@ -607,6 +693,13 @@ function buildStyles() {
 			color: var(--accent-contrast, #ffffff);
 			font-weight: 600;
 		}
+		.lx-badge-count {
+			background: rgba(255,255,255,0.2);
+			color: inherit;
+			font-size: 11px;
+			padding: 1px 6px;
+			border-radius: 10px;
+		}
 		.lx-search-box {
 			display: flex;
 			align-items: center;
@@ -670,10 +763,23 @@ function buildStyles() {
 		.lx-btn:hover {
 			background: var(--border, #2e3440);
 		}
-		.lx-btn.active {
+		.lx-btn-primary {
+			border: none;
 			background: var(--accent, #5e81ac);
 			color: var(--accent-contrast, #ffffff);
-			border-color: var(--accent, #5e81ac);
+			border-radius: 6px;
+			padding: 6px 14px;
+			font-size: 12.5px;
+			font-weight: 600;
+			cursor: pointer;
+			display: flex;
+			align-items: center;
+			gap: 6px;
+			transition: transform 0.15s, opacity 0.15s;
+		}
+		.lx-btn-primary:hover {
+			transform: scale(1.02);
+			opacity: 0.95;
 		}
 
 		/* 次级工具栏 (音源切换/榜单切换) */
@@ -705,6 +811,25 @@ function buildStyles() {
 			background: var(--accent, #5e81ac);
 			color: var(--accent-contrast, #ffffff);
 			border-color: var(--accent, #5e81ac);
+		}
+
+		/* 列表操作顶栏 (一键播放全部) */
+		.lx-list-action-bar {
+			display: flex;
+			align-items: center;
+			justify-content: space-between;
+			padding: 10px 0 12px 0;
+			border-bottom: 1px solid rgba(255,255,255,0.05);
+			margin-bottom: 6px;
+		}
+		.lx-list-left-actions {
+			display: flex;
+			align-items: center;
+			gap: 10px;
+		}
+		.lx-list-count {
+			font-size: 12px;
+			color: var(--text-faint, #7e8798);
 		}
 
 		/* 主体内容布局 */
@@ -980,6 +1105,30 @@ function buildStyles() {
 			outline: none;
 		}
 
+		/* 轻量非阻断 Toast 提示框 */
+		.lx-toast {
+			position: absolute;
+			bottom: 80px;
+			left: 50%;
+			transform: translateX(-50%) translateY(20px);
+			background: rgba(20, 22, 29, 0.94);
+			border: 1px solid var(--border, #2e3440);
+			color: var(--text, #eceff4);
+			padding: 8px 18px;
+			border-radius: 20px;
+			font-size: 12.5px;
+			box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+			pointer-events: none;
+			opacity: 0;
+			transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+			z-index: 99999;
+			backdrop-filter: blur(8px);
+		}
+		.lx-toast.show {
+			opacity: 1;
+			transform: translateX(-50%) translateY(0);
+		}
+
 		/* 模态框 */
 		.lx-modal-mask {
 			position: fixed;
@@ -1082,6 +1231,23 @@ function renderApp(el) {
 			<!-- 中间主视图 -->
 			<div class="lx-main">
 				<div class="lx-song-list-wrap">
+					<!-- 列表操作顶栏 (一键播放全部) -->
+					<div class="lx-list-action-bar">
+						<div class="lx-list-left-actions">
+							<button class="lx-btn-primary" id="lx-play-all-btn">
+								<svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+								<span>播放全部</span>
+							</button>
+							<button class="lx-btn" id="lx-add-all-btn" title="将当前列表整张加入播放队列(无确认框)">
+								<span>➕ 全部入队</span>
+							</button>
+							<button class="lx-btn" id="lx-clear-queue-btn" style="display: none;" title="清空播放队列">
+								<span>🗑️ 清空队列</span>
+							</button>
+						</div>
+						<div class="lx-list-count" id="lx-list-count">共 0 首歌曲</div>
+					</div>
+
 					<table class="lx-table">
 						<thead>
 							<tr>
@@ -1126,7 +1292,6 @@ function renderApp(el) {
 
 				<div class="lx-footer-center">
 					<div class="lx-ctrl-btns">
-						<!-- 播放模式切换 -->
 						<button class="lx-icon-btn" id="lx-mode-btn" title="列表循环">
 							<span id="lx-mode-icon">🔁</span>
 						</button>
@@ -1139,7 +1304,6 @@ function renderApp(el) {
 						<button class="lx-icon-btn" id="lx-next-btn" title="下一首 (Ctrl+Right)">
 							<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 4 15 12 5 20 5 4"/><line x1="19" y1="5" x2="19" y2="19" stroke="currentColor" stroke-width="2"/></svg>
 						</button>
-						<!-- 画中画悬浮歌词 -->
 						<button class="lx-icon-btn" id="lx-pip-btn" title="开启桌面画中画悬浮歌词">
 							<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><rect x="12" y="9" width="8" height="6" rx="1"/></svg>
 						</button>
@@ -1155,7 +1319,6 @@ function renderApp(el) {
 				</div>
 
 				<div class="lx-footer-right">
-					<!-- 音质选择 -->
 					<select class="lx-quality-select" id="lx-quality-select" title="音质选择">
 						<option value="128k">标准 128k</option>
 						<option value="320k">高品 320k</option>
@@ -1295,7 +1458,12 @@ function bindEvents(rootEl) {
 	rootEl.querySelector("#lx-prev-btn").addEventListener("click", playPrevSong);
 	rootEl.querySelector("#lx-next-btn").addEventListener("click", playNextSong);
 
-	// 6. 播放模式切换 (列表循环 -> 随机播放 -> 单曲循环)
+	// 6. 一键播放全部 与 一键全部入队
+	rootEl.querySelector("#lx-play-all-btn").addEventListener("click", playAllCurrentList);
+	rootEl.querySelector("#lx-add-all-btn").addEventListener("click", addAllCurrentToQueue);
+	rootEl.querySelector("#lx-clear-queue-btn").addEventListener("click", clearQueue);
+
+	// 7. 播放模式切换 (列表循环 -> 随机播放 -> 单曲循环)
 	const modeBtn = rootEl.querySelector("#lx-mode-btn");
 	const modeIcon = rootEl.querySelector("#lx-mode-icon");
 	const modes = [
@@ -1310,19 +1478,21 @@ function bindEvents(rootEl) {
 		globalState.playMode = next.type;
 		modeIcon.textContent = next.icon;
 		modeBtn.title = next.title;
+		showToast(`播放模式: ${next.title}`);
 	});
 
-	// 7. 画中画歌词
+	// 8. 画中画歌词
 	rootEl.querySelector("#lx-pip-btn").addEventListener("click", togglePictureInPicture);
 
-	// 8. 音质切换
+	// 9. 音质切换
 	const qualitySelect = rootEl.querySelector("#lx-quality-select");
 	qualitySelect.value = globalState.quality;
 	qualitySelect.addEventListener("change", (e) => {
 		globalState.quality = e.target.value;
+		showToast(`已切换音质: ${e.target.options[e.target.selectedIndex].text}`);
 	});
 
-	// 9. 进度条拖拽与跳转
+	// 10. 进度条拖拽与跳转
 	const track = rootEl.querySelector("#lx-progress-track");
 	track.addEventListener("click", (e) => {
 		if (!globalAudio || !globalState.duration) return;
@@ -1331,7 +1501,7 @@ function bindEvents(rootEl) {
 		globalAudio.currentTime = clickPct * globalState.duration;
 	});
 
-	// 10. 音量
+	// 11. 音量
 	const volSlider = rootEl.querySelector("#lx-vol-slider");
 	volSlider.addEventListener("input", (e) => {
 		const val = parseFloat(e.target.value);
@@ -1339,7 +1509,7 @@ function bindEvents(rootEl) {
 		if (globalAudio) globalAudio.volume = val;
 	});
 
-	// 11. 自定义音源弹窗
+	// 12. 自定义音源弹窗
 	const modal = rootEl.querySelector("#lx-userapi-modal");
 	const saveBtn = rootEl.querySelector("#lx-modal-save-btn");
 	const scriptArea = rootEl.querySelector("#lx-userapi-script");
@@ -1354,7 +1524,7 @@ function bindEvents(rootEl) {
 
 	saveBtn.addEventListener("click", async () => {
 		const script = scriptArea.value.trim();
-		if (!script) return alert("脚本内容或 URL 不能为空");
+		if (!script) return showToast("脚本内容或 URL 不能为空");
 
 		const oldText = saveBtn.textContent;
 		saveBtn.disabled = true;
@@ -1370,23 +1540,22 @@ function bindEvents(rootEl) {
 			if (res.ok) {
 				globalState.activeUserApi = res.meta;
 				updateUserApiBadge();
-				alert(`自定义音源激活成功: ${res.meta.name} (${res.meta.version})`);
+				showToast(`自定义音源激活成功: ${res.meta.name}`);
 				scriptArea.value = "";
 				modal.style.display = "none";
 			} else {
-				alert(`导入失败: ${res.error}`);
+				showToast(`导入失败: ${res.error}`);
 			}
 		} catch (err) {
-			alert(`请求异常: ${err.message}`);
+			showToast(`请求异常: ${err.message}`);
 		} finally {
 			saveBtn.disabled = false;
 			saveBtn.textContent = oldText;
 		}
 	});
 
-	// 12. 键盘快捷键监听
+	// 13. 键盘快捷键监听
 	const onKeyDown = (e) => {
-		// 如果在输入框中打字，不拦截快捷键
 		if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return;
 
 		if (e.code === "Space") {
@@ -1421,7 +1590,7 @@ function bindEvents(rootEl) {
 	};
 	window.addEventListener("keydown", onKeyDown);
 
-	// 13. 初始化恢复收藏夹与音源
+	// 14. 初始化恢复收藏夹与音源
 	fetch(`${apiBaseUrl}/favorites`)
 		.then((r) => r.json())
 		.then((d) => {
@@ -1451,6 +1620,11 @@ export default {
 			ctx.onData((payload) => {
 				if (payload?.type === "lx:play_song" && payload?.song) {
 					playSong(payload.song);
+				} else if (payload?.type === "lx:play_all" && payload?.songs?.length) {
+					globalState.queue = [...payload.songs];
+					updateQueueBadge();
+					playSong(payload.songs[0], false);
+					showToast(`AI 已为你开始播放整份歌单 (${payload.songs.length} 首)`);
 				} else if (payload?.type === "lx:pause" && globalAudio) {
 					globalAudio.pause();
 				} else if (payload?.type === "lx:resume" && globalAudio) {
@@ -1458,6 +1632,7 @@ export default {
 				} else if (payload?.type === "lx:playlist_add" && payload?.song) {
 					globalState.queue.push(payload.song);
 					updateQueueBadge();
+					showToast(`已追加至播放队列: ${payload.song.name}`);
 				}
 			});
 		}
@@ -1467,6 +1642,7 @@ export default {
 		renderPlayerBarInfo();
 		updatePlayButtonState();
 		renderLyrics();
+		updateQueueBadge();
 	},
 
 	unmount() {

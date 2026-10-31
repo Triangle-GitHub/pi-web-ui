@@ -26,6 +26,8 @@ export interface EditPromptAttachment {
 	sessionPath?: string;
 	lines?: { start: number; end: number };
 	imageData?: string;
+	/** Local attachment-store URL; resolved to imageData before sending. */
+	imageUrl?: string;
 	fileData?: string;
 	uploadPath?: string;
 	mimeType?: string;
@@ -37,6 +39,7 @@ export interface EditPromptAttachment {
 interface ImageBlock {
 	type: "image";
 	dataUrl?: string;
+	mimeType?: string;
 }
 
 /** 从 image 块还原 imageData 附件（dataUrl → 纯 base64）；有图片块返回 true。 */
@@ -49,6 +52,16 @@ function pushImageAttachments(
 	for (const b of content) {
 		const img = b as ImageBlock;
 		if (img.type !== "image" || typeof img.dataUrl !== "string") continue;
+		if (/^\/api\/attachment\/[a-f0-9]{64}$/.test(img.dataUrl)) {
+			hasImage = true;
+			atts.push({
+				path: "",
+				imageUrl: img.dataUrl,
+				mimeType: img.mimeType,
+				name: fallbackName ?? "image",
+			});
+			continue;
+		}
 		if (!img.dataUrl.startsWith("data:")) continue;
 		const mm = img.dataUrl.match(/^data:([^;]*);base64,(.+)$/);
 		if (!mm) continue;
@@ -141,6 +154,7 @@ function attachmentDedupKey(att: EditPromptAttachment): string {
 	if (att.mode === "page") {
 		return `page:${att.path}`;
 	}
+	if (att.imageUrl) return `image-url:${att.imageUrl}`;
 	if (att.imageData) {
 		return `img:${att.name ?? ""}:${att.imageData.length}:${att.imageData.slice(0, 64)}`;
 	}

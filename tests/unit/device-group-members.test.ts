@@ -2,6 +2,7 @@
 import { act, createElement } from "react";
 import { createRoot } from "react-dom/client";
 import { expect, it, vi } from "vitest";
+import { closeDesktopAccess, getDesktopAccess } from "../../web/src/device-access.js";
 import { DeviceGroupMembers } from "../../web/src/components/DeviceGroupMembers";
 import { DeviceGroupSection } from "../../web/src/components/DeviceGroupSection";
 import { LanguageProvider } from "../../web/src/i18n";
@@ -87,10 +88,9 @@ it("opens member devices by hosting device ID and selects the requested view", a
 		const buttons = host.querySelectorAll<HTMLButtonElement>("button");
 		await act(async () => buttons[0].click());
 		await act(async () => buttons[1].click());
-		expect(openHub.mock.calls.map(([url]) => url)).toEqual([
-			"https://hub.example.com/device/mac/__open?ticket=one&next=%2Fdesktop",
-			"https://hub.example.com/device/mac/__open?ticket=one",
-		]);
+		expect(openHub.mock.calls.map(([url]) => url)).toEqual(["https://hub.example.com/device/mac/__open?ticket=one"]);
+		expect(getDesktopAccess()?.url).toBe("https://hub.example.com/device/mac/__open?ticket=one&next=%2Fdesktop");
+		closeDesktopAccess(getDesktopAccess()!);
 		expect(
 			fetchMock.mock.calls
 				.filter(([, options]) => options?.method === "POST")

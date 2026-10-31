@@ -6840,15 +6840,17 @@ export class ClientSession {
 		const seen = new Set<Conversation>();
 		while (!seen.has(conv)) {
 			seen.add(conv);
-			if (conv.subagentWorktree && isSameOrSubpath(endpoint.cwd, conv.subagentWorktree.worktreePath))
-				return conv.subagentWorktree.mainRepoPath;
+			if (conv.subagentWorktree && isSameOrSubpath(conv.cwd, conv.subagentWorktree.worktreePath))
+				return normalizePathKey(conv.subagentWorktree.mainRepoPath);
 			if (!conv.parentId) break;
 			const parentOwner = this.subagentOwnerOf(conv.parentId);
 			const parent = parentOwner.convs.get(parentOwner.subagentCurrentId(conv.parentId));
 			if (!parent) break;
 			conv = parent;
 		}
-		return endpoint.cwd;
+		// A child may execute in an independent checkout. Its registered ancestry,
+		// rather than that checkout's path, determines the collaboration project.
+		return normalizePathKey(conv.cwd);
 	}
 
 	private communicationPending(conv: Conversation): boolean {

@@ -39,6 +39,7 @@ import { Markdown, PluginWidgetBlock } from "./Markdown";
 import { StreamMarkdown } from "./StreamMarkdown";
 import { CollapsibleHead } from "./CollapsibleHead";
 import { appUrl } from "../base-url";
+import type { EditPromptAttachment } from "../question-attachments";
 import { ThinkingBlock } from "./ThinkingBlock";
 import { ToolCallBlock, type ToolView } from "./ToolCallBlock";
 import { useT, type Translate } from "../i18n";
@@ -162,7 +163,7 @@ export function asBash(block: UiContentBlock): UiBashBlock | null {
  *  newly-added raw file (fileData) or workspace-path attachment. */
 type EditAttKind = "image" | "upload" | "file" | "path";
 function editAttKind(att: PromptAttachment): EditAttKind {
-	if (att.imageData) return "image";
+	if (att.imageData || (att as EditPromptAttachment).imageUrl) return "image";
 	if (att.uploadPath) return "upload";
 	if (att.fileData) return "file";
 	return "path";
@@ -171,7 +172,7 @@ function editAttKind(att: PromptAttachment): EditAttKind {
 /** Tooltip label for an editor chip (reuses the chat-input attachment i18n). */
 function editAttLabel(att: PromptAttachment, t: Translate): string {
 	if (att.mode === "quote" && att.quote) return att.quote.text;
-	if (att.imageData) return t("attachImage", { name: att.name ?? "image" });
+	if (att.imageData || (att as EditPromptAttachment).imageUrl) return t("attachImage", { name: att.name ?? "image" });
 	if (att.uploadPath) return t("attachFile", { name: att.name ?? att.uploadPath });
 	if (att.fileData) return t("attachFile", { name: att.name ?? "file" });
 	const base = att.path.split("/").pop() ?? att.path;
@@ -504,6 +505,43 @@ export const Message = memo(function Message({
 		}
 		if (imgs.length > 0) await addEditImageFiles(imgs);
 	};
+	const [resending, setResending] = useState(false);
+	const resendPending = useRef(false);
+	const resend = async (text: string, attachments: EditPromptAttachment[]) => {
+		if (resendPending.current) return;
+		if (!attachments.some((att) => att.imageUrl)) {
+			onEdit?.(message.id, text, attachments.length ? attachments : undefined);
+			setEditing(false);
+			return;
+		}
+		resendPending.current = true;
+		setResending(true);
+		try {
+			const restored = await Promise.all(
+				attachments.map(async ({ imageUrl, ...att }) => {
+					if (!imageUrl) return att;
+					const response = await fetch(appUrl(imageUrl));
+					if (!response.ok) throw new Error(`Image load failed: ${response.status}`);
+					const blob = await response.blob();
+					const dataUrl = await new Promise<string>((resolve, reject) => {
+						const reader = new FileReader();
+						reader.onload = () => resolve(String(reader.result));
+						reader.onerror = () => reject(reader.error);
+						reader.readAsDataURL(blob);
+					});
+					return { ...att, imageData: dataUrl.slice(dataUrl.indexOf(",") + 1), mimeType: blob.type || att.mimeType };
+				}),
+			);
+			onEdit?.(message.id, text, restored.length ? restored : undefined);
+			setEditing(false);
+		} catch {
+			setEditing(true);
+			pushEditNotice(t("fileLoadFailed", { name: attachments.find((att) => att.imageUrl)?.name ?? "image" }));
+		} finally {
+			resendPending.current = false;
+			setResending(false);
+		}
+	};
 	const directReask = () => {
 		const text = skillBlock
 			? "/skill:" + skillBlock.name + (skillBlock.userMessage ? " " + skillBlock.userMessage : "")
@@ -514,7 +552,9 @@ export const Message = memo(function Message({
 		const trimmed = text.trim();
 		const hasAttachments = Boolean(questionAttachments && questionAttachments.length > 0);
 		if (!trimmed && !hasAttachments) return;
-		onEdit?.(message.id, trimmed, hasAttachments ? questionAttachments : undefined);
+		setDraft(trimmed);
+		setEditAttachments(questionAttachments ?? []);
+		void resend(trimmed, questionAttachments ?? []);
 	};
 	const startEdit = () => {
 		setDraft(
@@ -539,15 +579,7 @@ export const Message = memo(function Message({
 	const submitEdit = () => {
 		const text = draft.trim();
 		if (!text && !editAttachments.some((a) => a.mode === "quote" && readTextQuote(a.quote))) return;
-		onEdit?.(
-			message.id,
-			text,
-			// Original attachments (images / uploads / path refs) are always
-			// preserved — restoring the visual context the fork would drop; a
-			// text-only edit with none stays undefined.
-			editAttachments.length > 0 ? editAttachments : undefined,
-		);
-		setEditing(false);
+		void resend(text, editAttachments);
 	};
 
 	// ---- 宿主 UI 扩展点（issue #146）：message.actions 工具条 + contextmenu.message ----
@@ -1155,7 +1187,14 @@ export const Message = memo(function Message({
 											title={editAttLabel(att, t)}
 										>
 											{kind === "image" ? (
-												<img src={`data:${att.mimeType ?? "image/png"};base64,${att.imageData}`} alt={att.name} />
+												<img
+													src={
+														(att as EditPromptAttachment).imageUrl
+															? appUrl((att as EditPromptAttachment).imageUrl!)
+															: `data:${att.mimeType ?? "image/png"};base64,${att.imageData}`
+													}
+													alt={att.name}
+												/>
 											) : (
 												<span className="msg-editor-file">
 													<span className="msg-editor-file-icon">
@@ -1241,7 +1280,10 @@ export const Message = memo(function Message({
 							<button
 								type="button"
 								className="btn primary sm"
-								disabled={!draft.trim() && !editAttachments.some((a) => a.mode === "quote" && readTextQuote(a.quote))}
+								disabled={
+									resending ||
+									(!draft.trim() && !editAttachments.some((a) => a.mode === "quote" && readTextQuote(a.quote)))
+								}
 								title={t("reaskFromHere")}
 								onClick={submitEdit}
 							>

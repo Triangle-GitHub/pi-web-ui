@@ -1,20 +1,21 @@
 /**
  * 供 AI 智能体调用的点歌与音乐播控工具
  */
-import { searchMusics } from "./music-sdk.mjs";
+import { getTopList, searchMusics } from "./music-sdk.mjs";
 
 export function createMusicTool(host, userApi) {
 	return {
 		name: "music_control",
 		description:
-			"Search, play, pause, or manage background music in pi-web-ui music player. Actions: search, play, pause, resume, playlist_add.",
+			"Search, play, pause, or manage background music in pi-web-ui music player. Actions: search, play, play_all, pause, resume, playlist_add.",
 		parameters: {
 			type: "object",
 			properties: {
 				action: {
 					type: "string",
-					enum: ["search", "play", "pause", "resume", "playlist_add"],
-					description: "Action to perform: search songs, play a song, pause, resume, or add to playlist.",
+					enum: ["search", "play", "play_all", "pause", "resume", "playlist_add"],
+					description:
+						"Action to perform: search songs, play a song, play all songs in a list/chart, pause, resume, or add to playlist.",
 				},
 				keyword: {
 					type: "string",
@@ -25,10 +26,15 @@ export function createMusicTool(host, userApi) {
 					enum: ["wy", "kw", "kg", "mg"],
 					description: "Music platform source (wy: Netease, kw: Kuwo, kg: Kugou, mg: Migu). Defaults to wy.",
 				},
+				chart: {
+					type: "string",
+					enum: ["hot", "soar", "new"],
+					description: "Chart type when action is play_all (hot: hot songs, soar: soaring, new: new releases).",
+				},
 			},
 			required: ["action"],
 		},
-		execute: async ({ action, keyword, source = "wy" }) => {
+		execute: async ({ action, keyword, source = "wy", chart = "hot" }) => {
 			if (action === "search") {
 				if (!keyword) return { error: "Keyword is required for search" };
 				try {
@@ -59,7 +65,6 @@ export function createMusicTool(host, userApi) {
 						return { status: "not_found", message: `No songs found for '${keyword}'` };
 					}
 					const targetSong = results[0];
-					// 向前端客户端广播播放指令
 					host.broadcast({
 						type: "lx:play_song",
 						song: targetSong,
@@ -71,6 +76,34 @@ export function createMusicTool(host, userApi) {
 					};
 				} catch (err) {
 					return { status: "error", message: `Play failed: ${err.message}` };
+				}
+			}
+
+			if (action === "play_all") {
+				try {
+					let songs = [];
+					if (keyword) {
+						songs = await searchMusics(source, keyword, 1, 20);
+					} else {
+						songs = await getTopList(chart, 30);
+					}
+
+					if (!songs || songs.length === 0) {
+						return { status: "not_found", message: "No songs available to play" };
+					}
+
+					host.broadcast({
+						type: "lx:play_all",
+						songs,
+					});
+					return {
+						status: "ok",
+						message: `Started playing entire list (${songs.length} songs), currently playing: ${songs[0].name} - ${songs[0].singer}`,
+						count: songs.length,
+						currentSong: songs[0],
+					};
+				} catch (err) {
+					return { status: "error", message: `Play all failed: ${err.message}` };
 				}
 			}
 

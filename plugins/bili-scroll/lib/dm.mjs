@@ -1,111 +1,181 @@
-/**
- * plugins/bili-scroll/lib/dm.mjs
- * B站 私信：读会话 / 读消息 / 发消息
- *
- * 核心设计：
- * 1. 只读、纯代码轮询，平时不花 token；
- * 2. 识别普通文本与视频分享卡片（msg_type=7/8 自动解析 bvid/jump_url）；
- * 3. 只有主人发来新消息时才唤醒模型或执行回复；
- */
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
-const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36";
-
+const ROOT = "https://api.vc.bilibili.com";
 export function loadCred(stateDir) {
-	const f = join(stateDir, "bili_credential.json");
-	if (!existsSync(f)) return null;
+	for (const name of ["bili_credential.json", "credentials.json"]) {
+		const file = join(stateDir, name);
+		if (!existsSync(file)) continue;
+		try {
+			const c = JSON.parse(readFileSync(file, "utf8"));
+			if (c?.sessdata) return c;
+		} catch {
+			/* Invalid credentials are not authentication. */
+		}
+	}
+	return null;
+}
+export function validUid(value) {
+	const s = String(value ?? "");
+	if (!/^[1-9]\d*$/.test(s) || !Number.isSafeInteger(Number(s))) throw new Error("Invalid Bilibili UID");
+	return Number(s);
+}
+export function myUid(cred) {
 	try {
-		const c = JSON.parse(readFileSync(f, "utf8"));
-		return c?.sessdata ? c : null;
+		return validUid(cred?.dedeuserid);
 	} catch {
-		return null;
+		return 0;
 	}
 }
-
+function cursor(value) {
+	if (value === undefined || value === null || value === "") return undefined;
+	const s = String(value);
+	if (!/^\d{1,30}$/.test(s)) throw new Error("Invalid DM cursor");
+	return s;
+}
+function size(value, fallback = 50) {
+	if (value === undefined) return fallback;
+	if (!Number.isInteger(value) || value < 1 || value > 50) throw new Error("DM page size must be 1..50");
+	return value;
+}
 function headers(cred) {
+	if (!cred?.sessdata) throw new Error("Bilibili login required");
+	const parts = { SESSDATA: cred.sessdata, bili_jct: cred.bili_jct, buvid3: cred.buvid3, DedeUserID: cred.dedeuserid };
+	if (Object.values(parts).some((v) => v != null && /[;\r\n]/.test(String(v)))) throw new Error("Invalid credentials");
 	return {
-		"User-Agent": UA,
+		"User-Agent": "Mozilla/5.0",
 		Referer: "https://message.bilibili.com/",
 		Origin: "https://message.bilibili.com",
-		Cookie: `SESSDATA=${cred.sessdata}; bili_jct=${cred.bili_jct}; buvid3=${cred.buvid3 || ""}`,
+		Cookie: Object.entries(parts)
+			.filter(([, v]) => v)
+			.map(([k, v]) => `${k}=${v}`)
+			.join("; "),
 	};
 }
-
-async function jget(url, cred) {
-	const r = await fetch(url, { headers: headers(cred) });
-	const j = await r.json().catch(() => null);
-	if (!j || j.code !== 0) throw new Error(`HTTP ${r.status} code=${j?.code} msg=${j?.message || ""}`);
-	return j.data || {};
+async function request(path, cred, options = {}) {
+	const signal = options.signal
+		? AbortSignal.any([options.signal, AbortSignal.timeout(15000)])
+		: AbortSignal.timeout(15000);
+	signal.throwIfAborted();
+	const res = await fetch(ROOT + path, { ...options, headers: { ...headers(cred), ...options.headers }, signal });
+	const json = await res.json();
+	if (!res.ok || json?.code !== 0)
+		throw new Error(`Bilibili DM request failed (HTTP ${res.status}, code ${json?.code})`);
+	return json.data || {};
 }
-
-/** 会话列表：[{ uid, unread, lastTs, preview }] */
-export async function listSessions(cred) {
-	const d = await jget(
-		"https://api.vc.bilibili.com/session_svr/v1/session_svr/get_sessions?session_type=1&group_id=0&Build=0&mobi_app=web",
-		cred,
+function content(m) {
+	let c;
+	try {
+		c = typeof m.content === "string" ? JSON.parse(m.content) : m.content;
+	} catch {
+		c = { content: m.content };
+	}
+	c = c && typeof c === "object" ? c : {};
+	const rawType = Number(m.msg_type) || 0;
+	const isCard = [7, 8].includes(rawType);
+	const originalText = String(
+		isCard ? c.title || c.headline || c.desc || c.content || "[分享视频]" : c.content || c.text || "[非文字消息]",
 	);
-	const list = d.session_list || [];
-	return list
-		.map((s) => {
-			let preview = "";
-			try {
-				const c = s.last_msg?.content ? JSON.parse(s.last_msg.content) : null;
-				preview = String(c?.content || c?.text || "").slice(0, 80);
-			} catch {
-				// 非 JSON 留空
-			}
-			return {
-				uid: Number(s.talker_id) || 0,
-				unread: Number(s.unread_count) || 0,
-				lastTs: Number(s.last_msg?.timestamp) || 0,
-				preview,
-			};
-		})
-		.filter((x) => x.uid > 0);
+	const text = originalText.slice(0, 4000);
+	const bvid = String(c.bvid || c.jump_url || text).match(/BV[0-9A-Za-z]{10}/)?.[0] || "";
+	return { kind: rawType, rawType, text, bvid, truncated: text.length < originalText.length };
 }
-
-/** 读某个会话最近的 n 条：[{ key, ts, fromMe, kind, text, bvid }] */
-export async function fetchMsgs(cred, talkerId, size = 10) {
-	const url =
-		`https://api.vc.bilibili.com/svr_sync/v1/svr_sync/fetch_session_msgs?talker_id=${Number(talkerId)}` +
-		`&session_type=1&size=${Math.max(1, Math.min(50, size))}&build=0&mobi_app=web`;
-	const d = await jget(url, cred);
-	const list = (d.messages || []).slice().reverse(); // 接口是倒序的
-	return list.map((m) => {
-		const mt = Number(m.msg_type) || 1;
-		let text = "";
-		let isCard = false;
-		let bvid = "";
-		try {
-			const c = JSON.parse(m.content || "{}");
-			if ((mt === 7 || mt === 8) && (c.jump_url || c.bvid || c.author || c.title)) {
-				isCard = true;
-				bvid = String(c.bvid || "") || (String(c.jump_url || "").match(/BV[0-9A-Za-z]{10}/) || [])[0] || "";
-				const title = String(c.title || c.headline || c.desc || "").slice(0, 80);
-				const who = String(c.author || "").slice(0, 30);
-				text = "[分享视频] " + (title || "(无标题)") + (who ? " / " + who : "") + (bvid ? " " + bvid : "");
-			} else {
-				text = String(c.content || c.text || "");
-				const bvMatch = text.match(/BV[0-9A-Za-z]{10}/);
-				if (bvMatch) bvid = bvMatch[0];
-			}
-		} catch {
-			text = String(m.content || "");
-		}
-		if (!text) text = "[非文字消息]";
-		return {
-			key: String(m.msg_key || m.msg_seqno || m.timestamp),
-			ts: Number(m.timestamp) || 0,
-			fromMe: Number(m.sender_uid) === Number(cred.dedeuserid),
-			kind: isCard ? mt : 1,
-			text: text.slice(0, 500),
-			bvid,
-		};
+export async function listSessionPage(cred, options = {}) {
+	const q = new URLSearchParams({
+		session_type: "1",
+		group_id: "0",
+		build: "0",
+		mobi_app: "web",
+		size: String(size(options.size)),
 	});
+	const next = cursor(options.cursor ?? options.endTs);
+	if (next !== undefined) q.set("end_ts", next);
+	const d = await request(`/session_svr/v1/session_svr/get_sessions?${q}`, cred, { signal: options.signal });
+	const sessions = (Array.isArray(d.session_list) ? d.session_list : [])
+		.filter((s) => Number.isSafeInteger(Number(s.talker_id)) && Number(s.talker_id) > 0)
+		.map((s) => ({
+			uid: Number(s.talker_id),
+			unread: Math.max(0, Number(s.unread_count) || 0),
+			lastTs: Number(s.last_msg?.timestamp) || 0,
+			lastSeq: cursor(s.last_msg?.msg_seqno),
+			sessionTs: cursor(s.session_ts),
+			preview: content(s.last_msg || {}).text.slice(0, 80),
+		}));
+	const nextCursor = cursor(d.end_ts ?? sessions.at(-1)?.sessionTs);
+	return { sessions, hasMore: d.has_more === 1 || d.has_more === true, nextCursor };
 }
-
-/** 我自己的 uid（凭证里有） */
-export function myUid(cred) {
-	return Number(cred?.dedeuserid) || 0;
+export async function fetchMessagePage(cred, talkerId, options = {}) {
+	const uid = validUid(talkerId);
+	const self = validUid(options.selfUid ?? cred?.dedeuserid);
+	const q = new URLSearchParams({
+		talker_id: String(uid),
+		session_type: "1",
+		size: String(size(options.size)),
+		build: "0",
+		mobi_app: "web",
+	});
+	const next = cursor(options.cursor ?? options.beginSeqno);
+	if (next !== undefined) q.set("begin_seqno", next);
+	const d = await request(`/svr_sync/v1/svr_sync/fetch_session_msgs?${q}`, cred, { signal: options.signal });
+	const raw = Array.isArray(d.messages) ? d.messages.slice(0, 50) : [];
+	const messages = raw
+		.map((m) => ({
+			key: String(m.msg_key ?? m.msg_seqno ?? "").slice(0, 64),
+			seq: cursor(m.msg_seqno),
+			ts: Number(m.timestamp) || 0,
+			senderUid: Number(m.sender_uid) || 0,
+			fromMe: Number(m.sender_uid) === self,
+			...content(m),
+		}))
+		.reverse();
+	// Bound serialized UTF-8 output, including JSON escaping, below tool details limits.
+	let truncated = false;
+	const textBudget = Math.floor(36000 / Math.max(1, messages.length));
+	for (const message of messages) {
+		const original = message.text;
+		let lo = 0,
+			hi = original.length;
+		while (lo < hi) {
+			const mid = Math.ceil((lo + hi) / 2);
+			if (Buffer.byteLength(JSON.stringify(original.slice(0, mid)), "utf8") <= textBudget) lo = mid;
+			else hi = mid - 1;
+		}
+		message.text = original.slice(0, lo);
+		message.truncated ||= lo < original.length;
+		truncated ||= message.truncated;
+	}
+	const nextCursor = cursor(d.min_seqno ?? raw.at(-1)?.msg_seqno);
+	return { messages, hasMore: d.has_more === 1 || d.has_more === true, nextCursor, truncated };
+}
+export async function listSessions(cred, options = {}) {
+	return (await listSessionPage(cred, options)).sessions;
+}
+export async function fetchMsgs(cred, uid, options = {}) {
+	return (await fetchMessagePage(cred, uid, typeof options === "number" ? { size: options } : options)).messages;
+}
+export async function sendDm(cred, uid, text, { signal } = {}) {
+	uid = validUid(uid);
+	const self = validUid(cred?.dedeuserid);
+	if (!cred.bili_jct) throw new Error("Bilibili CSRF credential required");
+	if (typeof text !== "string" || !text.trim() || text.length > 500)
+		throw new Error("DM text must contain 1..500 characters");
+	const body = new URLSearchParams({
+		"msg[sender_uid]": String(self),
+		"msg[receiver_id]": String(uid),
+		"msg[receiver_type]": "1",
+		"msg[msg_type]": "1",
+		"msg[msg_status]": "0",
+		"msg[content]": JSON.stringify({ content: text.trim() }),
+		"msg[timestamp]": String(Math.floor(Date.now() / 1000)),
+		"msg[dev_id]": String(cred.buvid3 || ""),
+		csrf: cred.bili_jct,
+		csrf_token: cred.bili_jct,
+	});
+	const data = await request("/web_im/v1/web_im/send_msg", cred, {
+		method: "POST",
+		headers: { "Content-Type": "application/x-www-form-urlencoded" },
+		body,
+		signal,
+	});
+	return { ok: true, data };
 }

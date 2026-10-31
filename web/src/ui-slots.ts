@@ -313,6 +313,15 @@ export const BUILTIN_UI_ITEMS: BuiltinUiItem[] = [
 		order: 3,
 		group: "primary",
 	},
+	{
+		id: "host:worktrees",
+		slot: "topbar.primary",
+		labelKey: "worktreeViewTitle",
+		icon: "branch",
+		kind: "action",
+		order: 4,
+		group: "primary",
+	},
 	// ---- 顶栏主栏 ----
 	// 「面板开关 / 主操作」组在前：它们是随时可点的动作，不参与视图切换的高亮语义。
 	// 顺序号即默认视觉顺序（渲染层按 slot 顺序直排）：history 在最前（手机端 ☰ 落在最左）、

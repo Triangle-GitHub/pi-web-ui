@@ -76,6 +76,49 @@ it("pencil and user rollback open the inline editor and submit the selected ques
 	expect(container.querySelector("textarea")).not.toBeNull();
 	expect(send).not.toHaveBeenCalled();
 });
+it.each(["edit", "reask"])("%s restores stored image bytes before submitting", async (action) => {
+	const imageUrl = `/api/attachment/${"a".repeat(64)}`;
+	const fetchImage = vi.fn(async () => ({
+		ok: true,
+		blob: async () => new Blob(["image bytes"], { type: "image/png" }),
+	}));
+	vi.stubGlobal("fetch", fetchImage);
+	mount({ questionAttachments: [{ path: "", imageUrl, name: "first.png", mimeType: "image/png" }] });
+	if (action === "edit") {
+		act(() =>
+			[...container.querySelectorAll<HTMLButtonElement>(".msg-action")]
+				.find((button) => button.textContent?.includes("edit-reask"))!
+				.click(),
+		);
+		expect(container.querySelector<HTMLImageElement>(".msg-editor-img img")?.getAttribute("src")).toBe(imageUrl);
+		click(".msg-editor .btn.primary");
+	} else {
+		click('.msg-action[aria-label="reask"]');
+	}
+	expect(edit).not.toHaveBeenCalled();
+	await act(async () => {
+		await vi.waitFor(() => expect(edit).toHaveBeenCalledOnce());
+	});
+	expect(fetchImage).toHaveBeenCalledWith(imageUrl);
+	expect(edit).toHaveBeenCalledWith("u1", "Original question", [
+		{ path: "", name: "first.png", mimeType: "image/png", imageData: btoa("image bytes") },
+	]);
+});
+it("failed image restoration keeps the editor and never submits a question without its image", async () => {
+	vi.stubGlobal(
+		"fetch",
+		vi.fn(async () => ({ ok: false, status: 404 })),
+	);
+	mount({ questionAttachments: [{ path: "", imageUrl: `/api/attachment/${"a".repeat(64)}`, name: "first.png" }] });
+	click('.msg-action[aria-label="reask"]');
+	await act(async () => {
+		await Promise.resolve();
+	});
+	expect(container.querySelector(".msg-editor-notice")).not.toBeNull();
+	expect(edit).not.toHaveBeenCalled();
+	expect(container.querySelector<HTMLTextAreaElement>("textarea")?.value).toBe("Original question");
+	expect(container.querySelector(".msg-editor-img img")).not.toBeNull();
+});
 it("read-only messages keep copy/export and metadata while hiding local conversation actions", () => {
 	mount({ readOnly: true, messageLabel: "Sender · device", canRollbackEdit: true });
 	expect(container.textContent).toContain("Sender · device");

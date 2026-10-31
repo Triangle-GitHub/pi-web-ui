@@ -3,8 +3,9 @@ import { act, createElement } from "react";
 import { createRoot } from "react-dom/client";
 import { expect, it, vi } from "vitest";
 import { DeviceDirectory } from "../../web/src/components/DeviceDirectory.js";
+import { closeDesktopAccess, getDesktopAccess } from "../../web/src/device-access.js";
 import { LanguageProvider } from "../../web/src/i18n.js";
-it("opens authorized device and desktop URLs through the desktop window bridge", async () => {
+it("opens device pages through the desktop bridge and desktops in the shared window", async () => {
 	const openHub = vi.fn(async (_url: string) => true);
 	vi.stubGlobal("piDesktop", { openHub });
 	const popup = vi.spyOn(window, "open");
@@ -35,10 +36,9 @@ it("opens authorized device and desktop URLs through the desktop window bridge",
 		await act(async () => links[0].click());
 		await act(async () => links[1].click());
 		expect(popup).not.toHaveBeenCalled();
-		expect(openHub.mock.calls.map(([url]) => url)).toEqual([
-			"https://hub.example.com/device/mac/__open?ticket=secret",
-			"https://hub.example.com/device/mac/__open?ticket=secret&next=%2Fdesktop",
-		]);
+		expect(openHub.mock.calls.map(([url]) => url)).toEqual(["https://hub.example.com/device/mac/__open?ticket=secret"]);
+		expect(getDesktopAccess()?.url).toBe("https://hub.example.com/device/mac/__open?ticket=secret&next=%2Fdesktop");
+		closeDesktopAccess(getDesktopAccess()!);
 		openHub.mockResolvedValue(false);
 		await act(async () => links[0].click());
 		expect(host.querySelector('[role="alert"]')).not.toBeNull();
