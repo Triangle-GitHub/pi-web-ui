@@ -12,6 +12,28 @@
 
 暂无未发布内容。
 
+## [0.114.3] — 2026-10-31
+
+### Added
+
+- **上下文分类明细（#805）**：点击顶栏、底栏或侧栏的上下文徽标，查看系统提示词、记忆文件、工具、技能、工具调用与结果、消息和剩余空间。支持浅深主题、窄屏、软上限，以及仅有总量的引擎。
+
+### Fixed
+
+- **分类缓存更新**：SDK 消息结束后的异步扩展可原地替换末条消息；末条与流式消息重新估算，截断后旧缓存也会失效，避免分类停留在旧内容。
+
+### Changed
+
+- 分类明确标注为会话内容估算；实际请求的去重、证据外置和扩展转换可能改变比例。分类校准不改变上下文总量或压缩阈值。新增真实服务浏览器和请求变换回归，协议版本同步为 40。
+
+<!-- auto-i18n:start -->
+
+### i18n
+
+- 前端新增 key（14）：`contextPercent`、`contextTokens`、`contextTokensEstimated`、`contextMemoryFiles`、`contextTools`、`contextSkills`、`contextToolResults`、`contextOther`、`contextUsed`、`contextFree`、`contextBreakdownUnavailable`、`contextBreakdownEstimate`、`contextUsageUnavailable`、`contextSoftCap`
+
+<!-- auto-i18n:end -->
+
 ## [0.114.2] — 2026-10-31
 
 ### Added
