@@ -10,6 +10,14 @@
 
 export type QueueMode = "all" | "one-at-a-time";
 
+/** Estimated contents of the current model context, excluding free space. */
+export type ContextCategory =
+	"systemPrompt" | "memoryFiles" | "tools" | "skills" | "toolResults" | "messages" | "other";
+export interface ContextCategoryUsage {
+	category: ContextCategory;
+	tokens: number;
+}
+
 export interface UiTextBlock {
 	type: "text";
 	text: string;
@@ -361,11 +369,14 @@ export interface UiState {
 			tokens: number | null;
 			contextWindow: number;
 			percent: number | null;
-			/** 遗留字段：现恒为 false（服务端所有分支——含压缩回填——都按当前配置实时
-			 *  算出 tokens/percent，不再有「约数」态），前端已不读。保留只为旧客户端兼容。 */
+			/** Whether the total is estimated; category breakdowns are always estimates. */
 			estimated?: boolean;
 			/** 当前模型的生效压缩软上限（tokens；null = 关闭，底栏不画标记线）。 */
 			softCap?: number | null;
+			/** Conversation-content estimates reconciled to tokens, not a provider request breakdown.
+			 * Request deduplication, evidence externalization and extensions can change proportions.
+			 * Absent when the engine supplies only a total. */
+			categories?: ContextCategoryUsage[];
 		};
 	};
 }

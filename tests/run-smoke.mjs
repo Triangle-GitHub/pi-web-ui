@@ -48,6 +48,7 @@ const ALL = [
 	"theme-buttons-test",
 	"stream-stability-ui-test",
 	"universal-stream-ui-test",
+	"context-usage-browser-test",
 	"clear-provider-key-test",
 	"conv-cross-project-test",
 	"conv-cwd-test",

@@ -6396,6 +6396,125 @@
 		display: none;
 	}
 
+	/* Context details are portaled to body so every bar can open them without clipping. */
+	.context-usage-panel {
+		z-index: 2000;
+		width: 280px;
+		max-width: calc(100vw - 16px);
+		max-height: calc(100dvh - 16px);
+		box-sizing: border-box;
+		padding: 14px 16px;
+		overflow: auto;
+		overscroll-behavior: contain;
+		border: 1px solid var(--border);
+		border-radius: 10px;
+		background: var(--bg-elev);
+		color: var(--text);
+		box-shadow: 0 8px 28px rgb(0 0 0 / 14%);
+		font-size: 12.5px;
+		line-height: 1.5;
+	}
+	.context-usage-header {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 12px;
+		min-width: 0;
+		max-width: 100%;
+		margin-bottom: 10px;
+	}
+	.context-usage-header h3 {
+		margin: 0;
+		font-size: 14px;
+		font-weight: 600;
+	}
+	.context-usage-header > span,
+	.context-usage-value {
+		font-variant-numeric: tabular-nums;
+		white-space: nowrap;
+	}
+	.context-usage-bar {
+		display: flex;
+		gap: 2px;
+		height: 8px;
+		overflow: hidden;
+		border-radius: 4px;
+		background: var(--border);
+	}
+	.context-usage-bar > span {
+		flex-basis: 0;
+		min-width: 2px;
+		border-radius: 2px;
+		background: var(--context-color);
+	}
+	.context-usage-bar > [data-category="free"] {
+		min-width: 0;
+	}
+	.context-usage-panel [data-category="systemPrompt"] {
+		--context-color: var(--blue);
+	}
+	.context-usage-panel [data-category="memoryFiles"] {
+		--context-color: var(--green);
+	}
+	.context-usage-panel [data-category="tools"] {
+		--context-color: var(--plugin-purple);
+	}
+	.context-usage-panel [data-category="skills"] {
+		--context-color: var(--amber);
+	}
+	.context-usage-panel [data-category="toolResults"] {
+		--context-color: var(--red);
+	}
+	.context-usage-panel [data-category="messages"] {
+		--context-color: var(--text-dim);
+	}
+	.context-usage-panel [data-category="other"] {
+		--context-color: var(--text-faint);
+	}
+	.context-usage-panel [data-category="free"] {
+		--context-color: var(--border);
+	}
+	.context-usage-tokens,
+	.context-usage-note {
+		margin: 4px 0 0;
+		color: var(--text-dim);
+		overflow-wrap: anywhere;
+	}
+	.context-usage-note {
+		margin-top: 10px;
+		font-size: 11.5px;
+	}
+	.context-usage-categories {
+		display: grid;
+		gap: 3px;
+		margin: 12px 0 0;
+		padding: 0;
+		list-style: none;
+	}
+	.context-usage-categories li {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		min-width: 0;
+		max-width: 100%;
+	}
+	.context-usage-dot {
+		flex: none;
+		width: 8px;
+		height: 8px;
+		border-radius: 50%;
+		background: var(--context-color);
+	}
+	.context-usage-label {
+		flex: 1;
+		min-width: 0;
+		color: var(--text-dim);
+		overflow-wrap: anywhere;
+	}
+	.context-usage-value {
+		flex: none;
+	}
+
 	/* 上下文环形进度（Footer） */
 	.ctx-ring {
 		display: inline-block;
