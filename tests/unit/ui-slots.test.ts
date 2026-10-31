@@ -1286,16 +1286,16 @@ describe("buildUiSlots —— diagnostics（P0-1）", () => {
 describe("左栏分区（P2 · leftpanel.sections）", () => {
 	const sectionIds = (slots: ReturnType<typeof build>) => ids(slots["leftpanel.sections"]);
 
-	it("三条宿主分区默认登记在 leftpanel.sections，顺序：项目 / 运行 / 历史", () => {
+	it("四条宿主分区默认登记在 leftpanel.sections，顺序：项目 / 群组 / 运行 / 历史", () => {
 		const slots = build([]);
-		expect(sectionIds(slots)).toEqual(["host:lp-projects", "host:lp-running", "host:lp-history"]);
+		expect(sectionIds(slots)).toEqual(["host:lp-projects", "host:lp-groups", "host:lp-running", "host:lp-history"]);
 		expect(slots["leftpanel.sections"].every((e) => e.source === "host" && !e.hidden)).toBe(true);
 	});
 
 	it("布局页隐藏某分区 → hidden=true，条目本身仍在（布局页才找得回来）", () => {
 		const slots = build([], { layout: { hidden: ["host:lp-running"] } });
 		expect(slots["leftpanel.sections"].find((e) => e.id === "host:lp-running")?.hidden).toBe(true);
-		expect(sectionIds(slots)).toHaveLength(3);
+		expect(sectionIds(slots)).toHaveLength(4);
 	});
 
 	it("用户调序（layout.order）改变分区先后", () => {
@@ -1355,7 +1355,13 @@ describe("左栏插件自定义分区（P4 · leftpanel.sections 接受 kind=vie
 			arrange: [],
 		});
 		const slots = build([p]);
-		expect(sectionIds(slots)).toEqual(["host:lp-projects", "host:lp-running", "host:lp-history", "notes:fav"]);
+		expect(sectionIds(slots)).toEqual([
+			"host:lp-projects",
+			"host:lp-groups",
+			"host:lp-running",
+			"host:lp-history",
+			"notes:fav",
+		]);
 		const fav = slots["leftpanel.sections"].find((e) => e.id === "notes:fav");
 		expect(fav?.source).toBe("plugin:notes");
 		expect(fav?.kind).toBe("view");

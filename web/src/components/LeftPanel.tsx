@@ -1756,6 +1756,7 @@ export const LeftPanel = memo(function LeftPanel({
 		if (key === "groups") {
 			return (
 				<DeviceGroupSection
+					entry={uiSections?.find((entry) => entry.id === "host:lp-groups")}
 					active={active}
 					selectedRoomId={activeGroupId}
 					flex={effFlex("groups")}
