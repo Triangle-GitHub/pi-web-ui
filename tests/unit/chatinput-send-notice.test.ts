@@ -66,7 +66,7 @@ function mount(opts: {
 	return container;
 }
 
-/** 受控 textarea：走原生 setter + input 事件（与 dsh-question-dialog 的 click 同路）。 */
+/** 受控 textarea：走原生 setter + input 事件（与 question-dialog 的 click 同路）。 */
 function typeText(container: HTMLElement, value: string) {
 	const ta = container.querySelector("textarea") as HTMLTextAreaElement;
 	if (!ta) throw new Error("cannot find textarea");

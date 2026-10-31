@@ -714,6 +714,8 @@
 		"modelQuestion": "模型提問",
 		"modelQuestionCustom": "補充回答（可選）",
 		"modelQuestionSubmit": "提交回答",
+		"questionAutoSubmitLast": "最后一题点选后自动提交",
+		"questionPickSubmits": "点选即提交",
 		"modelQuestionRejectWithNote": "駁回並附言",
 		"modelQuestionRejectWithNoteTip": "攜帶輸入框中的附言取消提問，並將說明回饋給模型",
 		"recommended": "推薦",

@@ -99,6 +99,8 @@ pi 的 `schedule` 创建任务时单独持久化创建来源（稳定 SDK 会话
 
 ## 问卷队列与父代理请示
 
+共用 `QuestionDialog` 保留单选选中新选项后立即进入下一题；再次点选已选项则取消并留在当前题，鼠标与数字键一致。末题默认等待提交按钮或 Enter；问卷底部可开启「最后一题点选后自动提交」，偏好保存在当前浏览器，单题问卷同样适用。切换偏好和恢复草稿不触发提交；取消选择后允许只交补充说明，隐藏条件题不提交答案。
+
 标准 pi 引擎通过 `question_queue` 推送当前项目完整待答队列；每个请求保持稳定 ID、来源对话、顶层对话、持有方、创建时间及可选截止时间。顶层入口、来源对话与跨页面回答引用同一请求，回答按当前持有方结算，过户保留请求身份与期限。快照的 `pendingQuestion` 和即时 `question_pending` 保留其他引擎兼容；前端队列入口合并后只展示一个问卷。
 
 `questionPresentation` 控制当前对话弹出并排队其他问卷（默认 `queue`）、全部自动弹出（`all`）或仅手动队列（`manual`）。工具审批独立使用 `toolApprovalPresentation`，同样支持这三种方式，默认 `all` 保持所有对话的审批依次自动弹出；该设置只控制提醒，不改变审批开关、规则与批准/拒绝结果。稍后回答保留问卷与草稿，取消为显式操作；来源跳转打开对应对话。当前项目以外的问卷不得进入队列。
@@ -141,7 +143,7 @@ pi 的 `schedule` 创建任务时单独持久化创建来源（稳定 SDK 会话
 1. **只放极少变化的字段**。`messages` / `state` / `settings` / `streaming` 这类快照流里的数据**绝不**放进来：`ChatInput` / `GoalBar` 等 `memo()` 组件靠「窄 props + 引用稳定」躲开流式重渲染，而 store 通知**绕过 `memo()`** 直接重渲染订阅者 —— 放错一个字段就是每个 token 重渲染一次输入框。
 2. **快照引用必须稳定**：`getSnapshot()` 返回模块级 `cached`，只有 `setAppGlobals` 真正改了字段才替换对象并通知（数组按元素比、字段值相等则静默 return）—— 否则 `useSyncExternalStore` 会判定「快照每次都变」而无限重渲染。重连重放 `ready` 时靠这条不白刷一遍。
 
-回归：`tests/unit/app-globals.test.ts`（合并语义/同值不通知/退订/回落）与 `tests/unit/dsh-question-dialog.test.ts`（组件测试改用 `setAppSend` 注入 + 记录发出的消息）。
+回归：`tests/unit/app-globals.test.ts`（合并语义/同值不通知/退订/回落）与 `tests/unit/question-dialog.test.ts`（组件测试改用 `setAppSend` 注入 + 记录发出的消息）。
 
 ## Codex CLI 引擎
 
@@ -239,7 +241,7 @@ pi 的 `schedule` 创建任务时单独持久化创建来源（稳定 SDK 会话
 
 `UiState.pendingApprovals` 是当前连接持有的全部对话的权威待审批队列（含后台对话），按创建时间排序；完整快照与增量快照均携带，刷新或重连后可恢复。`pendingApproval` 保留单项兼容。即时 `tool_approval_pending` 按 ID 追加或更新，`tool_approval_resolved` 仅移除对应 ID，不能清空其他待办。答复仍通过服务端 `findPendingApproval` 按稳定 ID 定位原对话；允许同类/全部允许仍只作用于该对话。
 
-前端问卷和审批共用 `PendingQueue` 的列表、数量、等待时间、稳定选择、跳转和稍后处理逻辑，分别保留 `DshQuestionDialog` 与审批编辑面板。新请求和快照不能抢占已打开的请求；审批编辑器只随请求 ID 初始化，避免快照覆盖正在编辑的参数。稍后处理只暂缓展示，不产生审批答复；暂缓状态仅在本次页面生命周期保存。
+前端问卷和审批共用 `PendingQueue` 的列表、数量、等待时间、稳定选择、跳转和稍后处理逻辑，分别保留 `QuestionDialog` 与审批编辑面板。新请求和快照不能抢占已打开的请求；审批编辑器只随请求 ID 初始化，避免快照覆盖正在编辑的参数。稍后处理只暂缓展示，不产生审批答复；暂缓状态仅在本次页面生命周期保存。
 
 ### 审批三档放行与自定义规则库
 
@@ -279,7 +281,7 @@ pi 的 `schedule` 创建任务时单独持久化创建来源（稳定 SDK 会话
 
 ### 待答问卷进快照（重连恢复对话框）
 
-`question_pending` 是即时通道：只推给「提问那一刻在线」的连接，刷新页面 / WS 重连 / 新标签页都收不到那条历史消息，而服务端还在阻塞等人回答——面板会凭空消失（`DshQuestionDialog` 没有别的入口）。因此待答问卷同时挂在快照上（`UiState.pendingQuestion`，标准引擎按对话过滤：`pendingQuestionForSnapshot()` 只带当前对话的那张，切回原对话会重推快照；DSH 的提问桥是 runtime 级的，不分对话）。前端 `use-chat.ts` 收到 `snapshot` / `snapshot_delta` 时用纯函数 `web/src/pending-question.ts` 的 `resolvePendingQuestion` 决定面板去留：快照有待答问卷就恢复（已答过的 id 跳过——回答消息与在途快照会交错），但只有「由快照恢复出来的」面板才接受快照收起（避免一张回答之前的旧快照把刚由即时通道弹出的面板闪掉）。单测 `tests/unit/pending-question.test.ts`。
+`question_pending` 是即时通道：只推给「提问那一刻在线」的连接，刷新页面 / WS 重连 / 新标签页都收不到那条历史消息，而服务端还在阻塞等人回答——面板会凭空消失（`QuestionDialog` 没有别的入口）。因此待答问卷同时挂在快照上（`UiState.pendingQuestion`，标准引擎按对话过滤：`pendingQuestionForSnapshot()` 只带当前对话的那张，切回原对话会重推快照；DSH 的提问桥是 runtime 级的，不分对话）。前端 `use-chat.ts` 收到 `snapshot` / `snapshot_delta` 时用纯函数 `web/src/pending-question.ts` 的 `resolvePendingQuestion` 决定面板去留：快照有待答问卷就恢复（已答过的 id 跳过——回答消息与在途快照会交错），但只有「由快照恢复出来的」面板才接受快照收起（避免一张回答之前的旧快照把刚由即时通道弹出的面板闪掉）。单测 `tests/unit/pending-question.test.ts`。
 
 ### 后台任务列表
 
@@ -416,7 +418,7 @@ pointer-events:none、2.2s 淡出），避免用户以为页面自己在动。�
 
 ### 扩展 UI 桥
 
-扩展的 `setWidget/setStatus/notify/select/confirm/input` → `widgets/statuses/notice/dialog` 消息；对话框经 `dialog_response` 回传，Esc 视为取消。`Dialog.tsx`（扩展对话框）与 `DshQuestionDialog.tsx`（DSH 模型提问桥）的正文/选项/详情/预览都走 `Markdown(rawHtml)` 富渲染（markdown + 原始 HTML 混排，模型自选、信任模型；默认 `rawHtml=false` 的聊天正文渲染不受影响），可选项 `preview` 展示「选项预览」框。
+扩展的 `setWidget/setStatus/notify/select/confirm/input` → `widgets/statuses/notice/dialog` 消息；对话框经 `dialog_response` 回传，Esc 视为取消。`Dialog.tsx`（扩展对话框）与 `QuestionDialog.tsx`（共用模型问卷）的正文/选项/详情/预览都走 `Markdown(rawHtml)` 富渲染（markdown + 原始 HTML 混排，模型自选、信任模型；默认 `rawHtml=false` 的聊天正文渲染不受影响），可选项 `preview` 展示「选项预览」框。
 
 `snapshot` 里 `streamingMessage` 是进行中的消息（60ms 粒度流式），`messages` 是已落盘的。
 

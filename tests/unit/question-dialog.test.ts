@@ -3,20 +3,20 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { act } from "react-dom/test-utils";
-import { DshQuestionDialog } from "../../web/src/components/DshQuestionDialog.js";
+import { QuestionDialog } from "../../web/src/components/QuestionDialog.js";
 import { setAppSend } from "../../web/src/app-globals.js";
 import { LanguageProvider } from "../../web/src/i18n.js";
 import { clearQuestionDraft } from "../../web/src/question-draft.js";
 
 /**
- * DshQuestionDialog 测试（jsdom）：验证
+ * QuestionDialog 测试（jsdom）：验证
  *   1. 富渲染：question/detail 按 markdown（rawHtml），选项描述/预览富文本
- *   2. 向导式：一次只显示一题；单选点选项自动切下一题；末题点选项自动提交
+ *   2. 向导式：一次只显示一题；单选点选项自动切下一题；末题按偏好自动提交或等待确认
  *   3. 上一步可回头修改；底部取消发送 cancelled 回答
  * 全部确定性、零 token、零模型 —— 不依赖 DSH 引擎是否真发 preview。
  */
 
-type Question = Parameters<typeof DshQuestionDialog>[0]["question"];
+type Question = Parameters<typeof QuestionDialog>[0]["question"];
 
 const baseQuestion: Question = {
 	id: "q1",
@@ -59,7 +59,7 @@ function mount(question: Question = baseQuestion, send: (msg: unknown) => boolea
 			createElement(
 				LanguageProvider,
 				null,
-				createElement(DshQuestionDialog, {
+				createElement(QuestionDialog, {
 					question,
 				}),
 			),
@@ -98,6 +98,7 @@ afterEach(() => {
 		act(() => root!.unmount());
 		root = null;
 	}
+	localStorage.removeItem("pi-web:question-auto-submit-last");
 	clearQuestionDraft("q1");
 	clearQuestionDraft("q2");
 	clearQuestionDraft("q3");
@@ -105,7 +106,7 @@ afterEach(() => {
 	document.body.innerHTML = "";
 });
 
-describe("DshQuestionDialog rich rendering", () => {
+describe("QuestionDialog rich rendering", () => {
 	it("question 按 markdown 渲染（**粗体** → <strong>）", () => {
 		const { container } = mount();
 		const strong = container.querySelector(".question-head strong");
@@ -126,7 +127,7 @@ describe("DshQuestionDialog rich rendering", () => {
 		const c = mount();
 		expect(c.container.querySelector(".question-preview")).toBeNull();
 
-		// 点击带 preview 的选项 A（单选 → 自动提交；组件不被卸载，预览仍在）
+		// 点击带 preview 的选项 A，停留当前题并展示预览。
 		click(c.container, ".question-option");
 
 		const preview = c.container.querySelector(".question-preview");
@@ -138,7 +139,7 @@ describe("DshQuestionDialog rich rendering", () => {
 	});
 });
 
-describe("DshQuestionDialog wizard", () => {
+describe("QuestionDialog wizard", () => {
 	it("多题时每次只显示一题，点选项直接进入下一题", () => {
 		const c = mount(wizardQuestion);
 		expect(c.container.textContent).toContain("Q1");
@@ -170,8 +171,9 @@ describe("DshQuestionDialog wizard", () => {
 		expect(prev.disabled).toBe(true);
 	});
 
-	it("最后一题点选项自动提交全部答案（含前几题的选择）", () => {
+	it("开启偏好后最后一题点选自动提交全部答案", () => {
 		const c = mount(wizardQuestion);
+		click(c.container, ".question-auto-submit input");
 		click(c.container, ".question-option"); // Q1 → A
 		click(c.container, ".question-option"); // Q2 → X（最后一题 → 自动提交）
 
@@ -185,12 +187,94 @@ describe("DshQuestionDialog wizard", () => {
 		]);
 	});
 
-	it("单题问卷点选项即自动提交", () => {
+	it("单题问卷默认点选不提交，点击提交后发送", () => {
 		const c = mount(baseQuestion);
-		click(c.container, ".question-option"); // 唯一题的选项 A
+		click(c.container, ".question-option");
+		expect(c.sent).toHaveLength(0);
+		click(c.container, ".dialog-submit");
 		expect(c.sent).toHaveLength(1);
 		const msg = c.sent[0] as { answers: unknown[] };
 		expect(msg.answers).toEqual([{ id: "c1", selected: ["A"] }]);
+	});
+
+	it("返回后再次点击已选项取消并停留，可只提交说明", () => {
+		const c = mount(wizardQuestion);
+		click(c.container, ".question-option");
+		click(c.container, ".dialog-prev");
+		click(c.container, ".question-option.active");
+		expect(c.container.textContent).toContain("Q1");
+		expect(c.container.querySelector(".question-option.active")).toBeNull();
+		setNativeValue(c.container.querySelector(".question-custom")!, "Neither option fits");
+		click(c.container, ".dialog-submit");
+		click(c.container, ".question-option");
+		click(c.container, ".dialog-submit");
+		expect((c.sent[0] as any).answers[0]).toEqual({ id: "c1", selected: [], custom: "Neither option fits" });
+	});
+
+	it("改选后跳过隐藏条件题并且不提交其旧答案", () => {
+		const c = mount({
+			id: "q3",
+			questions: [
+				{ id: "route", question: "Route", options: [{ label: "A" }, { label: "B" }] },
+				{ id: "detail", question: "Detail", dependsOn: { questionId: "route", value: "A" }, options: [{ label: "D" }] },
+				{ id: "end", question: "End", options: [{ label: "E" }] },
+			],
+		});
+		click(c.container, ".question-option");
+		click(c.container, ".question-option");
+		click(c.container, ".dialog-prev");
+		click(c.container, ".dialog-prev");
+		click(c.container, c.container.querySelectorAll<HTMLElement>(".question-option")[1]);
+		click(c.container, ".question-option");
+		click(c.container, ".dialog-submit");
+		expect((c.sent[0] as any).answers).toEqual([
+			{ id: "route", selected: ["B"] },
+			{ id: "end", selected: ["E"] },
+		]);
+	});
+
+	it("数字键支持选中和取消，Enter 明确提交", () => {
+		const c = mount();
+		const key = (value: string) =>
+			act(() => {
+				window.dispatchEvent(new KeyboardEvent("keydown", { key: value, bubbles: true }));
+			});
+		key("1");
+		expect(c.sent).toHaveLength(0);
+		key("1");
+		expect(c.container.querySelector(".question-option.active")).toBeNull();
+		key("2");
+		key("Enter");
+		expect((c.sent[0] as any).answers).toEqual([{ id: "c1", selected: ["B"] }]);
+	});
+
+	it("记住自动提交偏好，打开问卷和切换开关均不触发提交", () => {
+		localStorage.setItem("pi-web:question-auto-submit-last", "1");
+		const c = mount();
+		expect((c.container.querySelector(".question-auto-submit input") as HTMLInputElement).checked).toBe(true);
+		expect(c.sent).toHaveLength(0);
+		click(c.container, ".question-auto-submit input");
+		click(c.container, ".question-option");
+		click(c.container, ".question-auto-submit input");
+		expect(c.sent).toHaveLength(0);
+		expect(localStorage.getItem("pi-web:question-auto-submit-last")).toBe("1");
+		click(c.container, ".question-option.active");
+		expect(c.sent).toHaveLength(0);
+		click(c.container, ".question-option");
+		expect(c.sent).toHaveLength(1);
+	});
+
+	it("开启自动提交后数字键选中末题提交，切题仍保持快速前进", () => {
+		localStorage.setItem("pi-web:question-auto-submit-last", "1");
+		const c = mount(wizardQuestion);
+		act(() => window.dispatchEvent(new KeyboardEvent("keydown", { key: "1", bubbles: true })));
+		expect(c.sent).toHaveLength(0);
+		expect(c.container.textContent).toContain("Q2");
+		act(() => window.dispatchEvent(new KeyboardEvent("keydown", { key: "2", bubbles: true })));
+		expect((c.sent[0] as any).answers).toEqual([
+			{ id: "c1", selected: ["A"] },
+			{ id: "c2", selected: ["Y"] },
+		]);
 	});
 
 	it("底部「取消」发送 cancelled 回答", () => {
@@ -229,8 +313,10 @@ describe("DshQuestionDialog wizard", () => {
 		expect(c.container.textContent).not.toContain("M1");
 		expect(c.container.textContent).toContain("Q2");
 
-		// 最后一题点选项 → 提交，选中含多选两项
+		// 最后一题默认等待确认，保留前面多选答案。
 		click(c.container, ".question-option");
+		expect(c.sent).toHaveLength(0);
+		click(c.container, ".dialog-submit");
 		expect(c.sent).toHaveLength(1);
 		const msg = c.sent[0] as { answers: { id: string; selected: string[] }[] };
 		expect(msg.answers[0]).toEqual({ id: "c1", selected: ["A", "B"] });
@@ -264,7 +350,7 @@ describe("DshQuestionDialog wizard", () => {
  * 在上方裁掉、滚也滚不到。改用 HoverDetail（portal 到 body + fixed）后，
  * 浮层必须挂在对话框子树之外，才谈得上「不受任何祖先 overflow 裁剪」。
  */
-describe("DshQuestionDialog 选项详情浮层", () => {
+describe("QuestionDialog 选项详情浮层", () => {
 	const tip = () => document.body.querySelector(".question-desc-tip");
 
 	it("hover 选项时以顶层浮层渲染：内容富文本，且不在对话框子树里", () => {
@@ -344,7 +430,7 @@ describe("DshQuestionDialog 选项详情浮层", () => {
 	});
 });
 
-describe("DshQuestionDialog 对话名字展示", () => {
+describe("QuestionDialog 对话名字展示", () => {
 	it("当 question 携带 conversationTitle 时在头部展示", () => {
 		const q: Question = {
 			...baseQuestion,
@@ -373,7 +459,7 @@ describe("DshQuestionDialog 对话名字展示", () => {
 				createElement(
 					LanguageProvider,
 					null,
-					createElement(DshQuestionDialog, {
+					createElement(QuestionDialog, {
 						question: baseQuestion,
 						conversationTitle: "兜底对话名字",
 					}),
@@ -386,7 +472,7 @@ describe("DshQuestionDialog 对话名字展示", () => {
 	});
 });
 
-describe("DshQuestionDialog 折叠与展开", () => {
+describe("QuestionDialog 折叠与展开", () => {
 	it("默认处于展开状态，显示题目与操作栏", () => {
 		const { container } = mount(baseQuestion);
 		const inline = container.querySelector(".dialog-inline");
@@ -477,7 +563,7 @@ describe("DshQuestionDialog 折叠与展开", () => {
 				createElement(
 					LanguageProvider,
 					null,
-					createElement(DshQuestionDialog, {
+					createElement(QuestionDialog, {
 						question: baseQuestion,
 					}),
 				),
@@ -498,7 +584,7 @@ describe("DshQuestionDialog 折叠与展开", () => {
 				createElement(
 					LanguageProvider,
 					null,
-					createElement(DshQuestionDialog, {
+					createElement(QuestionDialog, {
 						question: nextQuestion,
 					}),
 				),
@@ -515,7 +601,7 @@ describe("DshQuestionDialog 折叠与展开", () => {
  * 不是提交。修复前只看 `e.key === "Enter"`，文字刚上屏就把问卷答案发给模型，面板随之收起
  * 且无法修改。本组用例锁住两条漏判路径（与 #248 同源）。
  */
-describe("DshQuestionDialog 输入法上屏回车不提交（issue #560）", () => {
+describe("QuestionDialog 输入法上屏回车不提交（issue #560）", () => {
 	it("组合态回车（isComposing=true）不提交，仅让文字上屏", () => {
 		const { container, sent } = mount(baseQuestion);
 		const input = container.querySelector(".question-custom") as HTMLInputElement;

@@ -112,7 +112,7 @@
 - DSH 机制：`dsh-user-questions`（ctx.userQuestions.ask() 阻塞等答案，registerProvider 注册 UI 侧）+ `dsh-tool-ask-user`（ask_user_question 工具，**base bundle 未挂，需 override.patch.yml 手动 insert**）。
 - 桥实现（goal-rpc.mjs）：apply 里 `ctx.userQuestions.registerProvider({ ask })` → 发 `question.pending` 通知 → 等 `question/answer` RPC（带 answers/cancelled）→ 恢复工具结果。单客户端隔离（每客户端一 runtime）。取消 → reject → 工具报错 → 模型继续。
 - 协议：客户端 `question_answer`；服务端 `question_pending`（questions 含 options{label,description,preview?}/multiSelect）。
-- 前端：DshQuestionDialog.tsx（每题单选/多选 + 自由文本补充 + 提交/取消，复用 .dialog-inline 样式）。`question/detail/description/preview` 走 `Markdown(rawHtml)` 富渲染（模型可自选 markdown 或 HTML）；选中带 `preview` 的选项时展示「选项预览」框，对齐 rpiv-ask-user-question。`preview` 为可选新增，DSH 模型未发时前端回退纯文本。
+- 前端：QuestionDialog.tsx（每题单选/多选 + 自由文本补充 + 提交/取消，复用 .dialog-inline 样式）。`question/detail/description/preview` 走 `Markdown(rawHtml)` 富渲染（模型可自选 markdown 或 HTML）；选中带 `preview` 的选项时展示「选项预览」框，对齐 rpiv-ask-user-question。`preview` 为可选新增，DSH 模型未发时前端回退纯文本。
 - 实测：模型 ask_user_question → 浏览器收到"喜欢什么颜色 红/蓝/绿" → 答"蓝+偏深蓝" → 模型回应"你选择的是蓝（偏深蓝）"。
 
 **交互式调研向导**（startGoalWizard 重写，替代一键设置）：
@@ -179,7 +179,7 @@
 3. **设置面板「界面插件」**——「DSH 用户补丁」区块展示 `<dataDir>/dsh-patches/*.yml` 文件（测试放无害 persona 覆盖补丁，验证扫描与展示）。
 4. **技能页签**——显示 DSH 说明文案（`dshSkillsNote`）。
 
-**范围取舍**：流式渲染 / 图片粘贴（vision-exp）/ 提问对话框的浏览器级渲染需真 key + 模型时序，易 flaky，由协议级 dsh 测试（`dsh-goal/question/vision`）覆盖 + 引擎无关共享组件（StreamMarkdown/DshQuestionDialog/image-paste）保证；本 E2E 专注 DSH 专属 UI chromium（徽标/补丁/目标条/技能说明），零 key、可进 CI。
+**范围取舍**：流式渲染 / 图片粘贴（vision-exp）/ 提问对话框的浏览器级渲染需真 key + 模型时序，易 flaky，由协议级 dsh 测试（`dsh-goal/question/vision`）覆盖 + 引擎无关共享组件（StreamMarkdown/QuestionDialog/image-paste）保证；本 E2E 专注 DSH 专属 UI chromium（徽标/补丁/目标条/技能说明），零 key、可进 CI。
 
 ### 2.12 ⭐ Agent 预设（dsh-web 四模式复刻，2026-09-15）
 
@@ -320,7 +320,7 @@ E:/pi-web-ui/server/dsh/
 | 9   | 前端徽标 + 引擎状态                                                                   | ✅ 完成                                                                                                                                            |
 | 10  | typecheck/build/冒烟（双引擎）                                                        | ✅ typecheck/build/vitest 全绿；pi smoke 抽样回归绿；**dsh smoke 已评估（§3.5，22/32 + 2 环境跳过，失败全归因）**                                  |
 | 11  | 二期：视觉桥（真 image block + vision-exp 模型 + 回放补图）                           | ✅ 完成（§2.7，probe-vision.mjs 实证）                                                                                                             |
-| 12  | 二期：用户提问桥（question_pending/question_answer + DshQuestionDialog）              | ✅ 完成（§2.7，WS 实证：提问→回答→模型回应）                                                                                                       |
+| 12  | 二期：用户提问桥（question_pending/question_answer + QuestionDialog）                 | ✅ 完成（§2.7，WS 实证：提问→回答→模型回应）                                                                                                       |
 | 13  | 二期：交互式调研向导（startGoalWizard 重写）                                          | ✅ 完成（§2.7，4 轮提问→GOAL 收敛→自动设目标实证）                                                                                                 |
 | 14  | 第二轮：P0 稳定性（watchdog/竞态/内存回收/DEBUG/重试/提问超时）                       | ✅ 完成（§8.1 全部）                                                                                                                               |
 | 15  | 第二轮：P1 体验对齐（vision 校验/设置面板/轮次检测/locked 语义/conv-cwd/保留期/搜索） | ✅ 完成（§8.2 全部；conv-cwd-test 转绿）                                                                                                           |
@@ -396,7 +396,7 @@ E:/pi-web-ui/server/dsh/
 | `E:/pi-web-ui/tests/dsh-tools-test.mjs`                  | dsh 工具桥真 key 门控测试（模型调用桥接插件工具 test_echo → 服务端执行 → 结果回传）            |
 | `E:/pi-web-ui/tests/dsh-mcp-test.mjs`                    | dsh MCP 工具桥真 key 门控测试（mcp.json → McpBridge 发现 mcp_echo → 模型调用 → MCP_ECHO 回传） |
 | `E:/pi-web-ui/tests/dsh-ui-test.mjs`                     | dsh 浏览器 UI E2E（零 key Playwright：引擎徽标/目标条/DSH 补丁区块/技能说明，5/5）             |
-| `E:/pi-web-ui/web/src/components/DshQuestionDialog.tsx`  | 模型提问对话框（单选/多选/自定义文本 + `Markdown(rawHtml)` 富渲染 + 选项 `preview` 预览框）    |
+| `E:/pi-web-ui/web/src/components/QuestionDialog.tsx`     | 模型提问对话框（单选/多选/自定义文本 + `Markdown(rawHtml)` 富渲染 + 选项 `preview` 预览框）    |
 | `E:/pi-web-ui/dev/dsh-probes/probe-patch-seam.mjs`       | 用户 patch 层 probe（会话根重定向验证）                                                        |
 | `E:/pi-web-ui/server/index.ts`                           | 引擎分发（ENGINE/EngineService/DispatchSession）+ dispatch 表 + dsh_patches 分支               |
 | `E:/pi-web-ui/server/protocol.ts`                        | wire 协议唯一事实源（ready.engine + dsh_patches 消息）                                         |
@@ -421,7 +421,7 @@ E:/pi-web-ui/server/dsh/
 | 3   | **convs 内存回收**                | ✅ 5min 定时 + newChat 触发 `reclaimIdleConversations`：非 active/非 streaming/无终端，未 listed 闲置 >30min、listed 闲置 >24h 回收（JSONL 在磁盘可回放）；setCwd 切项目时同步回收旧项目未列出会话                                                                                     |
 | 4   | **PI_WEB_DSH_DEBUG 门控**         | ✅ dsh-client 加 `PI_WEB_DSH_DEBUG=1`：RPC 帧（-> / <-）、exit/kill/restart 生命周期打到 stderr                                                                                                                                                                                        |
 | 5   | **start 失败重试**                | ✅ `startWithRetry`：1s/3s/9s 指数退避，最终失败才发 error notice（create 与 watchdog 共用）                                                                                                                                                                                           |
-| 6   | **提问桥超时配置 + 前端倒计时**   | ✅ `PI_WEB_DSH_QUESTION_TIMEOUT_MS`（默认 10min）；question_pending 带 deadline；DshQuestionDialog 显示倒计时 + 归零自动取消（questionTimeout/questionTimeoutExpired i18n）                                                                                                            |
+| 6   | **提问桥超时配置 + 前端倒计时**   | ✅ `PI_WEB_DSH_QUESTION_TIMEOUT_MS`（默认 10min）；question_pending 带 deadline；QuestionDialog 显示倒计时 + 归零自动取消（questionTimeout/questionTimeoutExpired i18n）                                                                                                               |
 
 ### 8.2 P1 — 体验对齐（✅ 全部完成）
 
@@ -450,11 +450,11 @@ E:/pi-web-ui/server/dsh/
 
 ### 8.4 测试与交付
 
-| #   | 项                           | 现状                                                                                                                                                                                                                                                                                                                            | 方案 |
-| --- | ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---- |
-| 22  | **dsh 专属冒烟套件**         | ✅ 完成（§8.6）—— `tests/dsh-smoke-test.mjs` 零 key 协议冒烟（已纳入 run-smoke ALL），`tests/dsh-goal-test.mjs` / `dsh-question-test.mjs` / `dsh-vision-test.mjs` 真 key 门控（无 key SKIP 退出 0）。⚠️ 顺带修复 P2-17 隐藏 bug：goal-rpc inject 缺 `llm` 导致动态模型目录从末真正生效（本地表恰好 3 个模型掩盖了错误）         |
-| 23  | **浏览器 E2E（playwright）** | ✅ 零 key UI E2E（§2.11）—— `tests/dsh-ui-test.mjs`：引擎徽标（DSH）/目标条/设置面板「DSH 用户补丁」区块（扫 dsh-patches 展示文件）/技能页签 DSH 说明文案，5/5 通过。流式/图片粘贴/提问对话框的浏览器级渲染由协议级 dsh 测试（goal/question/vision）覆盖 + 引擎无关共享组件（StreamMarkdown/DshQuestionDialog/image-paste）保证 |
-| 24  | **部署文档**                 | ✅ 完成（§8.7）—— `docs/deployment.md` 新增「引擎选择（pi / DeepSeek Harness）」章节（PI_WEB_ENGINE / DSH 运行时树 / 环境变量速览 / 用户补丁层 / systemd+launchd env 示例）；`Dockerfile` 加全局 dsh 运行时树安装；`docker-compose.yml` 加 DSH 注释。`docs/env-vars.md` 此前已含 DSH 变量                                       |
+| #   | 项                           | 现状                                                                                                                                                                                                                                                                                                                         | 方案 |
+| --- | ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---- |
+| 22  | **dsh 专属冒烟套件**         | ✅ 完成（§8.6）—— `tests/dsh-smoke-test.mjs` 零 key 协议冒烟（已纳入 run-smoke ALL），`tests/dsh-goal-test.mjs` / `dsh-question-test.mjs` / `dsh-vision-test.mjs` 真 key 门控（无 key SKIP 退出 0）。⚠️ 顺带修复 P2-17 隐藏 bug：goal-rpc inject 缺 `llm` 导致动态模型目录从末真正生效（本地表恰好 3 个模型掩盖了错误）      |
+| 23  | **浏览器 E2E（playwright）** | ✅ 零 key UI E2E（§2.11）—— `tests/dsh-ui-test.mjs`：引擎徽标（DSH）/目标条/设置面板「DSH 用户补丁」区块（扫 dsh-patches 展示文件）/技能页签 DSH 说明文案，5/5 通过。流式/图片粘贴/提问对话框的浏览器级渲染由协议级 dsh 测试（goal/question/vision）覆盖 + 引擎无关共享组件（StreamMarkdown/QuestionDialog/image-paste）保证 |
+| 24  | **部署文档**                 | ✅ 完成（§8.7）—— `docs/deployment.md` 新增「引擎选择（pi / DeepSeek Harness）」章节（PI_WEB_ENGINE / DSH 运行时树 / 环境变量速览 / 用户补丁层 / systemd+launchd env 示例）；`Dockerfile` 加全局 dsh 运行时树安装；`docker-compose.yml` 加 DSH 注释。`docs/env-vars.md` 此前已含 DSH 变量                                    |
 
 ### 8.5 已知取舍（不打算改，除非用户要求）
 

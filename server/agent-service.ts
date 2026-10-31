@@ -1464,7 +1464,12 @@ export class ClientSession {
 			// 子代理会话同样订阅 SDK 事件：否则 onEvent 永不触发，点开查看时没有
 			// message_delta 流式增量、快照也不刷新，只能靠切走切回时的 flushSnapshot
 			// 看到新内容（dismiss/释放流程本来就会 unsubscribe，不泄漏）。
-			conv.unsubscribe = conv.session.subscribe((event) => spawnOwner.onEvent(conv, event));
+			conv.unsubscribe = runtime.session.subscribe((event) => {
+				const owner = this.findConversationHome?.(runtime.session)?.session ?? spawnOwner;
+				if (owner.convs.get(conv.id) === conv && conv.runtime === runtime && conv.session === runtime.session) {
+					owner.onEvent(conv, event);
+				}
+			});
 			// 扩展绑定（rpc 模式）；用 headless 的 Web UI context：
 			// 扩展绑定时不会因缺方法崩，UI 输出也不下发（不会与主对话的 widget/status 冲突）。
 			try {
@@ -1570,16 +1575,26 @@ export class ClientSession {
 			assertChildCurrent();
 			// 触发回合（后台执行；失败转识为通知）。把 Promise 挂在对话上：目标模式的
 			// 「等本回合结束」要先等它落定，才能区分「还没开跑」与「已跑完」。
+			const generation = conv.subagentRunGeneration ?? 0;
+			const currentHolder = () => {
+				const owner = this.findConversationHome?.(runtime.session)?.session ?? this;
+				return owner.convs.get(conv.id) === conv &&
+					conv.runtime === runtime &&
+					conv.session === runtime.session &&
+					(conv.subagentRunGeneration ?? 0) === generation
+					? owner
+					: undefined;
+			};
 			const onSpawnAbort = () => {
 				// SDK sendUserMessage has no signal option; abort only the captured child session.
-				void runtime.session.abort().catch(() => {});
+				if (currentHolder()) void runtime.session.abort().catch(() => {});
 			};
 			signal?.addEventListener("abort", onSpawnAbort, { once: true });
 			holder.assertSubagentWorktreeAdmission(conv);
 			conv.kickoff = runtime.session
 				.sendUserMessage(prompt)
 				.catch((err) => {
-					this.emit({
+					currentHolder()?.emit({
 						type: "notice",
 						level: "error",
 						text: `子代理 ${conversationId} 启动失败: ${err instanceof Error ? err.message : String(err)}`,
@@ -1588,7 +1603,11 @@ export class ClientSession {
 				})
 				.finally(() => {
 					signal?.removeEventListener("abort", onSpawnAbort);
+					const owner = currentHolder();
+					if (!owner) return;
 					conv.promptInFlight = false;
+					if (conv.isSubagent) owner.scheduleSubagentCompletionNotice(conv);
+					owner.emitConversations();
 				});
 			if (persist) {
 				holder.pushProjects().catch(() => {});
@@ -4502,7 +4521,7 @@ export class ClientSession {
 							() => this.flushSnapshot(),
 						),
 						// 标准引擎的 ask_user_question：模型调用 → 浏览器富渲染问卷（复用 DSH
-						// 的 question_pending/question_answer 协议，前端 DshQuestionDialog）。
+						// 的 question_pending/question_answer 协议，前端 QuestionDialog）。
 						// DSH 引擎不经此（它走 goal-rpc 的 userQuestions provider）。
 						makeAskUserQuestionTool(bridge, ownerId),
 						// 浏览器页面工具：模型调用 → page_request 给浏览器 → page-picker 扩展
@@ -5999,6 +6018,12 @@ export class ClientSession {
 				break;
 			}
 			case "agent_settled": {
+				// agent_end can precede both SDK idle and kickoff's finally. Retry at
+				// each settlement boundary; the scheduler rechecks manual dependencies.
+				const owner = this.findConversationHome?.(conv.session)?.session ?? this;
+				if (owner.convs.get(conv.id) === conv && conv.isSubagent && !conv.promptInFlight && !conv.session.isStreaming) {
+					owner.scheduleSubagentCompletionNotice(conv);
+				}
 				// 记录本会话自己的 Base 基线：currentBaseTokens 必须传 conv（否则串成
 				// 活跃会话的基线）；快照未就绪时保持 undefined，宁可少补偿也不把 0 钉死。
 				// 只有在真正获得了有效的大模型回复 usage 时才落账（被 abort 或网络失败全 0 不落账，

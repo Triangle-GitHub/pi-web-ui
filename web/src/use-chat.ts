@@ -2173,7 +2173,7 @@ export function useChat() {
 	 *
 	 *  为什么需要它：question_pending 是即时通道，只推给「提问那一刻在线」的连接；
 	 *  刷新/重连后前端拿不到那条历史消息，而服务端还在阻塞等人回答——问卷就从眼前
-	 *  消失（DshQuestionDialog 无入口）。快照是权威态，据此把面板补回来。
+	 *  消失（QuestionDialog 无入口）。快照是权威态，据此把面板补回来。
 	 *  判定规则（含三条边界）全在纯函数 resolvePendingQuestion。 */
 	const syncPendingQuestion = useCallback((p: UiPendingQuestion | null | undefined, activeConversationId: string) => {
 		const decision = resolvePendingQuestion({

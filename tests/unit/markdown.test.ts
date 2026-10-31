@@ -4,7 +4,7 @@ import { createElement } from "react";
 import { MarkdownBody } from "../../web/src/components/Markdown.js";
 
 /**
- * Markdown.rawHtml 冒烟测试：提问对话框（DshQuestionDialog / Dialog）把
+ * Markdown.rawHtml 冒烟测试：提问对话框（QuestionDialog / Dialog）把
  * question/detail/description/preview 交给 <Markdown rawHtml>，模型可自选
  * markdown 或 HTML。
  *

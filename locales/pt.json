@@ -714,6 +714,8 @@
 		"modelQuestion": "Pergunta do Modelo",
 		"modelQuestionCustom": "Resposta personalizada (opcional)",
 		"modelQuestionSubmit": "Enviar resposta",
+		"questionAutoSubmitLast": "Auto-submit when picking an option on the last question",
+		"questionPickSubmits": "Picking an option submits",
 		"modelQuestionRejectWithNote": "Rejeitar com observação",
 		"modelQuestionRejectWithNoteTip": "Cancela a pergunta com a observação digitada e devolve a explicação ao modelo",
 		"recommended": "Recomendado",

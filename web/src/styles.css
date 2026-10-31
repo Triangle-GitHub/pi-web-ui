@@ -17768,7 +17768,25 @@
 		color: var(--text);
 		background: var(--bg-elev);
 	}
-	/* DSH 向导式问题导航：取消居左，上一步/下一步居右 */
+	.question-auto-submit {
+		display: flex;
+		align-items: center;
+		flex-wrap: wrap;
+		gap: 6px;
+		min-width: 0;
+		max-width: 100%;
+		font-size: 12px;
+		color: var(--text);
+		overflow-wrap: anywhere;
+		word-break: break-word;
+	}
+	.question-auto-submit input {
+		accent-color: var(--accent);
+	}
+	.question-auto-submit-hint {
+		color: var(--text-dim);
+	}
+	/* 共用问卷导航：取消居左，上一步/下一步居右 */
 	.dialog-nav {
 		display: flex;
 		align-items: center;

@@ -12,7 +12,7 @@ import {
 } from "../../web/src/question-queue";
 import { QuestionQueue } from "../../web/src/components/QuestionQueue";
 import { _chatReducerForTest as reducer, type ChatState } from "../../web/src/use-chat";
-import { DshQuestionDialog } from "../../web/src/components/DshQuestionDialog";
+import { QuestionDialog } from "../../web/src/components/QuestionDialog";
 import { setAppSend } from "../../web/src/app-globals";
 import { clearQuestionDraft, loadQuestionDraft, saveQuestionDraft } from "../../web/src/question-draft";
 
@@ -99,6 +99,7 @@ describe("question queue compatibility and modes", () => {
 		expect(loadQuestionDraft("queue-test")).not.toBeNull();
 		click(container.querySelector(".question-queue-actions button"));
 		click(container.querySelector(".question-option"));
+		click(container.querySelector(".dialog-submit"));
 		expect(sent).toContainEqual(
 			expect.objectContaining({ type: "question_answer", owner: "owner-a", id: "queue-test" }),
 		);
@@ -115,6 +116,7 @@ describe("question queue compatibility and modes", () => {
 		act(() => root!.render(createElement(QuestionQueue, { questions: [second, first], mode: "manual" })));
 		expect(container.querySelector(".question-queue-summary")?.textContent).toContain("Choose");
 		click(container.querySelector(".question-option"));
+		click(container.querySelector(".dialog-submit"));
 		expect(sent).toEqual([expect.objectContaining({ id: first.id })]);
 		// A manual-mode settlement must not automatically open the next request.
 		act(() => root!.render(createElement(QuestionQueue, { questions: [second], mode: "manual" })));
@@ -176,13 +178,11 @@ describe("question queue compatibility and modes", () => {
 		const sent = vi.fn(() => true);
 		setAppSend(sent);
 		saveQuestionDraft("queue-test", { selections: {}, customs: { choice: "saved note" }, step: 0 });
-		mount(createElement(DshQuestionDialog, { question: { ...request(), deadline: Date.now() + 1000 } }));
+		mount(createElement(QuestionDialog, { question: { ...request(), deadline: Date.now() + 1000 } }));
 		act(() => vi.advanceTimersByTime(3000));
 		expect(sent).not.toHaveBeenCalled();
 		expect(loadQuestionDraft("queue-test")).not.toBeNull();
-		act(() =>
-			root!.render(createElement(DshQuestionDialog, { question: { ...request(), deadline: Date.now() - 1000 } })),
-		);
+		act(() => root!.render(createElement(QuestionDialog, { question: { ...request(), deadline: Date.now() - 1000 } })));
 		expect(sent).not.toHaveBeenCalled();
 	});
 });

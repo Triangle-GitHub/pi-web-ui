@@ -714,6 +714,8 @@
 		"modelQuestion": "Modellfrage",
 		"modelQuestionCustom": "Ergänzende Antwort (optional)",
 		"modelQuestionSubmit": "Antwort senden",
+		"questionAutoSubmitLast": "Auto-submit when picking an option on the last question",
+		"questionPickSubmits": "Picking an option submits",
 		"modelQuestionRejectWithNote": "Reject with note",
 		"modelQuestionRejectWithNoteTip": "Cancel the question with the custom note and send the explanation back to the model",
 		"recommended": "Recommended",

@@ -714,6 +714,8 @@
 		"modelQuestion": "Model sorusu",
 		"modelQuestionCustom": "Ek yanıt (isteğe bağlı)",
 		"modelQuestionSubmit": "Yanıtı gönder",
+		"questionAutoSubmitLast": "Auto-submit when picking an option on the last question",
+		"questionPickSubmits": "Picking an option submits",
 		"modelQuestionRejectWithNote": "Notla reddet",
 		"modelQuestionRejectWithNoteTip": "Soruyu giriş kutusundaki notla iptal eder ve açıklamayı modele geri iletir",
 		"recommended": "Önerilen",

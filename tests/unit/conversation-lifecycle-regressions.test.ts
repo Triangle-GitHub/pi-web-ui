@@ -1,4 +1,6 @@
 import { resolve } from "node:path";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createAgentSessionRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
 import { ClientSession } from "../../server/agent-service.js";
@@ -527,6 +529,103 @@ describe("plugin tool synchronization across sessions", () => {
 			expect(session._refreshToolRegistry).toHaveBeenCalledTimes(2);
 			cs.syncPluginTools(session);
 			expect(session._refreshToolRegistry).toHaveBeenCalledTimes(2);
+		}
+	});
+});
+
+describe("initial subagent kickoff settlement", () => {
+	it.each([
+		"settled before promise",
+		"promise before settled",
+		"takeover",
+		"removed",
+		"runtime replaced",
+		"new generation",
+		"canceled",
+	])("retries completion only for the captured current run: %s", async (ordering) => {
+		const agentDir = mkdtempSync(resolve(tmpdir(), "pi-kickoff-test-"));
+		try {
+			vi.spyOn(SessionManager, "inMemory").mockReturnValue({} as any);
+			const owner = client();
+			const destination = client();
+			const parent = conversation("A");
+			const child = conversation("child");
+			const run = deferred<void>();
+			const controller = new AbortController();
+			Object.assign(child.session, {
+				isStreaming: false,
+				sendUserMessage: vi.fn(() => run.promise),
+				abort: vi.fn().mockResolvedValue(undefined),
+			});
+			Object.assign(owner, {
+				agentDir,
+				makeTerminalManager: () => child.terminals,
+				makeRuntimeFactory: () => ({}),
+				makeConversation: (runtime: any, id: string) => Object.assign(child, { runtime, id }),
+				makeExtensionErrorReporter: vi.fn(),
+				applySessionOverrides: vi.fn(),
+				emitConversations: vi.fn(),
+				scheduleSubagentCompletionNotice: vi.fn(),
+				currentBaseTokens: () => undefined,
+			});
+			destination.scheduleSubagentCompletionNotice = vi.fn();
+			destination.emitConversations = vi.fn();
+			owner.convs.set(parent.id, parent);
+			vi.mocked(createAgentSessionRuntime).mockResolvedValue(child.runtime);
+			await owner.spawnSubagentConversation(
+				"task",
+				"general",
+				"",
+				undefined,
+				undefined,
+				parent.id,
+				false,
+				undefined,
+				undefined,
+				"manual",
+				undefined,
+				undefined,
+				controller.signal,
+			);
+			expect(child.promptInFlight).toBe(true);
+			if (ordering === "settled before promise") {
+				owner.onEvent(child, { type: "agent_settled" });
+				expect(owner.scheduleSubagentCompletionNotice).not.toHaveBeenCalled();
+			}
+			if (ordering === "takeover") {
+				owner.convs.delete(child.id);
+				destination.convs.set(child.id, child);
+				owner.findConversationHome.mockReturnValue({ session: destination, conv: child });
+			}
+			if (ordering === "removed") owner.convs.delete(child.id);
+			if (ordering === "runtime replaced") child.runtime = { ...child.runtime };
+			if (ordering === "new generation") child.subagentRunGeneration = 1;
+			if (ordering === "canceled") controller.abort();
+			if (["removed", "runtime replaced", "new generation"].includes(ordering)) {
+				controller.abort();
+				expect(child.session.abort).not.toHaveBeenCalled();
+			}
+			if (["takeover", "removed", "runtime replaced"].includes(ordering)) {
+				const originalEvents = vi.spyOn(owner, "onEvent").mockImplementation(() => {});
+				const destinationEvents = vi.spyOn(destination, "onEvent").mockImplementation(() => {});
+				const listener = child.session.subscribe.mock.calls[0][0];
+				listener({ type: "agent_settled" });
+				expect(originalEvents).not.toHaveBeenCalled();
+				expect(destinationEvents).toHaveBeenCalledTimes(ordering === "takeover" ? 1 : 0);
+			}
+			run.resolve();
+			await child.kickoff;
+			const stale = ["removed", "runtime replaced", "new generation"].includes(ordering);
+			expect(child.promptInFlight).toBe(stale);
+			expect(owner.scheduleSubagentCompletionNotice).toHaveBeenCalledTimes(stale || ordering === "takeover" ? 0 : 1);
+			expect(destination.scheduleSubagentCompletionNotice).toHaveBeenCalledTimes(ordering === "takeover" ? 1 : 0);
+			if (ordering === "promise before settled") {
+				owner.onEvent(child, { type: "agent_settled" });
+				expect(owner.scheduleSubagentCompletionNotice).toHaveBeenCalledTimes(2);
+			}
+			if (ordering === "canceled") expect(child.session.abort).toHaveBeenCalledOnce();
+		} finally {
+			rmSync(agentDir, { recursive: true, force: true });
 		}
 	});
 });

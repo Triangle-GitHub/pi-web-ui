@@ -25,7 +25,7 @@ interface QuestionItem {
 	optionsMap?: Record<string, { label: string; description?: string; preview?: string; recommended?: boolean }[]>;
 }
 
-interface DshQuestionDialogProps {
+interface QuestionDialogProps {
 	question: {
 		id: string;
 		/** 服务端超时时间戳（epoch ms）——仅显示倒计时，由服务端处理超时。 */
@@ -43,9 +43,9 @@ interface DshQuestionDialogProps {
 }
 
 /**
- * DSH 引擎的模型提问对话框（ask_user_question 工具 → question_pending 通知）。
+ * 共用模型提问对话框（ask_user_question 工具 → question_pending 通知）。
  * 向导式：每次只显示一道题。
- *  - 单选：点选项即选中并自动进入下一题；最后一题点选项直接提交。
+ *  - 单选：选中新选项自动进入下一题，再点已选项取消；最后一题按用户偏好提交。
  *  - 多选/自由文本：勾选或输入后用「下一步/提交」推进，「上一步」可回头修改。
  *  - ✗ / Esc → onDefer（队列）或取消；底部「取消」始终显式取消。提交与取消立即收起本面板
  *    （use-chat 在发出 question_answer 后置空 question）。
@@ -55,7 +55,7 @@ interface DshQuestionDialogProps {
  * 文本渲染：question/detail/description/preview 统一走 Markdown（rawHtml），
  * 模型可自由写 markdown 或 HTML —— 由模型自选、信任模型。
  */
-export function DshQuestionDialog({ question, owner, conversationTitle, onDefer, onNavigate }: DshQuestionDialogProps) {
+export function QuestionDialog({ question, owner, conversationTitle, onDefer, onNavigate }: QuestionDialogProps) {
 	const t = useT();
 	const convTitle = question.conversationTitle || conversationTitle;
 	const [selections, setSelections] = useState<Record<string, string[]>>(() => {
@@ -67,6 +67,13 @@ export function DshQuestionDialog({ question, owner, conversationTitle, onDefer,
 		return draft?.customs ?? {};
 	});
 	const [collapsed, setCollapsed] = useState(false);
+	const [autoSubmitLast, setAutoSubmitLast] = useState(() => {
+		try {
+			return localStorage.getItem("pi-web:question-auto-submit-last") === "1";
+		} catch {
+			return false;
+		}
+	});
 	/** 输入法守卫：macOS 中文输入法下 Enter 是「上屏」而非「提交」（issue #560，与 #248 同源）。 */
 	const imeGuard = useImeCompositionGuard();
 	/** 向导当前步（question.questions 下标），支持从草稿恢复。 */
@@ -211,11 +218,13 @@ export function DshQuestionDialog({ question, owner, conversationTitle, onDefer,
 	const submitSelections = (sel: Record<string, string[]>) => {
 		submittedRef.current = true;
 		clearQuestionDraft(question.id);
-		const answers = question.questions.map((qq) => {
-			const selected = sel[qq.id] ?? [];
-			const custom = (customs[qq.id] ?? "").trim();
-			return { id: qq.id, selected, ...(custom ? { custom } : {}) };
-		});
+		const answers = question.questions
+			.filter((qq) => isQuestionVisible(qq, sel))
+			.map((qq) => {
+				const selected = sel[qq.id] ?? [];
+				const custom = (customs[qq.id] ?? "").trim();
+				return { id: qq.id, selected, ...(custom ? { custom } : {}) };
+			});
 		appSend({ type: "question_answer", id: question.id, answers, ...(owner ? { owner } : {}) });
 	};
 
@@ -229,19 +238,22 @@ export function DshQuestionDialog({ question, owner, conversationTitle, onDefer,
 		});
 	};
 
-	/** 单选：选中并直接前进；多选：仅切换勾选。 */
+	/** 单选选中后快速前进；再次点选取消，末题按用户偏好提交。 */
 	const onOptionClick = (qid: string, label: string, multi: boolean) => {
 		if (multi) {
 			toggleOption(qid, label);
 			return;
 		}
-		const sel = { ...selections, [qid]: [label] };
+		const deselecting = (selections[qid] ?? []).includes(label);
+		const sel = { ...selections, [qid]: deselecting ? [] : [label] };
 		setSelections(sel);
+		if (deselecting) return;
 		const nextVisible = question.questions.filter((qq) => isQuestionVisible(qq, sel));
-		if (currentStep >= nextVisible.length - 1) {
+		const nextIndex = nextVisible.findIndex((qq) => qq.id === qid) + 1;
+		if (nextIndex < nextVisible.length) {
+			setStep(nextIndex);
+		} else if (autoSubmitLast) {
 			submitSelections(sel);
-		} else {
-			setStep(currentStep + 1);
 		}
 	};
 
@@ -282,7 +294,9 @@ export function DshQuestionDialog({ question, owner, conversationTitle, onDefer,
 		const onKeyDown = (e: KeyboardEvent) => {
 			const target = e.target as HTMLElement | null;
 			const isEditing = target?.tagName === "INPUT" || target?.tagName === "TEXTAREA" || target?.isContentEditable;
-			if (isEditing) return;
+			if (isEditing || imeGuard.isImeKey(e)) return;
+			// Native controls own Enter/Space, avoiding duplicate submit or checkbox activation.
+			if (e.key === "Enter" && target?.closest?.("button, select, label")) return;
 
 			// 数字键 1-9：快速点选对应选项
 			if (e.key >= "1" && e.key <= "9") {
@@ -461,6 +475,25 @@ export function DshQuestionDialog({ question, owner, conversationTitle, onDefer,
 							}}
 						/>
 					</div>
+					<label className="question-auto-submit">
+						<input
+							type="checkbox"
+							checked={autoSubmitLast}
+							onChange={(e) => {
+								const enabled = e.target.checked;
+								setAutoSubmitLast(enabled);
+								try {
+									localStorage.setItem("pi-web:question-auto-submit-last", enabled ? "1" : "0");
+								} catch {
+									// Keep the choice for this dialog when browser storage is unavailable.
+								}
+							}}
+						/>
+						<span>{t("questionAutoSubmitLast")}</span>
+						{autoSubmitLast && currentStep === total - 1 && !q.multiSelect && effectiveOptions.length > 0 && (
+							<span className="question-auto-submit-hint">{t("questionPickSubmits")}</span>
+						)}
+					</label>
 					<div className="dialog-nav">
 						<button
 							type="button"

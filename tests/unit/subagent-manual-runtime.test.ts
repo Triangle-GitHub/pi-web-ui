@@ -8,6 +8,7 @@ const proto = ClientSession.prototype as any;
 function harness() {
 	const owner: any = {
 		convs: new Map(),
+		conv: { id: "active-elsewhere" },
 		pendingQuestions: new Map(),
 		pendingSubagentNotices: new Map(),
 		deliveringSubagentNotices: new Map(),
@@ -57,6 +58,74 @@ function child(owner: any, id: string, parentId: string, manual = true): any {
 }
 afterEach(() => vi.useRealTimers());
 describe("manual task runtime", () => {
+	function settled(owner: any, conv: any) {
+		owner.currentBaseTokens = () => undefined;
+		proto.onEvent.call(owner, conv, { type: "agent_settled" });
+	}
+	it.each([true, false])("retries an agent_end while streaming once the SDK settles (manual=%s)", async (manual) => {
+		vi.useFakeTimers();
+		const owner = harness();
+		const root = child(owner, "root", "", false);
+		const a = child(owner, "a", "root", manual);
+		a.session.isStreaming = true;
+		Object.assign(owner, {
+			emitRun: vi.fn(),
+			scheduleSessionsRefresh: vi.fn(),
+			refreshConversationTitle: vi.fn(),
+			subagentRunOutcome: proto.subagentRunOutcome,
+			notifyTurnEnd: vi.fn(),
+			goalSvc: { onAgentEnd: vi.fn() },
+			settingsSvc: { hasPendingReload: () => false },
+			disposed: true,
+		});
+		a.queueSteering = [];
+		a.queueFollowUp = [];
+		proto.onEvent.call(owner, a, { type: "agent_end", messages: a.session.agent.state.messages });
+		await vi.advanceTimersByTimeAsync(500);
+		expect(root.session.sendUserMessage).not.toHaveBeenCalled();
+		a.session.isStreaming = false;
+		settled(owner, a);
+		await vi.advanceTimersByTimeAsync(500);
+		expect(root.session.sendUserMessage).toHaveBeenCalledOnce();
+		settled(owner, a);
+		await vi.advanceTimersByTimeAsync(500);
+		expect(root.session.sendUserMessage).toHaveBeenCalledOnce();
+	});
+	it("settlement uses the current holder and keeps manual dependencies and opt-out", async () => {
+		vi.useFakeTimers();
+		const old = harness();
+		const owner = harness();
+		const root = child(owner, "root", "", false);
+		const a = child(owner, "a", "root");
+		old.findConversationHome = () => ({ session: owner });
+		owner.communicationPending = () => true;
+		settled(old, a);
+		await vi.advanceTimersByTimeAsync(500);
+		expect(root.session.sendUserMessage).not.toHaveBeenCalled();
+		owner.communicationPending = () => false;
+		a.notifyOnDone = false;
+		settled(old, a);
+		await vi.advanceTimersByTimeAsync(500);
+		expect(root.session.sendUserMessage).not.toHaveBeenCalled();
+		a.notifyOnDone = "manual";
+		settled(old, a);
+		await vi.advanceTimersByTimeAsync(500);
+		expect(root.session.sendUserMessage).toHaveBeenCalledOnce();
+		expect(old.pendingSubagentNotices.size).toBe(0);
+	});
+	it.each(["removed", "replaced", "streaming", "prompt in flight"])("settlement ignores a %s task", async (state) => {
+		vi.useFakeTimers();
+		const owner = harness();
+		const root = child(owner, "root", "", false);
+		const a = child(owner, "a", "root");
+		if (state === "removed") owner.convs.delete(a.id);
+		if (state === "replaced") child(owner, "a", "root");
+		if (state === "streaming") a.session.isStreaming = true;
+		if (state === "prompt in flight") a.promptInFlight = true;
+		settled(owner, a);
+		await vi.advanceTimersByTimeAsync(500);
+		expect(root.session.sendUserMessage).not.toHaveBeenCalled();
+	});
 	it("idle manual with cross-owner child remains pending and occupies concurrency", () => {
 		const owner = harness();
 		const remote = harness();

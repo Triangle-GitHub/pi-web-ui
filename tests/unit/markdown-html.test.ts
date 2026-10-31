@@ -12,7 +12,7 @@ beforeAll(async () => {
 /**
  * Markdown.rawHtml 的「HTML 渲染」专项冒烟测试。
  *
- * 提问对话框（DshQuestionDialog / Dialog）把 question/detail/description/preview
+ * 提问对话框（QuestionDialog / Dialog）把 question/detail/description/preview
  * 交给 <Markdown rawHtml>，模型可自选 markdown **或 HTML**。这里用
  * react-dom/server.renderToStaticMarkup 在 node 环境渲染，零 token / 零浏览器，
  * 确定性验证 html 分支真实渲染成 DOM 结构（表格/列表/引用/代码块/链接/标题/

@@ -7,7 +7,7 @@ import {
 	type QueueQuestion,
 	type QuestionQueueMode,
 } from "../question-queue";
-import { DshQuestionDialog } from "./DshQuestionDialog";
+import { QuestionDialog } from "./QuestionDialog";
 import { PendingQueue } from "./PendingQueue";
 
 export interface QuestionQueueProps {
@@ -46,7 +46,7 @@ export function QuestionQueue({ questions, activeConversationId, mode }: Questio
 			}
 		>
 			{(selected, defer) => (
-				<DshQuestionDialog
+				<QuestionDialog
 					key={questionQueueKey(selected)}
 					question={selected}
 					owner={selected.owner}
