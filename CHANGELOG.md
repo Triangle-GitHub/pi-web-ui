@@ -12,6 +12,33 @@
 
 暂无未发布内容。
 
+## [0.114.1] — 2026-10-31
+
+### Added
+
+- **设备协作与引擎**：更新设备群组、远程桌面连接与引导，扩展 Codex 引擎、画布定时任务、对话通信与问卷队列，支持提示词模板命令。
+
+### Fixed
+
+- **bash 精确停止**：停止命令仅作用于目标会话，控制器随会话过户和改名迁移，避免误停其他对话或子代理，以及把停止提示写到错误会话。
+- **原生进程收尾**：限制退出后的输出排空和取消等待，防止命令完成或中止后工具仍挂起。
+- **临时会话与标题**：保留已开始的临时对话，并通过运行中的会话管理器持久保存标题修改。
+
+### Changed
+
+- **回归验证**：新增双真实进程的跨客户端取消检查，修正历史分页集成测试游标并验证无效锚点触发重新同步。
+
+<!-- auto-i18n:start -->
+
+### i18n
+
+- 前端新增 key（45）：`settingsEngineCodexTitle`、`settingsEngineCodexDesc`、`engineCodexModelDesc`、`tpl.fieldCommand`、`tpl.commandHint`、`tpl.commandInvalid`、`tpl.commandDuplicate`、`tpl.storageError`、`deviceSetupServer`、`deviceSetupSshPort`、`deviceSetupUsername`、`deviceSetupAuth`、`deviceSetupAuthPassword`、`deviceSetupAuthKey`、`deviceSetupAuthExisting`、`deviceSetupServicePort`、`deviceSetupCredentialHint`、`deviceSetupOptionalTls`、`deviceSetupDomain`、`deviceSetupEnableHttps`、`deviceSetupTlsHint`、`deviceSetupPreview`、`deviceSetupPreviewEmpty`、`deviceSetupUserActions`、`deviceSetupCloudPorts`、`deviceSetupSourceScope`、`deviceSetupAfterStart`、`deviceSetupGuide`、`deviceSetupRemoteInvalid`、`deviceSetupStartAi`、`pendingQueueDefer`、`toolApprovalPresentation`、`toolApprovalPresentationDesc`、`toolApprovalPresentationAll`、`communicateEnabledDesc`、`communicateOffHint`、`schedulerTargetLabel`、`schedulerTargetConversation`、`schedulerTargetCanvas`、`schedulerGraphLabel`、`schedulerGraphPlaceholder`、`schedulerGraphUnavailable`、`schedulerGraphHint`、`schedulerRunBaseLabel`、`schedulerCanvasPromptPlaceholder`
+- 前端删除 key（3）：`deviceSetupNoServer`、`deviceSetupNoServerHint`、`deviceSetupCliHint`
+- 前端中文变更（4）：`deviceSetupRemote`、`deviceSetupRemoteHint`、`questionPresentationDesc`、`toolDescSubagent`
+- 前端英文变更（4）：`deviceSetupRemote`、`deviceSetupRemoteHint`、`questionPresentationDesc`、`toolDescSubagent`
+
+<!-- auto-i18n:end -->
+
 ## [0.114.0] — 2026-10-30
 
 ### Added
@@ -2063,6 +2090,7 @@ when?, children?}`，也收 `topbar` / `settings` 这类简写别名）；宿主
 - 0.29.0（2026-08-23）：全局搜索弹窗（Ctrl+K）+ 消息列表惰性窗口化。
 
 [Unreleased]: https://github.com/xing-shuyin/pi-web-ui/compare/v0.114.0...main
+[0.114.1]: https://github.com/xing-shuyin/pi-web-ui/compare/v0.114.0...v0.114.1
 [0.114.0]: https://github.com/xing-shuyin/pi-web-ui/compare/v0.113.1...v0.114.0
 [0.113.0]: https://github.com/xing-shuyin/pi-web-ui/releases/tag/v0.113.0
 [0.112.0]: https://github.com/xing-shuyin/pi-web-ui/releases/tag/v0.112.0
