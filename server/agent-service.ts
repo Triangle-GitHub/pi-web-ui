@@ -362,10 +362,15 @@ import {
 import { buildVisionBridgePrompt, findVisionModels, transcribeImages } from "./vision-bridge.js";
 import { generateScmCommitMessage } from "./scm-commitmsg.js";
 import {
+	estimateBaseContext,
+	estimateContextWeights,
+	reconcileContextCategories,
+	type ContextWeights,
+} from "./context-usage.js";
+import {
 	BUILTIN_SOUL,
 	DEFAULT_PROMPT_TEMPLATE,
 	buildToolsSchemaText,
-	estimatePromptTokens,
 	renderPromptTemplate,
 	resolveSectionTexts,
 	type PromptComposerInputs,
@@ -2917,7 +2922,9 @@ export class ClientSession {
 	}
 
 	/** 会话级 Base Tokens 缓存（避免在节流快照热路径上重复计算正则）。 */
-	private cachedBaseTokens: { at: number; convId: string; tokens: number } | null = null;
+	private cachedBaseTokens: { at: number; convId: string; tokens: number; weights: ContextWeights } | null = null;
+	private cachedContextWeights: { base: ContextWeights; at: number; weights: ContextWeights } | null = null;
+	private contextMessageWeights = new WeakMap<object, ContextWeights>();
 
 	/** 指定会话（缺省 = 活跃会话）系统提示词 + 工具 schema 的基础 token 开销
 	 *  （与设置面板中的「合计」完全一致）。会话未就绪返回 null——调用方必须区分
@@ -2935,11 +2942,35 @@ export class ClientSession {
 		}
 		const snap = this.sessionPromptSnapshot(conv);
 		if (!snap) return null;
-		const prompt = estimatePromptTokens(snap.full);
-		const schema = estimatePromptTokens(snap.toolsSchema);
-		const tokens = prompt + schema;
-		this.cachedBaseTokens = { at: now, convId: conv.id, tokens };
+		const { tokens, weights } = estimateBaseContext(snap, this.settingsSvc.current);
+		this.cachedBaseTokens = { at: now, convId: conv.id, tokens, weights };
 		return tokens;
+	}
+
+	/** Classification is best-effort and must never affect totals or compaction. */
+	private contextCategories(conv: Conversation, tokens: number) {
+		try {
+			const base = this.cachedBaseTokens;
+			if (!base || base.convId !== conv.id) return undefined;
+			const now = Date.now();
+			if (
+				!this.cachedContextWeights ||
+				this.cachedContextWeights.base !== base.weights ||
+				now - this.cachedContextWeights.at >= STATS_CACHE_MS
+			) {
+				const state = conv.session.agent.state;
+				const weights = estimateContextWeights(
+					base.weights,
+					state.messages,
+					state.streamingMessage,
+					this.contextMessageWeights,
+				);
+				this.cachedContextWeights = { base: base.weights, at: now, weights };
+			}
+			return reconcileContextCategories(this.cachedContextWeights.weights, tokens);
+		} catch {
+			return undefined;
+		}
 	}
 
 	/** 判断会话中是否已有大模型返回过有效 usage（input/output/totalTokens > 0）的定稿助手消息。 */
@@ -6312,6 +6343,8 @@ export class ClientSession {
 				contextUsage: (() => {
 					const cu = s.contextUsage;
 					if (!cu || cu.contextWindow <= 0) return stats.contextUsage;
+					// Refresh category weights even when compaction supplies the total directly.
+					this.currentBaseTokens(conv);
 					const effectiveTokens = this.getEffectiveContextTokens(conv);
 					const isEstimated =
 						cu.tokens != null &&
@@ -6323,6 +6356,7 @@ export class ClientSession {
 						percent: (effectiveTokens / cu.contextWindow) * 100,
 						estimated: isEstimated,
 						softCap: this.activeSoftCap(cu.contextWindow),
+						categories: this.contextCategories(conv, effectiveTokens),
 					};
 				})(),
 			};

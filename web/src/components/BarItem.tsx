@@ -35,6 +35,8 @@ import { Dropdown, DropdownItem } from "./Dropdown";
 import { BrowserControl } from "./BrowserControl";
 import { BROWSER_PAGE_TOOL_NAME } from "../../../server/tool-manager.js";
 import { EnginePicker } from "./EnginePicker";
+import { ContextUsage } from "./ContextUsage";
+import { formatTokens } from "../format-tokens";
 
 export type ViewName = "chat" | "terminal" | "git" | "canvas" | "devices" | `plugin:${string}`;
 
@@ -79,12 +81,6 @@ export interface BarItemProps {
 		managed?: boolean;
 		appVersion?: string;
 	};
-}
-
-function formatTokens(n: number): string {
-	if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1).replace(/\.0$/, "")}M`;
-	if (n >= 1000) return `${(n / 1000).toFixed(1).replace(/\.0$/, "")}K`;
-	return String(n);
 }
 
 function localeShort(code: string): string {
@@ -428,12 +424,12 @@ export function BarItem({
 			ctxPercent !== null && ctxPercent > 0 ? +(31.42 * (1 - Math.min(ctxPercent, 100) / 100)).toFixed(2) : 31.42;
 
 		return (
-			<span
-				className="bar-item status-item status-ctx bar-item-ctx"
+			<ContextUsage
+				key={`${chat.engine}:${state?.conversationId ?? state?.sessionId ?? ""}`}
+				context={context}
+				bar={bar}
 				title={ctxTitle}
-				data-tip={ctxTitle}
 				onContextMenu={handleContextMenu}
-				data-bar-item={id}
 			>
 				<svg className={`ctx-ring ${ctxRingClass}`} viewBox="0 0 14 14" width="13" height="13" aria-hidden="true">
 					<circle className="ctx-ring-bg" cx="7" cy="7" r="5" />
@@ -461,7 +457,7 @@ export function BarItem({
 						ctxText
 					)}
 				</span>
-			</span>
+			</ContextUsage>
 		);
 	}
 
