@@ -71,6 +71,8 @@ export class DurableEventProjector {
 	private readonly textSent = new Map<number, number>();
 	/** 每个思考内容块已下发的字符数 */
 	private readonly thinkingSent = new Map<number, number>();
+	/** 保留末条消息计数供存储兜底去重；下一条已提交助手消息才换账。 */
+	private assistantMessageEnded = false;
 	/** 每个工具调用已下发的进度输出窗口（用于把 `set` / `append` 换算成增量） */
 	private readonly toolOutput = new Map<string, string>();
 	/** 已发过 onToolStart 的调用（未见过开始的回执不单独出结果卡） */
@@ -99,7 +101,7 @@ export class DurableEventProjector {
 		if (!Array.isArray(events)) return;
 		// 引擎在同一个提交里会先发 `tool_execution_start`、后发该轮正文的 message 事件（见 events.js 的 Progress 段），
 		// 而正文在时间上早于工具调用——“我来看下目录”类的文字必须落在工具卡之前，所以把工具开始推迟到批末
-		// （同一批里它自己的 `tool_execution_update` 跟着一起推，避免先到进度后到卡片）。
+		// （同一批里它自己的 update/end 跟着一起推，保证卡片先开始再更新、结束）。
 		const deferred: any[] = [];
 		const deferredCallIds = new Set<string>();
 		for (const event of events) {
@@ -109,7 +111,10 @@ export class DurableEventProjector {
 				deferredCallIds.add(String(event?.toolCallId ?? ""));
 				continue;
 			}
-			if (type === "tool_execution_update" && deferredCallIds.has(String(event?.toolCallId ?? ""))) {
+			if (
+				(type === "tool_execution_update" || type === "tool_execution_end") &&
+				deferredCallIds.has(String(event?.toolCallId ?? ""))
+			) {
 				deferred.push(event);
 				continue;
 			}
@@ -130,6 +135,8 @@ export class DurableEventProjector {
 		if (!event || typeof event !== "object") return;
 		switch (event.type) {
 			case "message_start": {
+				if (event.message?.role !== "assistant") return;
+				this.assistantMessageEnded = false;
 				// 新一轮助手消息：contentIndex 记账归零，避免沿用上一条消息的下发长度
 				this.textSent.clear();
 				this.thinkingSent.clear();
@@ -159,7 +166,14 @@ export class DurableEventProjector {
 			}
 			case "message_end": {
 				// 提交后的完整助手消息：补齐流式期间遗漏的尾部
-				this.projectMessage(event.entry?.model?.[0], sink);
+				const message = event.entry?.model?.[0];
+				if (message?.role !== "assistant") return;
+				if (this.assistantMessageEnded) {
+					this.textSent.clear();
+					this.thinkingSent.clear();
+				}
+				this.projectMessage(message, sink);
+				this.assistantMessageEnded = true;
 				return;
 			}
 			case "tool_execution_start": {
@@ -198,6 +212,7 @@ export class DurableEventProjector {
 
 	/** 按已下发长度补齐一条完整助手消息（含 thinking / text）。 */
 	projectMessage(message: any, sink: DurableSinkLike): void {
+		if (message?.role !== "assistant") return;
 		const blocks = message?.content;
 		if (!Array.isArray(blocks)) return;
 		blocks.forEach((block: any, index: number) => this.projectBlock(index, block, sink));

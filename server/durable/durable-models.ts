@@ -15,8 +15,17 @@ import {
 	readModelsJson,
 	resolveProviderCredential,
 	isProtocolSupportedByEngine,
+	resolveModelProtocol,
 } from "../model-resolver.js";
 import { loadDurablePeerModule } from "./durable-loader.js";
+
+function mergeProviderHeaders(...sources: Array<Record<string, string> | undefined>): Record<string, string> {
+	const headers = new Map<string, [string, string]>();
+	for (const source of sources) {
+		for (const [name, value] of Object.entries(source ?? {})) headers.set(name.toLowerCase(), [name, value]);
+	}
+	return Object.fromEntries(headers.values());
+}
 
 export interface DurableModelInfo {
 	id: string;
@@ -113,12 +122,14 @@ export async function setupDurableModels(agentDir?: string): Promise<any> {
 	}
 
 	// 2. 兜底保障基础内置提供商
-	const fallbackBuiltinIds = ["openai", "anthropic", "google", "mistral", "groq", "deepseek"];
+	const fallbackBuiltinIds = ["openai", "anthropic", "google", "google-vertex", "mistral", "groq", "deepseek"];
 	for (const pid of fallbackBuiltinIds) {
 		if (models.providers && models.providers.has(pid)) continue;
 		try {
 			const providerModule = await loadDurablePeerModule("@earendil-works/pi-ai", `providers/${pid}`).catch(() => null);
-			const providerFactory = providerModule?.[`${pid}Provider`] || providerModule?.default;
+			const providerFactory =
+				providerModule?.[`${pid.replace(/-([a-z])/g, (_, letter: string) => letter.toUpperCase())}Provider`] ||
+				providerModule?.default;
 			if (typeof providerFactory === "function") {
 				const instance = providerFactory();
 				if (typeof models.setProvider === "function") {
@@ -130,72 +141,14 @@ export async function setupDurableModels(agentDir?: string): Promise<any> {
 		}
 	}
 
-	// 3. 动态加载 models.json 中的自定义服务商与模型
-	try {
-		const { providers: customProviders } = readModelsJson(agentDir);
-		const oCompModule = await loadDurablePeerModule("@earendil-works/pi-ai", "api/openai-completions.lazy").catch(
-			() => null,
-		);
-		const oRespModule = await loadDurablePeerModule("@earendil-works/pi-ai", "api/openai-responses.lazy").catch(
-			() => null,
-		);
-		const aMsgModule = await loadDurablePeerModule("@earendil-works/pi-ai", "api/anthropic-messages.lazy").catch(
-			() => null,
-		);
-
-		for (const [providerId, pConfig] of Object.entries(customProviders)) {
-			if (!pConfig || typeof pConfig !== "object") continue;
-			const cred = resolveProviderCredential(agentDir, providerId);
-			const apiProtocol = (typeof (pConfig as any).api === "string" ? (pConfig as any).api : "").toLowerCase();
-
-			let apiImpl: any = null;
-			if (apiProtocol === "anthropic-messages" && aMsgModule?.anthropicMessagesApi) {
-				apiImpl = aMsgModule.anthropicMessagesApi();
-			} else if (apiProtocol === "openai-responses" && oRespModule?.openAIResponsesApi) {
-				apiImpl = oRespModule.openAIResponsesApi();
-			} else if (oCompModule?.openAICompletionsApi) {
-				apiImpl = oCompModule.openAICompletionsApi();
-			}
-
-			if (apiImpl && typeof aiModule.createProvider === "function") {
-				const rawModels = Array.isArray((pConfig as any).models) ? (pConfig as any).models : [];
-				const customProvider = aiModule.createProvider({
-					id: providerId,
-					name: (pConfig as any).name || providerId,
-					baseUrl: cred.baseUrl,
-					headers: cred.headers,
-					auth: {
-						apiKey: {
-							name: `${providerId} API key`,
-							login: async () => ({ type: "api_key", key: cred.apiKey || "" }),
-							resolve: async () => (cred.apiKey ? { auth: { apiKey: cred.apiKey }, source: "config" } : undefined),
-						},
-					},
-					models: rawModels.map((m: any) => ({
-						...m,
-						provider: providerId,
-						api: m.api || (pConfig as any).api || "openai-completions",
-						baseUrl: cred.baseUrl,
-						cost: m.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-						type: "chat",
-					})),
-					api: apiImpl,
-				});
-
-				models.setProvider(customProvider);
-			}
-		}
-	} catch {
-		/* custom provider setup skipped */
-	}
-
-	// 4. 继承持久化动态模型缓存 (~/.pi/agent/models-store.json)
+	// 3. 继承持久化动态模型缓存 (~/.pi/agent/models-store.json)
+	let cachedProviders: Record<string, any> = {};
 	try {
 		const userAgentDir = agentDir || join(homedir(), ".pi", "agent");
 		const storePath = join(userAgentDir, "models-store.json");
 		if (existsSync(storePath)) {
-			const store = JSON.parse(readFileSync(storePath, "utf8"));
-			for (const [providerId, pData] of Object.entries(store)) {
+			cachedProviders = JSON.parse(readFileSync(storePath, "utf8"));
+			for (const [providerId, pData] of Object.entries(cachedProviders)) {
 				const p = typeof models.getProvider === "function" ? models.getProvider(providerId) : undefined;
 				if (p && Array.isArray((pData as any)?.models)) {
 					const extraModels: any[] = (pData as any).models;
@@ -235,8 +188,114 @@ export async function setupDurableModels(agentDir?: string): Promise<any> {
 		/* dynamic models store read skipped */
 	}
 
+	// 4. 动态加载 models.json 中的自定义服务商与模型
+	try {
+		const { providers: customProviders } = readModelsJson(agentDir);
+		const implementations: Record<string, any> = {};
+		for (const [protocol, factory] of [
+			["openai-completions", "openAICompletionsApi"],
+			["openai-responses", "openAIResponsesApi"],
+			["anthropic-messages", "anthropicMessagesApi"],
+			["google-generative-ai", "googleGenerativeAIApi"],
+			["google-vertex", "googleVertexApi"],
+		]) {
+			try {
+				const module = await loadDurablePeerModule("@earendil-works/pi-ai", `api/${protocol}.lazy`);
+				if (typeof module?.[factory] === "function") implementations[protocol] = module[factory]();
+			} catch {
+				/* An unavailable API must not suppress unrelated providers. */
+			}
+		}
+
+		for (const [providerId, pConfig] of Object.entries(customProviders)) {
+			if (!pConfig || typeof pConfig !== "object") continue;
+			const cred = resolveProviderCredential(agentDir, providerId);
+			const builtin = models.getProvider(providerId);
+			const rawModels: any[] = Array.isArray(pConfig.models) ? pConfig.models : [];
+			const apiOverride = typeof pConfig.api === "string" && pConfig.api.trim() ? pConfig.api : undefined;
+			const mergeModels = (baseline: any[]) => {
+				const key = (model: any) => `${model.type ?? "chat"}:${model.id}`;
+				const cached: any[] = Array.isArray(cachedProviders[providerId]?.models)
+					? cachedProviders[providerId].models
+					: [];
+				const merged = new Map([...cached, ...baseline].map((model: any) => [key(model), { ...model }]));
+				for (const override of rawModels) {
+					const original = merged.get(key(override));
+					merged.set(key(override), {
+						...original,
+						...override,
+						...(original?.cost && override.cost ? { cost: { ...original.cost, ...override.cost } } : {}),
+						api:
+							override.type && override.type !== "chat"
+								? (override.api ?? original?.api)
+								: resolveModelProtocol(
+										override.api ?? apiOverride ?? original?.api ?? builtin?.getModels()[0]?.api,
+										providerId,
+										override.id,
+									),
+					});
+				}
+				return [...merged.values()].map((model: any) => ({
+					...model,
+					provider: providerId,
+					api:
+						model.type && model.type !== "chat"
+							? model.api
+							: resolveModelProtocol(
+									rawModels.find((m) => key(m) === key(model))?.api ?? apiOverride ?? model.api,
+									providerId,
+									model.id,
+								),
+					cost: model.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					type: model.type ?? "chat",
+				}));
+			};
+
+			if (Object.keys(implementations).length && typeof aiModule.createProvider === "function") {
+				const customProvider = aiModule.createProvider({
+					id: providerId,
+					name: (pConfig as any).name || providerId,
+					baseUrl: cred.baseUrl,
+					headers: cred.headers,
+					auth: builtin?.auth ?? {
+						apiKey: {
+							name: `${providerId} API key`,
+							login: async () => ({ type: "api_key", key: cred.apiKey || "" }),
+							resolve: async () => (cred.apiKey ? { auth: { apiKey: cred.apiKey }, source: "config" } : undefined),
+						},
+					},
+					models: mergeModels([]),
+					api: implementations,
+				});
+
+				if (builtin) {
+					// Keep native authentication and operations (ADC/OAuth, images, discovery).
+					// Only explicit API overrides opt into a different SDK implementation.
+					const overridden = (model: any) =>
+						apiOverride ||
+						rawModels.some((m) => m.id === model.id && (m.type ?? "chat") === (model.type ?? "chat") && m.api);
+					models.setProvider({
+						...builtin,
+						name: pConfig.name || builtin.name,
+						getModels: () => mergeModels(builtin.getModels()).filter((model: any) => model.type === "chat"),
+						getAllModels: () => mergeModels(builtin.getAllModels?.() ?? builtin.getModels()),
+						stream: (model: any, context: any, options: any) =>
+							(overridden(model) ? customProvider : builtin).stream(model, context, options),
+						streamSimple: (model: any, context: any, options: any) =>
+							(overridden(model) ? customProvider : builtin).streamSimple(model, context, options),
+					});
+				} else {
+					models.setProvider(customProvider);
+				}
+			}
+		}
+	} catch {
+		/* custom provider setup skipped */
+	}
+
 	// 5. 为所有已注册 Provider 注入凭证与 BaseURL
 	try {
+		const { providers } = readModelsJson(agentDir);
 		if (models.providers && typeof models.providers.keys === "function") {
 			for (const providerId of models.providers.keys()) {
 				const cred = resolveProviderCredential(agentDir, providerId);
@@ -248,13 +307,37 @@ export async function setupDurableModels(agentDir?: string): Promise<any> {
 						}))
 						.catch(() => {});
 				}
-				if (cred.baseUrl) {
-					const p = models.getProvider(providerId);
-					if (p) p.baseUrl = cred.baseUrl;
-				}
-				if (cred.headers) {
-					const p = models.getProvider(providerId);
-					if (p) p.headers = { ...p.headers, ...cred.headers };
+				const p = models.getProvider(providerId);
+				const pConfig = providers[providerId];
+				if (p && (cred.baseUrl || cred.headers || pConfig?.api || pConfig?.models)) {
+					if (cred.baseUrl) p.baseUrl = cred.baseUrl;
+					if (cred.headers) p.headers = { ...p.headers, ...cred.headers };
+					// pi-ai streams consume model.baseUrl/headers, not provider metadata.
+					// Apply provider defaults before explicit per-model configuration.
+					const overrides: any[] = Array.isArray(pConfig?.models) ? pConfig.models : [];
+					for (const method of ["getModels", "getAllModels"]) {
+						if (typeof p[method] !== "function") continue;
+						const getModels = p[method].bind(p);
+						p[method] = () =>
+							getModels().map((model: any) => {
+								const override = overrides.find(
+									(m) => m.id === model.id && (m.type ?? "chat") === (model.type ?? "chat"),
+								);
+								return {
+									...model,
+									api:
+										model.type && model.type !== "chat"
+											? model.api
+											: resolveModelProtocol(
+													override?.api ?? (typeof pConfig?.api === "string" ? pConfig.api : model.api),
+													providerId,
+													model.id,
+												),
+									baseUrl: override?.baseUrl ?? cred.baseUrl ?? model.baseUrl,
+									headers: mergeProviderHeaders(model.headers, cred.headers, override?.headers),
+								};
+							});
+					}
 				}
 			}
 		}

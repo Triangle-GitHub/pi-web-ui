@@ -28,7 +28,6 @@ import type {
 	UiSettingsState,
 	UiContentBlock,
 	UiTextBlock,
-	UiThinkingBlock,
 	UiModelConfigEntry,
 	WorktreeInfo,
 	SlashCommandInfo,
@@ -671,7 +670,10 @@ export class UniversalSession implements DispatchSession {
 			sessionFile: conv.id,
 			conversationId: conv.id,
 			rev: this.rev,
-			messages: conv.messages,
+			messages:
+				this.turnConvId === conv.id && this.pendingToolResults.length > 0
+					? [...conv.messages, ...this.pendingToolResults]
+					: conv.messages,
 			// 回合归属会话才携带流式态：切走后的前台会话快照不再混入后台回合内容（#701）
 			streamingMessage: !this.turnConvId || this.turnConvId === conv.id ? this.streamingMessage : null,
 			isStreaming: !this.turnConvId || this.turnConvId === conv.id ? this.isStreaming : false,
@@ -915,15 +917,13 @@ export class UniversalSession implements DispatchSession {
 				onThinkingDelta: (delta: string) => {
 					this.streamingThinking += delta;
 					if (!this.streamingMessage) return;
-					let thinkBlock = this.streamingMessage.content.find((b) => b.type === "thinking") as
-						UiThinkingBlock | undefined;
-					if (!thinkBlock) {
-						thinkBlock = { type: "thinking", thinking: "" };
-						this.streamingMessage.content.unshift(thinkBlock);
+					const lastBlock = this.streamingMessage.content.at(-1);
+					if (lastBlock?.type === "thinking") {
+						lastBlock.thinking += delta;
+					} else {
+						this.streamingMessage.content.push({ type: "thinking", thinking: delta });
 					}
-					thinkBlock.thinking = this.streamingThinking;
 					this.emitDelta({ type: "thinking_delta", delta });
-					this.scheduleThrottledSnapshot();
 				},
 				onTextDelta: (delta: string) => {
 					this.streamingText += delta;
@@ -935,7 +935,6 @@ export class UniversalSession implements DispatchSession {
 						this.streamingMessage.content.push({ type: "text", text: delta });
 					}
 					this.emitDelta({ type: "text_delta", delta });
-					this.scheduleThrottledSnapshot();
 				},
 				onToolStart: (callId: string, toolName: string, args: Record<string, unknown>) => {
 					if (!this.streamingMessage) return;
@@ -946,7 +945,9 @@ export class UniversalSession implements DispatchSession {
 						argumentsText: JSON.stringify(args, null, 2),
 					};
 					this.streamingMessage.content.push(toolBlock);
-					this.scheduleThrottledSnapshot();
+					// Publish the structural boundary before a following text/thinking delta.
+					// Otherwise the reducer can merge it into the block preceding this tool.
+					this.flushSnapshot();
 				},
 				onToolEnd: (callId: string, result: { output?: string; error?: string }) => {
 					const toolMsg: UiMessage = {
@@ -3021,7 +3022,6 @@ export class UniversalSession implements DispatchSession {
 
 		const now = Date.now();
 		const assistantMsgId = `a-${now}-${randomUUID().slice(0, 6)}`;
-		let thinkingText = "";
 		let assistantText = "";
 
 		const assistantMsg: UiMessage = {
@@ -3039,15 +3039,14 @@ export class UniversalSession implements DispatchSession {
 				if (!conv.isEphemeral) this.store.saveConversation(cwd, conv);
 			},
 			onThinkingDelta: (delta: string) => {
-				thinkingText += delta;
-				let thinkBlock = assistantMsg.content.find((b) => b.type === "thinking") as UiThinkingBlock | undefined;
-				if (!thinkBlock) {
-					thinkBlock = { type: "thinking", thinking: "" };
-					assistantMsg.content.unshift(thinkBlock);
+				const lastBlock = assistantMsg.content.at(-1);
+				if (lastBlock?.type === "thinking") {
+					lastBlock.thinking += delta;
+				} else {
+					assistantMsg.content.push({ type: "thinking", thinking: delta });
 				}
-				thinkBlock.thinking = thinkingText;
 				if (this.activeConvId === convId) {
-					this.emitDelta({ type: "thinking_delta", delta });
+					// Subagents stream through conv.messages snapshots, not the main turn's message.
 					this.scheduleThrottledSnapshot();
 				}
 			},
@@ -3060,7 +3059,6 @@ export class UniversalSession implements DispatchSession {
 					assistantMsg.content.push({ type: "text", text: delta });
 				}
 				if (this.activeConvId === convId) {
-					this.emitDelta({ type: "text_delta", delta });
 					this.scheduleThrottledSnapshot();
 				}
 			},
