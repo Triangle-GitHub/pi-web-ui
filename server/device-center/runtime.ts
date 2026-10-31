@@ -1,4 +1,7 @@
-import { resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
+import { createHash } from "node:crypto";
+import { readFileSync, statSync } from "node:fs";
+import { writeJsonAtomicSync } from "../atomic-file.js";
 import { createDeviceCollabService } from "./collab-service.js";
 import { createDeviceTaskExecutor, type DeviceExecutorTask, type DeviceTaskExecutorOptions } from "./executor.js";
 import { createDeviceFileSync } from "./file-sync.js";
@@ -10,12 +13,24 @@ type Files = ReturnType<typeof createDeviceFileSync>;
 type Executor = { run(task: DeviceExecutorTask): Promise<string>; close(): void | Promise<void> };
 type Owner = { roomId: string; taskId: string; root: string; botId: string };
 type TaskOwner = { controller: AbortController; executor?: Executor; done?: Promise<unknown> };
+type Transcript = { binding: string; path: string };
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const MAX_WAITING_TASKS = 32;
+
+/** The task settled, but its executor has not confirmed that execution stopped. */
+export class DeviceTaskStopUnconfirmedError extends Error {
+	readonly stopUnconfirmed = true;
+	constructor(cause: unknown) {
+		super(cause instanceof Error ? cause.message : "Task executor stop unconfirmed", { cause });
+		this.name = "DeviceTaskStopUnconfirmedError";
+	}
+}
 
 export function createDeviceRuntime(options: {
 	config: Config;
 	localOrigin: string;
 	localAuthToken?: string;
-	dataDir: string;
+	dataDir?: string;
 	bots: LocalBotRegistry;
 	executorFactory?: (options: DeviceTaskExecutorOptions) => Executor;
 }) {
@@ -28,6 +43,36 @@ export function createDeviceRuntime(options: {
 	let blocked: unknown;
 	let generation = new AbortController();
 	let active: TaskOwner | undefined;
+	const queue: { start(): void; cancel(): void }[] = [];
+	let draining = false;
+	function drain() {
+		if (draining) return;
+		queue.shift()?.start();
+	}
+	const transcriptFile = options.dataDir ? join(options.dataDir, "bot-execution-conversations.json") : undefined;
+	let transcripts: Record<string, Transcript> = Object.create(null);
+	let transcriptLoadError: unknown;
+	if (transcriptFile) {
+		try {
+			const stored: unknown = JSON.parse(readFileSync(transcriptFile, "utf8"));
+			if (!stored || typeof stored !== "object" || Array.isArray(stored))
+				throw new Error("Invalid transcript registry");
+			for (const [id, entry] of Object.entries(stored)) {
+				const value = entry as Transcript;
+				if (
+					!UUID.test(id) ||
+					!value ||
+					typeof value.binding !== "string" ||
+					typeof value.path !== "string" ||
+					!isAbsolute(value.path)
+				)
+					throw new Error("Invalid transcript registry");
+			}
+			transcripts = Object.assign(Object.create(null), stored);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") transcriptLoadError = error;
+		}
+	}
 	function enabled(signal?: AbortSignal) {
 		signal?.throwIfAborted();
 		if (closed) throw new Error("Device runtime closed");
@@ -68,6 +113,7 @@ export function createDeviceRuntime(options: {
 		const key = JSON.stringify([roomId, botId, lease.revision]);
 		let entry = files.get(key);
 		if (!entry) {
+			if (!options.dataDir) throw new Error("File synchronization storage unavailable");
 			entry = {
 				roomId,
 				botId,
@@ -117,13 +163,45 @@ export function createDeviceRuntime(options: {
 	function onTask(task: DeviceExecutorTask & { roomId: string }, signal?: AbortSignal): Promise<string> {
 		try {
 			enabled(signal);
+			if (queue.length >= MAX_WAITING_TASKS) throw new DeviceTaskError("Local task queue full");
 		} catch (error) {
 			return Promise.reject(error);
 		}
-		if (active)
-			return Promise.reject(
-				new DeviceTaskError("目标设备正在执行另一个群任务，请稍后再试。 / Local task executor busy."),
-			);
+		const taskSignal = AbortSignal.any([generation.signal, ...(signal ? [signal] : [])]);
+		return track(
+			new Promise<string>((resolve, reject) => {
+				const entry = {
+					start() {
+						taskSignal.removeEventListener("abort", entry.cancel);
+						draining = true;
+						void runTask(task, taskSignal)
+							.then(resolve, reject)
+							.finally(() => {
+								draining = false;
+								drain();
+							});
+					},
+					cancel() {
+						const index = queue.indexOf(entry);
+						if (index >= 0) queue.splice(index, 1);
+						taskSignal.removeEventListener("abort", entry.cancel);
+						reject(taskSignal.reason);
+					},
+				};
+				queue.push(entry);
+				taskSignal.addEventListener("abort", entry.cancel, { once: true });
+				if (taskSignal.aborted) entry.cancel();
+				else drain();
+			}),
+		);
+	}
+	function runTask(task: DeviceExecutorTask & { roomId: string }, signal?: AbortSignal): Promise<string> {
+		try {
+			enabled(signal);
+		} catch (error) {
+			return Promise.reject(error);
+		}
+
 		const owner: TaskOwner = { controller: new AbortController() };
 		active = owner;
 		const taskSignal = AbortSignal.any([owner.controller.signal, generation.signal, ...(signal ? [signal] : [])]);
@@ -139,8 +217,10 @@ export function createDeviceRuntime(options: {
 				try {
 					await stopping;
 				} catch (error) {
-					blocked = error;
-					throw error;
+					const failure =
+						error instanceof DeviceTaskStopUnconfirmedError ? error : new DeviceTaskStopUnconfirmedError(error);
+					blocked = failure;
+					throw failure;
 				}
 			};
 			try {
@@ -153,13 +233,80 @@ export function createDeviceRuntime(options: {
 					if (taskSignal.aborted) throw error;
 					throw new DeviceTaskError("目标 Bot 不可用、配置已变更或正在忙碌。 / Target Bot unavailable or busy.");
 				}
+				let binding: string | undefined;
+				let resumePath: string | undefined;
+				let transcriptPath: string | undefined;
+				let boundSession: string | undefined;
+				if (task.resume !== undefined && typeof task.resume !== "boolean")
+					throw new DeviceTaskError("Invalid resume flag");
+				if (task.resume && !task.conversationId) throw new DeviceTaskError("Resume conversation address required");
+				if (task.conversationId !== undefined) {
+					if (!UUID.test(task.conversationId) || !transcriptFile || transcriptLoadError)
+						throw new DeviceTaskError("Persistent conversation storage unavailable or invalid address");
+					binding = createHash("sha256")
+						.update(
+							JSON.stringify([
+								config.hubUrl,
+								config.deviceId,
+								task.roomId,
+								lease.bot.id,
+								lease.bot.revision,
+								resolve(lease.root),
+							]),
+						)
+						.digest("hex");
+					const stored = transcripts[task.conversationId];
+					if (task.resume) {
+						if (!stored || stored.binding !== binding)
+							throw new DeviceTaskError("Conversation unavailable or configuration changed");
+						try {
+							if (!statSync(stored.path).isFile()) throw new Error();
+						} catch {
+							throw new DeviceTaskError("Conversation transcript unavailable");
+						}
+						resumePath = stored.path;
+					} else if (stored) throw new DeviceTaskError("Conversation already exists; explicit resume required");
+				}
 				owner.executor = (options.executorFactory ?? createDeviceTaskExecutor)({
 					localOrigin: options.localOrigin,
 					localAuthToken: options.localAuthToken,
 					cwd: lease.root,
 					bot: lease.bot,
 					allowExecution: config.allowExecution,
+					resumePath,
+					onSessionPath(taskId, path) {
+						taskSignal.throwIfAborted();
+						if (
+							taskId !== task.id ||
+							!boundSession ||
+							sessions.get(boundSession)?.taskId !== task.id ||
+							!isAbsolute(path) ||
+							(resumePath && path !== resumePath)
+						)
+							throw new Error("Transcript ownership mismatch");
+						if (task.conversationId) {
+							const currentBot = bots.get(task.botId);
+							if (
+								!binding ||
+								!currentBot?.enabled ||
+								currentBot.revision !== lease!.bot.revision ||
+								resolve(currentBot.cwd) !== resolve(lease!.root)
+							)
+								throw new DeviceTaskError("Conversation transcript ownership changed");
+							try {
+								if (!statSync(path).isFile()) throw new Error();
+								const next = { ...transcripts, [task.conversationId]: { binding, path } };
+								writeJsonAtomicSync(transcriptFile!, next);
+								transcripts = next;
+							} catch {
+								throw new DeviceTaskError("Conversation transcript persistence failed");
+							}
+						}
+						transcriptPath = path;
+					},
 					onSession(taskId, sessionId) {
+						if (taskId !== task.id) throw new Error("Task session ownership mismatch");
+						boundSession = sessionId;
 						for (const [id, bound] of sessions)
 							if (bound.taskId === taskId && bound.roomId === task.roomId) sessions.delete(id);
 						if (sessionId && !taskSignal.aborted)
@@ -169,7 +316,19 @@ export function createDeviceRuntime(options: {
 				taskSignal.addEventListener("abort", stop, { once: true });
 				taskSignal.throwIfAborted();
 				const result = await owner.executor.run(task);
+				await confirmStop();
 				taskSignal.throwIfAborted();
+				if (task.conversationId) {
+					const currentBot = bots.get(task.botId);
+					if (
+						!transcriptPath ||
+						!binding ||
+						!currentBot?.enabled ||
+						currentBot.revision !== lease.bot.revision ||
+						resolve(currentBot.cwd) !== resolve(lease.root)
+					)
+						throw new DeviceTaskError("Conversation transcript capture failed");
+				}
 				return result;
 			} finally {
 				taskSignal.removeEventListener("abort", stop);

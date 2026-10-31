@@ -55,12 +55,14 @@ export function createDeviceConnector(options: DeviceConnectorOptions) {
 	endpoint.searchParams.set("deviceId", options.deviceId);
 	let closed = false;
 	let tasksDisabled = false;
-	const taskControllers = new Set<AbortController>();
+	const runningTasks = new Map<
+		string,
+		{ attemptId: string; ws: WebSocket; controller: AbortController; settled: Promise<void>; stopUnconfirmed: boolean }
+	>();
 	function stopTasks() {
 		if (tasksDisabled) return;
 		tasksDisabled = true;
-		for (const controller of taskControllers) controller.abort();
-		taskControllers.clear();
+		for (const task of runningTasks.values()) task.controller.abort();
 		try {
 			options.onDisconnect?.();
 		} catch {}
@@ -122,6 +124,7 @@ export function createDeviceConnector(options: DeviceConnectorOptions) {
 		socket = ws;
 		const rpc = createCommandChannel(ws, options.onCommand);
 		const messages = createWsMessageChannel(ws);
+		const cancellations = new Set<string>();
 		ws.on("open", () => {
 			if (socket !== ws || closed) {
 				ws.terminate();
@@ -129,7 +132,6 @@ export function createDeviceConnector(options: DeviceConnectorOptions) {
 			}
 			attempts = 0;
 			tasksDisabled = false;
-			runningTasks.clear();
 			lastPong = Date.now();
 			void Promise.resolve()
 				.then(() => options.onConnect?.())
@@ -143,6 +145,35 @@ export function createDeviceConnector(options: DeviceConnectorOptions) {
 			try {
 				const frame = parseFrame(Buffer.from(raw as Buffer));
 				if (rpc.handle(frame)) return;
+				if (frame.type === "task_cancel") {
+					if (
+						typeof frame.id !== "string" ||
+						!frame.id ||
+						frame.id.length > 128 ||
+						typeof frame.taskId !== "string" ||
+						typeof frame.attemptId !== "string" ||
+						cancellations.size >= RELAY_LIMITS.cancellations ||
+						cancellations.has(frame.id)
+					)
+						throw new Error("Invalid task cancellation");
+					const id = frame.id;
+					const task = runningTasks.get(frame.taskId);
+					const matched = task?.ws === ws && task.attemptId === frame.attemptId;
+					cancellations.add(frame.id);
+					if (matched) task.controller.abort();
+					void (matched ? task.settled : Promise.resolve()).then(() => {
+						cancellations.delete(id);
+						if (socket === ws && !closed)
+							sendFrame(ws, {
+								type: "task_cancelled",
+								id: frame.id,
+								taskId: frame.taskId,
+								attemptId: frame.attemptId,
+								stopped: matched && !task.stopUnconfirmed,
+							});
+					});
+					return;
+				}
 				if (frame.type === "task") {
 					if (tasksDisabled) throw new Error("Task executor disconnected");
 					const task = frame.task as any;
@@ -159,11 +190,9 @@ export function createDeviceConnector(options: DeviceConnectorOptions) {
 						runningTasks.size >= RELAY_LIMITS.streams
 					)
 						throw new Error("Invalid task");
-					runningTasks.add(task.id);
 					const controller = new AbortController();
-					taskControllers.add(controller);
 					const emit = (status: string, report?: string) => {
-						if (socket === ws && !closed)
+						if (socket === ws && !closed && !controller.signal.aborted)
 							sendFrame(ws, {
 								type: "task_event",
 								taskId: task.id,
@@ -174,7 +203,15 @@ export function createDeviceConnector(options: DeviceConnectorOptions) {
 							});
 					};
 					emit("running");
-					Promise.resolve()
+					const execution = {
+						attemptId: task.attemptId,
+						ws,
+						controller,
+						settled: Promise.resolve(),
+						stopUnconfirmed: false,
+					};
+					runningTasks.set(task.id, execution);
+					execution.settled = Promise.resolve()
 						.then(() => {
 							if (!options.onTask) throw new Error("Task handler unavailable");
 							if (controller.signal.aborted) throw new Error("Task cancelled");
@@ -182,11 +219,13 @@ export function createDeviceConnector(options: DeviceConnectorOptions) {
 						})
 						.then(
 							(result) => emit("completed", typeof result === "string" ? result : undefined),
-							(error) => emit("failed", deviceTaskFailure(error)),
+							(error) => {
+								execution.stopUnconfirmed = !!error && typeof error === "object" && error.stopUnconfirmed === true;
+								emit("failed", deviceTaskFailure(error));
+							},
 						)
 						.finally(() => {
-							if (socket === ws) runningTasks.delete(task.id);
-							taskControllers.delete(controller);
+							if (runningTasks.get(task.id) === execution) runningTasks.delete(task.id);
 						});
 					return;
 				}
@@ -341,7 +380,6 @@ export function createDeviceConnector(options: DeviceConnectorOptions) {
 			}
 		});
 	}
-	const runningTasks = new Set<string>();
 	const heartbeat = setInterval(() => {
 		if (socket?.readyState === WebSocket.OPEN) {
 			if (Date.now() - lastPong > 45_000) socket.terminate();

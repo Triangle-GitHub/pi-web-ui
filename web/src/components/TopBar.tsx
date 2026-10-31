@@ -21,7 +21,7 @@ import {
 	FiTerminal,
 } from "react-icons/fi";
 import { GoTriangleDown } from "react-icons/go";
-import { LuFlaskConical, LuMessageSquareDashed, LuWorkflow } from "react-icons/lu";
+import { LuFlaskConical, LuFolders, LuMessageSquareDashed, LuWorkflow } from "react-icons/lu";
 import type { ChatState, UpdateAllItem } from "../use-chat";
 import type { CommandDef } from "../types";
 import { buildUpdateCommand } from "../update-command";
@@ -1021,7 +1021,7 @@ export function TopBar({
 				title={t("worktreeViewTitle")}
 				onClick={() => onViewChange("worktrees")}
 			>
-				<FiGitBranch />
+				<LuFolders />
 				<span>{t("worktreeViewTitle")}</span>
 			</button>
 		) : null,

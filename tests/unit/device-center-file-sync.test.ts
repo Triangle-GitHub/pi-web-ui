@@ -46,6 +46,99 @@ function combine(...bundles: DeviceFileBundle[]): DeviceFileBundle {
 }
 
 describe("device file sync", () => {
+	it("requires explicit recursion, sorts files, reports pruned sensitive and ignored entries", async () => {
+		const { root, sync, dataDir } = await fixture();
+		await mkdir(join(root, "project", "nested"), { recursive: true });
+		await mkdir(join(root, "project", ".git"));
+		await mkdir(join(root, "project", "node_modules"));
+		for (const path of ["z.txt", "a.txt", "nested/文件.bin", ".envlocal", "credentials.json", "private.pem"])
+			await writeFile(join(root, "project", path), path);
+		await expect(sync.prepare({ paths: ["project"] })).rejects.toThrow(/recursive/);
+		const result = await sync.prepare({ paths: ["project"], recursive: true });
+		expect(result.manifest.files.map((f) => f.path)).toEqual([
+			"project/a.txt",
+			"project/nested/文件.bin",
+			"project/z.txt",
+		]);
+		expect(result.manifest.totalExcluded).toBe(5);
+		expect(result.manifest.exclusions).toEqual([
+			{ path: "project/.envlocal", reason: "sensitive" },
+			{ path: "project/.git", reason: "ignored" },
+			{ path: "project/credentials.json", reason: "sensitive" },
+			{ path: "project/node_modules", reason: "ignored" },
+			{ path: "project/private.pem", reason: "sensitive" },
+		]);
+		await expect(sync.prepare({ paths: ["project/.envlocal"], recursive: true })).rejects.toThrow(/Sensitive/);
+		await expect(sync.prepare({ paths: ["project", "project/a.txt"], recursive: true })).rejects.toThrow(/overlapping/);
+		const preview = await sync.stage(result);
+		const stagedDir = (await readdir(join(dataDir, "device-transfers")))[0];
+		expect(
+			JSON.parse(await readFile(join(dataDir, "device-transfers", stagedDir, "bundle.json"), "utf8")).manifest,
+		).toEqual(result.manifest);
+		await sync.cancel(preview.id);
+	});
+	it("bounds exclusion summaries by count and UTF-8 bytes while counting all pruned entries", async () => {
+		const { root, sync } = await fixture();
+		await mkdir(join(root, "tree"));
+		await writeFile(join(root, "tree", "ok"), "ok");
+		for (let i = 0; i < 140; i++)
+			await writeFile(join(root, "tree", `.env${String(i).padStart(3, "0")}${"密".repeat(50)}`), "secret");
+		const { manifest } = await sync.prepare({ paths: ["tree"], recursive: true });
+		expect(manifest.totalExcluded).toBe(140);
+		expect(manifest.exclusions!.length).toBeLessThanOrEqual(128);
+		expect(Buffer.byteLength(JSON.stringify(manifest.exclusions))).toBeLessThanOrEqual(8192);
+		expect(manifest.exclusions!.length).toBeLessThan(140);
+		const malformed = structuredClone(bundle());
+		malformed.manifest.exclusions = [{ path: "../secret", reason: "sensitive" }];
+		malformed.manifest.totalExcluded = 1;
+		await expect(sync.stage(malformed)).rejects.toThrow(/Unsafe/);
+	});
+	it("rejects recursive directory symlinks or Windows junctions, including ignored names", async () => {
+		const { root, dir, sync } = await fixture();
+		await mkdir(join(root, "tree"));
+		await mkdir(join(dir, "outside"));
+		await symlink(join(dir, "outside"), join(root, "tree", ".git"), process.platform === "win32" ? "junction" : "dir");
+		await expect(sync.prepare({ paths: ["tree"], recursive: true })).rejects.toThrow(/Symlink/);
+	});
+	it("enforces incremental file and visited-entry limits and permits no partial bundle", async () => {
+		const { root, sync } = await fixture();
+		await mkdir(join(root, "tree"));
+		for (let i = 0; i <= DEVICE_FILE_SYNC_LIMITS.files; i++) await writeFile(join(root, "tree", `f${i}`), "");
+		await expect(sync.prepare({ paths: ["tree"], recursive: true })).rejects.toThrow(/file count budget/);
+		await rm(join(root, "tree"), { recursive: true });
+		await mkdir(join(root, "tree"));
+		for (let i = 0; i < DEVICE_FILE_SYNC_LIMITS.visitedEntries; i++) await mkdir(join(root, "tree", `d${i}`));
+		await expect(sync.prepare({ paths: ["tree"], recursive: true })).rejects.toThrow(/entry budget/);
+	}, 30000);
+	it("checks cumulative recursive bytes before reading the next file", async () => {
+		const { root, sync } = await fixture();
+		await mkdir(join(root, "tree"));
+		await writeFile(join(root, "tree", "a"), Buffer.alloc(DEVICE_FILE_SYNC_LIMITS.bytes));
+		await writeFile(join(root, "tree", "b"), "x");
+		await expect(sync.prepare({ paths: ["tree"], recursive: true })).rejects.toThrow(/budget/);
+	});
+	it("rejects case-folded selections and discovered duplicate file names", async () => {
+		const { root, sync } = await fixture();
+		await mkdir(join(root, "tree"));
+		await writeFile(join(root, "tree", "a"), "a");
+		await expect(sync.prepare({ paths: ["tree/a", "TREE/A"], recursive: true })).rejects.toThrow(/Duplicate/);
+		await writeFile(join(root, "tree", "A"), "A");
+		if ((await readdir(join(root, "tree"))).length === 2)
+			await expect(sync.prepare({ paths: ["tree"], recursive: true })).rejects.toThrow(/Duplicate/);
+	});
+	it("cancels during asynchronous recursive scanning and rejects empty directories", async () => {
+		const { root, sync } = await fixture();
+		await mkdir(join(root, "tree"));
+		await expect(sync.prepare({ paths: ["tree"], recursive: true })).rejects.toThrow(/no transferable/);
+		await writeFile(join(root, "tree", "file"), "hello");
+		const controller = new AbortController();
+		const pending = sync.prepare({ paths: ["tree"], recursive: true, signal: controller.signal });
+		setImmediate(() => controller.abort());
+		await expect(pending).rejects.toThrow(/cancelled|aborted/);
+		await expect(sync.prepare({ paths: ["tree"], recursive: true })).resolves.toMatchObject({
+			manifest: { totalBytes: 5 },
+		});
+	});
 	it("prepares explicit UTF-8 paths and binary content, stages privately, then exclusively creates", async () => {
 		const { root, dataDir, sync } = await fixture();
 		const bytes = Buffer.from([0, 255, 128, 10]);
@@ -130,7 +223,7 @@ describe("device file sync", () => {
 		const { root, sync } = await fixture();
 		await mkdir(join(root, "folder"));
 		await writeFile(join(root, "file"), "x");
-		await expect(sync.prepare({ paths: ["folder"] })).rejects.toThrow(/regular/);
+		await expect(sync.prepare({ paths: ["folder"] })).rejects.toThrow(/recursive/);
 		await expect(sync.prepare({ paths: ["file", "file"] })).rejects.toThrow(/Duplicate/);
 		await expect(sync.stage(bundle("folder"))).rejects.toThrow(/regular/);
 	});

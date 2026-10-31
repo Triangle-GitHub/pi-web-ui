@@ -1,6 +1,18 @@
 import { groupDeviceToken, type GroupDevice } from "./device-group-messages";
 
-export type GroupMemberReference = { start: number; end: number; member: GroupDevice };
+export type GroupMemberReference = { start: number; end: number; member: GroupDevice; conversationId?: string };
+
+/** One continued conversation per message; never silently discard another explicit target. */
+export function groupReferenceDestination(refs: GroupMemberReference[]): string | undefined {
+	const continued = refs.filter((ref) => ref.conversationId);
+	if (!continued.length) return undefined;
+	const destination = continued[0].conversationId;
+	if (refs.some((ref) => ref.conversationId !== destination))
+		throw new Error(
+			"同一条消息只能继续一个对话，请移除其他 @ 目标。 / Continue one conversation per message. Remove other @ targets.",
+		);
+	return destination;
+}
 
 /** Preserve identity only for untouched mentions across a textarea edit. */
 export function updateGroupMemberReferences(

@@ -3458,7 +3458,7 @@ wss.on("connection", (ws) => {
 		const msg = parsed as ClientMessage;
 		try {
 			const botClientId = clientId ?? (msg.type === "hello" ? msg.clientId : undefined);
-			if (botClientId && !botExecutionMessageAllowed(botClientId, msg.type)) {
+			if (botClientId && !botExecutionMessageAllowed(botClientId, msg.type, msg)) {
 				ws.close(1008, "Bot control command denied");
 				return;
 			}

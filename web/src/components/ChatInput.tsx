@@ -45,12 +45,13 @@ import { groupByAlign } from "../ui-slots";
 import { nextSearchReqId } from "../search-req-id";
 
 import { ModelThinking } from "./ModelThinking";
-import { groupDeviceHits, groupMessageTargets } from "../device-group-messages";
+import { groupConversationHits, groupMessageTargets } from "../device-group-messages";
 import {
 	insertGroupMember,
 	registerGroupMemberSink,
 	updateGroupMemberReferences,
 	serializeGroupMemberReferences,
+	groupReferenceDestination,
 	groupMemberDeletion,
 	type GroupMemberReference,
 } from "../group-member-reference";
@@ -88,7 +89,9 @@ function getComposerSafeMaxH(): number {
 interface ChatInputProps {
 	groupDevices?: readonly import("../device-group-messages").GroupDevice[];
 	groupReady?: boolean;
-	onGroupSend?: (text: string, targets: string[]) => Promise<boolean>;
+	groupConversationError?: string;
+	groupConversations?: readonly import("../device-group-messages").GroupBotConversation[];
+	onGroupSend?: (text: string, targets: string[], conversationId?: string) => Promise<boolean>;
 	/** 输入框前置区条目（composer.leading 槽位：纯插件，无内置条目；渲染在文件上传按钮左侧）。 */
 	composerLeading?: import("../ui-slots").UiSlotEntry[];
 	/** 输入框动作区条目（composer.actions 槽位：内置 + 插件的最终结果）。 */
@@ -194,6 +197,8 @@ interface ChatInputProps {
 export const ChatInput = memo(function ChatInput({
 	groupDevices,
 	groupReady,
+	groupConversationError,
+	groupConversations = [],
 	onGroupSend,
 	streaming,
 	planMode,
@@ -718,7 +723,7 @@ export const ChatInput = memo(function ChatInput({
 			return;
 		}
 		if (groupDevices) {
-			const items = groupDeviceHits(groupDevices, tok.query);
+			const items = groupConversationHits(groupDevices, groupConversations, tok.query, isZhLocale(locale));
 			setMenu(items.length ? { kind: "at", start: tok.start, end: cursor, items } : null);
 			setMenuIndex(0);
 			return;
@@ -892,11 +897,14 @@ export const ChatInput = memo(function ChatInput({
 		const cursor = ta ? (ta.selectionStart ?? text.length) : text.length;
 		const replaceEnd = cur?.end !== undefined && cur.end >= at ? cur.end : cursor;
 		const atts = pick.attachments ?? [];
-		const groupMember =
-			groupDevices && pick.providerId === "host:group-devices"
-				? groupDevices.find((member) => member.id === pick.hint)
+		const conversation =
+			pick.providerId === "host:group-conversations"
+				? groupConversations.find((item) => item.id === pick.hint)
 				: undefined;
-		const rawText = groupMember ? `@${groupMember.name}` : (pick.text ?? pick.title);
+		const groupMember = groupDevices?.find((member) =>
+			pick.providerId === "host:group-devices" ? member.id === pick.hint : member.id === conversation?.botId,
+		);
+		const rawText = pick.text ?? (groupMember ? `@${groupMember.name}` : pick.title);
 		if (groupDevices && pick.providerId === "host:group-devices" && pick.hint)
 			selectedGroupDevices.current.add(pick.hint);
 		// 附件型命中（文件/目录/页签…）统一插 `@提及` 形式：正文里的 `@x` 与附件 chip
@@ -906,7 +914,13 @@ export const ChatInput = memo(function ChatInput({
 		menuTextRef.current = next;
 		setText(next);
 		noteComposerEdit(next);
-		if (groupMember) groupReferences.current.push({ start: at, end: at + rawText.length, member: groupMember });
+		if (groupMember)
+			groupReferences.current.push({
+				start: at,
+				end: at + rawText.length,
+				member: groupMember,
+				conversationId: conversation?.id,
+			});
 		setMenu(null);
 		for (const a of atts) {
 			try {
@@ -959,11 +973,11 @@ export const ChatInput = memo(function ChatInput({
 				className={`slash-item${i === menuIndex ? " active" : ""}`}
 				onMouseEnter={() => setMenuIndex(i)}
 				onClick={() => acceptMenu(h)}
-				title={h.hint ?? h.title}
+				title={groupDevices ? h.title : (h.hint ?? h.title)}
 			>
 				<span className="slash-name">@{h.title}</span>
 				<span className={`slash-source ${h.providerId === "host:skills" ? "skill" : "plugin"}`}>{h.providerLabel}</span>
-				{h.hint && <span className="slash-desc">{h.hint}</span>}
+				{h.hint && !groupDevices && <span className="slash-desc">{h.hint}</span>}
 			</button>
 		));
 	};
@@ -1255,14 +1269,25 @@ export const ChatInput = memo(function ChatInput({
 		}
 		if (groupDevices) {
 			if (!onGroupSend || groupSending.current) return;
+			let destination: string | undefined;
+			try {
+				destination = groupReferenceDestination(groupReferences.current);
+			} catch (error) {
+				onNotice("error", (error as Error).message);
+				return;
+			}
 			groupSending.current = true;
 			const serialized = serializeGroupMemberReferences(text, groupReferences.current);
-			void onGroupSend(serialized.text.trim(), [
-				...new Set([
-					...serialized.targets,
-					...groupMessageTargets(trimmed, groupDevices).filter((id) => selectedGroupDevices.current.has(id)),
-				]),
-			])
+			void onGroupSend(
+				serialized.text.trim(),
+				[
+					...new Set([
+						...serialized.targets,
+						...groupMessageTargets(trimmed, groupDevices).filter((id) => selectedGroupDevices.current.has(id)),
+					]),
+				],
+				destination,
+			)
 				.then((ok) => {
 					if (ok && textMirrorRef.current.trim() === trimmed) {
 						setText("");
@@ -1855,6 +1880,11 @@ export const ChatInput = memo(function ChatInput({
 						</span>
 					</div>
 					{menu.kind === "slash" ? renderSlashRows() : renderAtRows()}
+					{groupDevices && menu.kind === "at" && groupConversationError && (
+						<div className="slash-desc" role="status">
+							{groupConversationError}
+						</div>
+					)}
 				</div>
 			)}
 			{pendingFill !== null && (
@@ -2022,17 +2052,21 @@ export const ChatInput = memo(function ChatInput({
 					value={text}
 					rows={1}
 					placeholder={
-						connected
-							? streaming
-								? isDsh
-									? t("placeholderStreamingQueued")
-									: t("placeholderStreaming")
-								: effectivePlanMode
-									? t("placeholderPlanMode")
-									: isModEnter
-										? t("placeholderIdleMod")
-										: t("placeholderIdle")
-							: t("placeholderConnecting")
+						groupDevices
+							? isZhLocale(locale)
+								? "输入 @，选择 Bot 开始新对话或继续之前的对话"
+								: "Type @ to start or continue a Bot conversation"
+							: connected
+								? streaming
+									? isDsh
+										? t("placeholderStreamingQueued")
+										: t("placeholderStreaming")
+									: effectivePlanMode
+										? t("placeholderPlanMode")
+										: isModEnter
+											? t("placeholderIdleMod")
+											: t("placeholderIdle")
+								: t("placeholderConnecting")
 					}
 					disabled={!connected}
 					onChange={(e) => {

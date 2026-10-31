@@ -34,7 +34,42 @@ export interface Bot {
 	createdAt: number;
 	updatedAt: number;
 }
+export interface HubConversation {
+	closed?: boolean;
+	id: string;
+	accountId: string;
+	roomId: string;
+	botId: string;
+	deviceId: string;
+	botRevision: number;
+	name: string;
+	rootTaskId: string;
+	dispatchDepth: number;
+	latestTaskId: string;
+	createdAt: number;
+	updatedAt: number;
+}
+export interface ConversationMessage {
+	id: string;
+	conversationId: string;
+	taskId: string;
+	kind: "message" | "request" | "reply" | "result";
+	text: string;
+	sourceBotId?: string;
+	requestId?: string;
+	idempotencyKey?: string;
+	fingerprint?: string;
+	createdAt: number;
+}
 export interface HubTask {
+	cancelRequested?: boolean;
+	stopConfirmed?: boolean;
+	sourceConversationId?: string;
+	conversationId?: string;
+	resume?: boolean;
+	kind?: "message" | "request" | "reply" | "result";
+	requestId?: string;
+	resultOfTaskId?: string;
 	botId: string;
 	botRevision: number;
 	sourceBotId?: string;
@@ -70,9 +105,13 @@ export interface RoomMessage {
 	createdAt: number;
 	taskIds: string[];
 	targetBotIds?: string[];
+	conversationId?: string;
+	conversationIds?: string[];
 }
 export interface HubState {
 	version: 2;
+	conversations: HubConversation[];
+	conversationMessages: ConversationMessage[];
 	accounts: Account[];
 	devices: Device[];
 	bots: Bot[];
@@ -82,6 +121,8 @@ export interface HubState {
 	tasks: HubTask[];
 	receipts: { accountId: string; roomId: string; key: string; fingerprint: string; messageId: string }[];
 }
+export const taskPending = (task: HubTask) =>
+	!isTerminal(task.status) || !!(task.cancelRequested && !task.stopConfirmed);
 export const isTerminal = (status: TaskStatus) => ["completed", "failed", "interrupted"].includes(status);
 export const hashSecret = (secret: string) => createHash("sha256").update(secret).digest("hex");
 export function secretMatches(secret: string, hash: string): boolean {
@@ -127,6 +168,8 @@ export class DeviceHubStore {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 			state = {
 				version: 2,
+				conversations: [],
+				conversationMessages: [],
 				accounts: [],
 				devices: [],
 				bots: [],
@@ -137,12 +180,17 @@ export class DeviceHubStore {
 				receipts: [],
 			};
 		}
+		state.conversations ??= [];
+		state.conversationMessages ??= [];
+		if (!Array.isArray(state.conversations) || !Array.isArray(state.conversationMessages))
+			throw new Error("Invalid conversation store");
 		const store = new DeviceHubStore(dataDir, state);
-		if (state.tasks.some((task) => task.status === "running")) {
+		if (state.tasks.some((task) => !isTerminal(task.status))) {
 			await store.transact((draft) => {
 				for (const task of draft.tasks)
-					if (task.status === "running") {
+					if (!isTerminal(task.status)) {
 						task.status = "interrupted";
+						task.report = "Hub restarted before execution was confirmed; submit a new turn to retry.";
 						task.updatedAt = Date.now();
 					}
 			});

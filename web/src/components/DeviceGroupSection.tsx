@@ -16,7 +16,9 @@ const words = {
 		create: "建群",
 		rename: "重命名",
 		members: "管理成员",
+		clear: "清空消息",
 		delete: "删除群组",
+		confirmClear: "确定清空群组“{name}”的全部消息和历史任务记录？此操作无法撤销，群组和成员将保留。",
 		save: "保存",
 		cancel: "取消",
 		empty: "还没有群组",
@@ -37,7 +39,10 @@ const words = {
 		create: "Create group",
 		rename: "Rename",
 		members: "Manage members",
+		clear: "Clear messages",
 		delete: "Delete group",
+		confirmClear:
+			"Clear all messages and task history in “{name}”? This cannot be undone. The group and members will be kept.",
 		save: "Save",
 		cancel: "Cancel",
 		empty: "No groups yet",
@@ -221,9 +226,10 @@ export function DeviceGroupSection({
 		};
 	}, [active]);
 
-	const mutate = async (room: SidebarDeviceGroup, action: "rename" | "delete") => {
+	const mutate = async (room: SidebarDeviceGroup, action: "rename" | "clear" | "delete") => {
 		if (mutationRef.current) return;
 		if (action === "delete" && !window.confirm(w.confirm.replace("{name}", room.name))) return;
+		if (action === "clear" && !window.confirm(w.confirmClear.replace("{name}", room.name))) return;
 		const controller = new AbortController();
 		mutationRef.current = controller;
 		setBusy(true);
@@ -248,7 +254,7 @@ export function DeviceGroupSection({
 	const menu = (event: React.MouseEvent, room: SidebarDeviceGroup) => {
 		event.preventDefault();
 		event.stopPropagation();
-		const entries: UiSlotEntry[] = (["rename", "members", "delete"] as const).map((action, order) => ({
+		const entries: UiSlotEntry[] = (["rename", "members", "clear", "delete"] as const).map((action, order) => ({
 			id: `host:device-group-${action}`,
 			slot: "contextmenu.project",
 			source: "host",
@@ -273,7 +279,7 @@ export function DeviceGroupSection({
 					setRenaming(room.id);
 					setName(room.name);
 				} else if (entry.action === "members") openGroup({ roomId: room.id, manage: true });
-				else if (entry.action === "delete") void mutate(room, "delete");
+				else if (entry.action === "clear" || entry.action === "delete") void mutate(room, entry.action);
 			},
 		});
 	};

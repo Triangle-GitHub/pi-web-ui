@@ -47,16 +47,19 @@ export function createDeviceCollabService(options: {
 				const base = checkedUrl(config.hubUrl);
 				if (!["http:", "https:"].includes(base.protocol) || base.search) throw new Error("Invalid hub URL");
 				const parentTaskId = options.getParentTask?.(context);
+				if (args.parentTaskId !== undefined && args.parentTaskId !== parentTaskId)
+					throw new Error("Parent task spoofing denied");
 				const boundBot = options.getSourceBot?.(context);
 				if (args.sourceBotId && boundBot && args.sourceBotId !== boundBot) throw new Error("Invalid source bot");
 				if (action === "create_room" && options.workspaceResolver) {
 					workspace = await options.workspaceResolver({ roomId: "", sourceBotId: args.sourceBotId!, context, signal });
 					if (resolve(context.cwd) !== resolve(workspace.root)) throw new Error("Invalid workspace");
 				}
-				const request = async (path: string, body?: unknown) => {
+				const request = async (path: string, body?: unknown, query?: URLSearchParams) => {
 					signal?.throwIfAborted();
 					const url = new URL(base.href);
 					url.pathname = `${url.pathname.replace(/\/$/, "")}/api/agent/${path}`;
+					if (query) url.search = query.toString();
 					const response = await (options.fetch ?? fetch)(url, {
 						method: body === undefined ? "GET" : "POST",
 						headers: {
@@ -84,6 +87,16 @@ export function createDeviceCollabService(options: {
 					}
 					case "list_rooms":
 						return await request("rooms");
+					case "read_history": {
+						if (
+							args.before !== undefined &&
+							(typeof args.before !== "string" || !args.before.trim() || args.before.length > 256)
+						)
+							throw new Error("Invalid history cursor");
+						const query = new URLSearchParams({ sourceBotId: args.sourceBotId! });
+						if (args.before !== undefined) query.set("before", args.before);
+						return await request(`${room()}/history`, undefined, query);
+					}
 					case "create_room":
 						if (!args.targetBotId) throw new Error("Target required");
 						return await request("rooms", {
@@ -102,11 +115,53 @@ export function createDeviceCollabService(options: {
 							idempotencyKey: randomUUID(),
 							...(parentTaskId ? { parentTaskId } : {}),
 						});
+					case "conversation_list":
+					case "conversation_read": {
+						if (action === "conversation_read" && !args.conversationId) throw new Error("Conversation required");
+						const suffix = action === "conversation_read" ? `/${encodeURIComponent(args.conversationId!)}` : "";
+						const query = new URLSearchParams({ sourceBotId: args.sourceBotId! });
+						if (action === "conversation_read" && args.before !== undefined) {
+							if (typeof args.before !== "string" || !args.before.trim() || args.before.length > 256)
+								throw new Error("Invalid conversation cursor");
+							query.set("before", args.before);
+						}
+						return await request(`${room()}/conversations${suffix}`, undefined, query);
+					}
+					case "conversation_stop":
+						if (!args.conversationId) throw new Error("Conversation required");
+						return await request(`${room()}/conversations/${encodeURIComponent(args.conversationId)}/stop`, {
+							sourceBotId: args.sourceBotId,
+						});
+					case "conversation_create":
+						if (!args.targetBotId || !args.prompt) throw new Error("Conversation fields required");
+						return await request(`${room()}/conversations`, {
+							targetBotId: args.targetBotId,
+							text: args.prompt,
+							sourceBotId: args.sourceBotId,
+							parentTaskId,
+							idempotencyKey: args.idempotencyKey ?? randomUUID(),
+						});
+					case "conversation_send":
+						if (
+							!args.conversationId ||
+							!args.message ||
+							(args.kind !== undefined && !["message", "request", "reply"].includes(args.kind)) ||
+							(args.kind === "reply" && !args.requestId)
+						)
+							throw new Error("Conversation fields required");
+						return await request(`${room()}/conversations/${encodeURIComponent(args.conversationId)}/messages`, {
+							text: args.message,
+							sourceBotId: args.sourceBotId,
+							parentTaskId,
+							kind: args.kind ?? "message",
+							requestId: args.requestId,
+							idempotencyKey: args.idempotencyKey ?? randomUUID(),
+						});
 					case "sync_files": {
 						if (!args.targetBotId || !args.roomId || !args.paths?.length) throw new Error("Transfer fields required");
 						const files = workspace?.files ?? options.files;
 						if (!files) throw new Error("File workspace unavailable");
-						const bundle = await files.prepare({ paths: args.paths, signal });
+						const bundle = await files.prepare({ paths: args.paths, signal, recursive: args.recursive });
 						const response = await request("transfers", {
 							action: "stage",
 							roomId: args.roomId,
@@ -114,7 +169,12 @@ export function createDeviceCollabService(options: {
 							targetBotId: args.targetBotId,
 							bundle,
 						});
-						return summarizeTransfer(response);
+						return {
+							...summarizeTransfer(response),
+							...(bundle.manifest.exclusions
+								? { exclusions: bundle.manifest.exclusions, totalExcluded: bundle.manifest.totalExcluded }
+								: {}),
+						};
 					}
 					case "transfer_preview":
 					case "transfer_apply": {

@@ -11,6 +11,7 @@ export const RELAY_LIMITS = {
 	queue: 2 * 1024 * 1024,
 	body: 64 * 1024 * 1024,
 	streams: 32,
+	cancellations: 16,
 	devices: 128,
 	sessions: 2048,
 };
@@ -106,10 +107,14 @@ export function safePath(path: unknown, method = "GET"): path is string {
 		if (normalized === "/api/device-center" || normalized.startsWith("/api/device-center/")) {
 			// Only account-scoped chat routes may cross a device portal.
 			if (method === "GET") {
-				return /^\/api\/device-center\/(chat-status|devices|bots|rooms(?:\/[^/]+)?)$/.test(normalized);
+				return /^\/api\/device-center\/(chat-status|devices|bots|rooms(?:\/[^/]+(?:\/conversations(?:\/[^/]+)?)?)?)$/.test(
+					normalized,
+				);
 			}
 			if (method === "POST")
-				return /^\/api\/device-center\/rooms(?:\/[^/]+\/(messages|rename|members|delete))?$/.test(normalized);
+				return /^\/api\/device-center\/rooms(?:\/[^/]+\/(messages|rename|members|clear|delete|conversations(?:\/[^/]+\/(messages|stop))?))?$/.test(
+					normalized,
+				);
 			return false;
 		}
 		return !["/devices", "/setup", "/api/setup"].some(
@@ -445,6 +450,7 @@ export function createDeviceRelay(options: DeviceRelayOptions) {
 				}
 			>;
 			tasks: Map<string, { attemptId: string; botId: string }>;
+			cancellations: Map<string, { taskId: string; attemptId: string; finish: (stopped: boolean) => void }>;
 			rpc: ReturnType<typeof createCommandChannel>;
 			messages: ReturnType<typeof createWsMessageChannel>;
 		}
@@ -528,6 +534,7 @@ export function createDeviceRelay(options: DeviceRelayOptions) {
 		return true;
 	}
 	function drop(id: string, entry: typeof devices extends Map<string, infer T> ? T : never) {
+		for (const pending of entry.cancellations.values()) pending.finish(false);
 		entry.rpc.close();
 		entry.messages.close();
 		for (const [taskId, { attemptId, botId }] of entry.tasks) {
@@ -892,6 +899,7 @@ export function createDeviceRelay(options: DeviceRelayOptions) {
 					ws,
 					streams: new Map(),
 					tasks: new Map<string, { attemptId: string; botId: string }>(),
+					cancellations: new Map<string, { taskId: string; attemptId: string; finish: (stopped: boolean) => void }>(),
 					rpc: createCommandChannel(ws),
 					messages: createWsMessageChannel(ws),
 				};
@@ -903,6 +911,18 @@ export function createDeviceRelay(options: DeviceRelayOptions) {
 						if (devices.get(device) !== entry) return;
 						const frame = parseFrame(Buffer.from(raw as Buffer));
 						if (entry.rpc.handle(frame)) return;
+						if (frame.type === "task_cancelled") {
+							const pending = typeof frame.id === "string" ? entry.cancellations.get(frame.id) : undefined;
+							if (!pending) return;
+							if (
+								pending.taskId !== frame.taskId ||
+								pending.attemptId !== frame.attemptId ||
+								typeof frame.stopped !== "boolean"
+							)
+								throw new Error("Invalid task cancellation acknowledgement");
+							pending.finish(frame.stopped);
+							return;
+						}
 						if (frame.type === "task_event") {
 							if (
 								typeof frame.taskId !== "string" ||
@@ -988,6 +1008,29 @@ export function createDeviceRelay(options: DeviceRelayOptions) {
 	}, 15_000);
 	heartbeat.unref();
 	return {
+		cancelTask(deviceId: string, taskId: string, attemptId: string): Promise<{ stopped: boolean }> {
+			const entry = devices.get(deviceId);
+			if (
+				!entry ||
+				entry.ws.readyState !== WebSocket.OPEN ||
+				entry.tasks.get(taskId)?.attemptId !== attemptId ||
+				entry.cancellations.size >= RELAY_LIMITS.cancellations
+			)
+				return Promise.resolve({ stopped: false });
+			const id = randomUUID();
+			return new Promise((resolve) => {
+				const finish = (stopped: boolean) => {
+					if (!entry.cancellations.delete(id)) return;
+					clearTimeout(timer);
+					if (stopped && entry.tasks.get(taskId)?.attemptId === attemptId) entry.tasks.delete(taskId);
+					resolve({ stopped });
+				};
+				const timer = setTimeout(() => finish(false), 10_000);
+				timer.unref();
+				entry.cancellations.set(id, { taskId, attemptId, finish });
+				if (!sendFrame(entry.ws, { type: "task_cancel", id, taskId, attemptId })) finish(false);
+			});
+		},
 		callDevice(id: string, action: DeviceCommand, payload: unknown, options?: { signal?: AbortSignal }) {
 			const entry = devices.get(id);
 			return entry ? entry.rpc.call(action, payload, options) : Promise.reject(new Error("Device offline"));

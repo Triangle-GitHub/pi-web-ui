@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { access, lstat, mkdir, mkdtemp, open, realpath, rename, rm } from "node:fs/promises";
+import { access, lstat, mkdir, mkdtemp, open, opendir, realpath, rename, rm } from "node:fs/promises";
 import { dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -10,14 +10,27 @@ export const DEVICE_FILE_SYNC_LIMITS = Object.freeze({
 	files: 128,
 	staged: 16,
 	stagedBytes: 32 * 1024 * 1024,
+	visitedEntries: 4096,
+	exclusions: 128,
+	exclusionBytes: 8 * 1024,
 });
 export interface DeviceFileEntry {
 	path: string;
 	size: number;
 	sha256: string;
 }
+export interface DeviceFileExclusion {
+	path: string;
+	reason: "ignored" | "sensitive";
+}
 export interface DeviceFileBundle {
-	manifest: { version: 1; totalBytes: number; files: DeviceFileEntry[] };
+	manifest: {
+		version: 1;
+		totalBytes: number;
+		files: DeviceFileEntry[];
+		exclusions?: DeviceFileExclusion[];
+		totalExcluded?: number;
+	};
 	files: { path: string; base64: string }[];
 }
 export interface DeviceFilePreview {
@@ -46,7 +59,18 @@ function checkSignal(signal?: AbortSignal) {
 
 /** Portable paths only. Case-fold duplicates even on case-sensitive hosts so a
  * bundle retains the same meaning when sent to Windows/macOS. */
-function safePath(value: unknown): string {
+function deniedPart(part: string): DeviceFileExclusion["reason"] | undefined {
+	if (/^(\.git|node_modules)$/i.test(part)) return "ignored";
+	if (
+		/^(\.env.*|\.ssh|\.aws|\.azure|\.gnupg|\.kube|\.npmrc|\.pypirc|\.netrc|_netrc|\.git-credentials|credentials(?:\..*)?|secrets?(?:\..*)?|tokens?(?:\..*)?|id_(?:rsa|dsa|ecdsa|ed25519)(?:\..*)?|authorized_keys|known_hosts)$/i.test(
+			part,
+		) ||
+		/\.(?:pem|key|p12|pfx|keystore)$/i.test(part)
+	)
+		return "sensitive";
+	return undefined;
+}
+function safePath(value: unknown, allowDenied = false): string {
 	if (
 		typeof value !== "string" ||
 		!value ||
@@ -70,13 +94,7 @@ function safePath(value: unknown): string {
 			/^(con|prn|aux|nul|com[0-9]|lpt[0-9])(?:\.|$)/i.test(part)
 		)
 			throw new Error("Unsafe file path component");
-		if (
-			/^(\.git|node_modules|\.env(?:\..*)?|\.ssh|\.aws|\.azure|\.gnupg|\.kube|\.npmrc|\.pypirc|\.netrc|_netrc|\.git-credentials|credentials(?:\..*)?|secrets?(?:\..*)?|tokens?(?:\..*)?|id_(?:rsa|dsa|ecdsa|ed25519)(?:\..*)?|authorized_keys|known_hosts)$/i.test(
-				part,
-			) ||
-			/\.(?:pem|key|p12|pfx|keystore)$/i.test(part)
-		)
-			throw new Error("Sensitive file path is denied");
+		if (!allowDenied && deniedPart(part)) throw new Error("Sensitive file path is denied");
 	}
 	return value;
 }
@@ -85,7 +103,8 @@ function within(root: string, path: string) {
 	return rel === "" || (!isAbsolute(rel) && rel !== ".." && !rel.startsWith(`..${sep}`));
 }
 /** Reject symlinks/junctions at every existing component, including ancestors. */
-async function checkChain(path: string, allowMissing = false) {
+async function checkChain(path: string, allowMissing = false, signal?: AbortSignal) {
+	checkSignal(signal);
 	const absolute = resolve(path);
 	let current = parse(absolute).root;
 	const parts = absolute.slice(current.length).split(sep).filter(Boolean);
@@ -94,18 +113,21 @@ async function checkChain(path: string, allowMissing = false) {
 		let s;
 		try {
 			s = await lstat(current);
+			checkSignal(signal);
 		} catch (e) {
 			if (allowMissing && missing(e)) return;
 			throw e;
 		}
 		if (s.isSymbolicLink()) throw new Error("Symlink paths are denied");
 		if (i < parts.length - 1 && !s.isDirectory()) throw new Error("Path ancestor is not a directory");
-		if (relative(resolve(current), await realpath(current)) !== "") throw new Error("Real path changed");
+		const canonical = await realpath(current);
+		checkSignal(signal);
+		if (relative(resolve(current), canonical) !== "") throw new Error("Real path changed");
 	}
 }
 
 /** Local capability: root never comes from an incoming bundle. No execution,
- * deletion or implicit directory traversal. Staged transfers are process-local;
+ * deletion or implicit directory traversal (recursive export is opt-in). Staged transfers are process-local;
  * close/cancel remove only this instance's private transfer directories. Node
  * path checks cannot exclude a hostile OS user racing filesystem operations. */
 export function createDeviceFileSync(config: { root: string; dataDir: string; allowReceive: boolean }) {
@@ -131,38 +153,51 @@ export function createDeviceFileSync(config: { root: string; dataDir: string; al
 		if (closed) throw new Error("File sync is closed");
 		checkSignal(signal);
 	}
-	async function roots() {
-		await checkChain(root);
-		if (!(await lstat(root)).isDirectory()) throw new Error("Project root must be a directory");
-		await checkChain(storage, true);
-		if (within(await realpath(root), dataDir)) throw new Error("Unsafe data directory");
+	async function roots(signal?: AbortSignal) {
+		await checkChain(root, false, signal);
+		active(signal);
+		const stats = await lstat(root);
+		active(signal);
+		if (!stats.isDirectory()) throw new Error("Project root must be a directory");
+		await checkChain(storage, true, signal);
+		active(signal);
+		const canonical = await realpath(root);
+		active(signal);
+		if (within(canonical, dataDir)) throw new Error("Unsafe data directory");
 	}
-	async function target(path: string) {
+	async function target(path: string, signal?: AbortSignal) {
 		safePath(path);
-		await roots();
+		await roots(signal);
+		active(signal);
 		const full = join(root, ...path.split("/"));
 		if (!within(root, full)) throw new Error("Target escapes project root");
-		await checkChain(full, true);
+		await checkChain(full, true, signal);
+		active(signal);
 		return full;
 	}
 	async function readFile(
 		path: string,
 		signal?: AbortSignal,
+		remainingBytes = DEVICE_FILE_SYNC_LIMITS.bytes,
 	): Promise<{ bytes: Buffer; snapshot: NonNullable<Snapshot> } | null> {
 		active(signal);
-		const full = await target(path);
+		const full = await target(path, signal);
+		active(signal);
 		let before;
 		try {
 			before = await lstat(full);
+			active(signal);
 		} catch (e) {
 			if (missing(e)) return null;
 			throw e;
 		}
 		if (!before.isFile() || before.nlink > 1) throw new Error("Target must be a single-link regular file");
-		if (before.size > DEVICE_FILE_SYNC_LIMITS.bytes) throw new Error("Target exceeds file budget");
+		if (before.size > remainingBytes) throw new Error("Target exceeds file budget");
 		const handle = await open(full, constants.O_RDONLY | (constants.O_NOFOLLOW || 0));
 		try {
+			active(signal);
 			const opened = await handle.stat();
+			active(signal);
 			if (!opened.isFile() || identity(opened) !== identity(before)) throw new Error("File changed while opening");
 			// Fixed buffer prevents unbounded allocation if a local writer grows it.
 			const buffer = Buffer.alloc(before.size + 1);
@@ -170,15 +205,17 @@ export function createDeviceFileSync(config: { root: string; dataDir: string; al
 			while (count < buffer.length) {
 				active(signal);
 				const result = await handle.read(buffer, count, buffer.length - count, count);
+				active(signal);
 				if (!result.bytesRead) break;
 				count += result.bytesRead;
 			}
-			await target(path);
-			if (
-				count !== before.size ||
-				identity(await handle.stat()) !== identity(before) ||
-				identity(await lstat(full)) !== identity(before)
-			)
+			await target(path, signal);
+			active(signal);
+			const afterOpen = await handle.stat();
+			active(signal);
+			const afterPath = await lstat(full);
+			active(signal);
+			if (count !== before.size || identity(afterOpen) !== identity(before) || identity(afterPath) !== identity(before))
 				throw new Error("File changed while reading");
 			const bytes = buffer.subarray(0, count);
 			return { bytes, snapshot: { hash: hash(bytes), identity: identity(before) } };
@@ -229,7 +266,27 @@ export function createDeviceFileSync(config: { root: string; dataDir: string; al
 		if (size !== bundle.manifest.totalBytes) throw new Error("Bundle total size mismatch");
 		for (const key of seen)
 			for (const other of seen) if (other.startsWith(`${key}/`)) throw new Error("Bundle file/ancestor collision");
-		return { manifest: { version: 1, totalBytes: size, files: entries }, files };
+		let summary: Pick<DeviceFileBundle["manifest"], "exclusions" | "totalExcluded"> = {};
+		if (bundle.manifest.exclusions !== undefined || bundle.manifest.totalExcluded !== undefined) {
+			const { exclusions, totalExcluded } = bundle.manifest;
+			if (
+				!Array.isArray(exclusions) ||
+				exclusions.length > DEVICE_FILE_SYNC_LIMITS.exclusions ||
+				!Number.isSafeInteger(totalExcluded) ||
+				totalExcluded! < exclusions.length ||
+				totalExcluded! < 1
+			)
+				throw new Error("Invalid exclusions summary");
+			const sanitized = exclusions.map((item) => {
+				const path = safePath(item?.path, true);
+				if (item.reason !== "ignored" && item.reason !== "sensitive") throw new Error("Invalid exclusion reason");
+				return { path, reason: item.reason };
+			});
+			if (Buffer.byteLength(JSON.stringify(sanitized)) > DEVICE_FILE_SYNC_LIMITS.exclusionBytes)
+				throw new Error("Exclusions summary exceeds budget");
+			summary = { exclusions: sanitized, totalExcluded };
+		}
+		return { manifest: { version: 1, totalBytes: size, files: entries, ...summary }, files };
 	}
 	async function makePreview(id: string, bundle: DeviceFileBundle, signal?: AbortSignal) {
 		const baselines: Snapshot[] = [];
@@ -359,28 +416,129 @@ export function createDeviceFileSync(config: { root: string; dataDir: string; al
 		}
 	}
 	return {
-		prepare({ paths, signal }: { paths: string[]; signal?: AbortSignal }): Promise<DeviceFileBundle> {
+		prepare({
+			paths,
+			signal,
+			recursive = false,
+		}: {
+			paths: string[];
+			signal?: AbortSignal;
+			recursive?: boolean;
+		}): Promise<DeviceFileBundle> {
 			return serialized(async () => {
 				active(signal);
 				if (!Array.isArray(paths) || !paths.length || paths.length > DEVICE_FILE_SYNC_LIMITS.files)
 					throw new Error("Invalid file count");
+				if (typeof recursive !== "boolean") throw new Error("Invalid recursive option");
+				const selected = paths.map((path) => safePath(path)).sort();
+				for (let i = 0; i < selected.length; i++) {
+					const key = selected[i].toLowerCase();
+					if (
+						selected.some(
+							(other, j) => j !== i && (other.toLowerCase() === key || key.startsWith(`${other.toLowerCase()}/`)),
+						)
+					)
+						throw new Error("Duplicate or overlapping selected path");
+				}
 				const files: DeviceFileBundle["files"] = [];
 				const entries: DeviceFileEntry[] = [];
+				const exclusions: DeviceFileExclusion[] = [];
+				let totalExcluded = 0;
+				let summaryFull = false;
 				let bytes = 0;
+				let visited = 0;
+				let discoveredFiles = 0;
 				const seen = new Set<string>();
-				for (const path of paths) {
-					const key = safePath(path).toLowerCase();
+				const countVisit = () => {
+					active(signal);
+					if (++visited > DEVICE_FILE_SYNC_LIMITS.visitedEntries)
+						throw new Error("Directory scan entry budget exceeded");
+				};
+				const visit = async (path: string, selectedPath = false): Promise<void> => {
+					active(signal);
+					const key = path.toLowerCase();
 					if (seen.has(key)) throw new Error("Duplicate bundle path");
 					seen.add(key);
-					const file = await readFile(path, signal);
+					safePath(path, true);
+					const reason = deniedPart(path.split("/").at(-1)!);
+					if (!selectedPath && reason) {
+						const excluded = join(root, ...path.split("/"));
+						await checkChain(excluded, false, signal);
+						active(signal);
+						totalExcluded++;
+						const item = { path, reason };
+						if (
+							!summaryFull &&
+							exclusions.length < DEVICE_FILE_SYNC_LIMITS.exclusions &&
+							Buffer.byteLength(JSON.stringify([...exclusions, item])) <= DEVICE_FILE_SYNC_LIMITS.exclusionBytes
+						)
+							exclusions.push(item);
+						else summaryFull = true;
+						return;
+					}
+					const full = await target(path, signal);
+					active(signal);
+					const before = await lstat(full);
+					active(signal);
+					if (before.isDirectory()) {
+						if (!recursive) throw new Error("Directory selection requires recursive: true");
+						const directory = await opendir(full);
+						const names: string[] = [];
+						try {
+							active(signal);
+							while (true) {
+								const entry = await directory.read();
+								active(signal);
+								if (!entry) break;
+								countVisit();
+								// Reject links even when their names would otherwise be excluded.
+								if (entry.isSymbolicLink()) throw new Error("Symlink paths are denied");
+								names.push(entry.name);
+							}
+						} finally {
+							await directory.close();
+						}
+						active(signal);
+						await target(path, signal);
+						active(signal);
+						const opened = await lstat(full);
+						active(signal);
+						if (identity(opened) !== identity(before)) throw new Error("Directory changed while scanning");
+						for (const name of names.sort()) {
+							await visit(`${path}/${name}`);
+							active(signal);
+						}
+						await target(path, signal);
+						active(signal);
+						const after = await lstat(full);
+						active(signal);
+						if (identity(after) !== identity(before)) throw new Error("Directory changed while scanning");
+						return;
+					}
+					if (++discoveredFiles > DEVICE_FILE_SYNC_LIMITS.files) throw new Error("Bundle exceeds file count budget");
+					const file = await readFile(path, signal, DEVICE_FILE_SYNC_LIMITS.bytes - bytes);
+					active(signal);
 					if (!file) throw new Error("Source file does not exist");
-					if ((bytes += file.bytes.length) > DEVICE_FILE_SYNC_LIMITS.bytes)
-						throw new Error("Bundle exceeds byte budget");
+					bytes += file.bytes.length;
 					entries.push({ path, size: file.bytes.length, sha256: file.snapshot.hash });
 					files.push({ path, base64: file.bytes.toString("base64") });
+				};
+				for (const path of selected) {
+					countVisit();
+					await visit(path, true);
+					active(signal);
 				}
+				if (!files.length) throw new Error("Selection contains no transferable regular files");
 				active(signal);
-				return { manifest: { version: 1, totalBytes: bytes, files: entries }, files };
+				return {
+					manifest: {
+						version: 1,
+						totalBytes: bytes,
+						files: entries,
+						...(totalExcluded ? { exclusions, totalExcluded } : {}),
+					},
+					files,
+				};
 			});
 		},
 		stage(input: unknown, { signal }: Options = {}): Promise<DeviceFilePreview> {

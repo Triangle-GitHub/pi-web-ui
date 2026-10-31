@@ -5,6 +5,7 @@
  * 条目过滤/分组排序、渲染行、键盘下标推进、模块级 store 的订阅语义。
  * 渲染层（portal / 焦点 / 事件监听）由真浏览器回归覆盖，不在单测里造 DOM。
  */
+import { readFileSync } from "node:fs";
 import { afterEach, describe, expect, it } from "vitest";
 import {
 	buildWhenContext,
@@ -47,6 +48,16 @@ const ids = (list: UiSlotEntry[]) => list.map((e) => e.id);
 
 afterEach(() => {
 	resetContextMenu();
+});
+
+describe("全局菜单挂载", () => {
+	it("独立于群组和其他视图分支，始终挂载唯一菜单", () => {
+		const source = readFileSync(new URL("../../web/src/App.tsx", import.meta.url), "utf8");
+		expect(source.match(/<ContextMenu\b/g)).toHaveLength(1);
+		// Require an unconditional direct child before any layout/view branch.
+		const providerChildren = source.slice(source.indexOf("<TemplateProvider "));
+		expect(providerChildren).toMatch(/^<TemplateProvider[^\n]*>\s*(?:\{\/\*[\s\S]*?\*\/\}\s*)?<ContextMenu\b/);
+	});
 });
 
 describe("clampMenuPosition", () => {

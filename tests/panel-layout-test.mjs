@@ -181,7 +181,7 @@ check(
 // 行一出现（用户消息入库）不等于运行已进入流式：服务端启动 run 后才置 isStreaming，所以等待标记出现，
 // 而不是行一出现就立刻计数（假模型永不回包，标记会一直保留）。
 const streamingShown = await page
-	.waitForSelector(".panel-convs .conv-streaming", { timeout: 15000 })
+	.waitForSelector(".panel-convs .session-item.is-running", { timeout: 15000 })
 	.then(() => true)
 	.catch(() => false);
 check("the row shows the streaming indicator while the run is in flight", streamingShown);

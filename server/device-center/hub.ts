@@ -3,10 +3,20 @@ import type { Request, Response, NextFunction } from "express";
 import { createServer, type Server } from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { randomBytes, randomUUID } from "node:crypto";
-import { DeviceHubStore, hashSecret, isTerminal, publicDevice, secretMatches } from "./store.js";
+import { DeviceHubStore, hashSecret, isTerminal, taskPending, publicDevice, secretMatches } from "./store.js";
+import { GROUP_RETENTION_LIMIT, groupHistoryPage, groupTaskContext, type GroupTaskContext } from "./group-context.js";
+type DeliveryTask = HubTask & { context?: GroupTaskContext };
 import type { HubTask, Handoff, TaskStatus, HubState } from "./store.js";
 import { createAccountAuth, hashPassword, verifyPassword, SESSION_TTL, HubRateLimiter } from "./hub-auth.js";
 import type { DevicePortals } from "./device-portals.js";
+import {
+	establishConversation,
+	recordConversationTurn,
+	conversationStatus,
+	queueParentResult,
+	conversationPage,
+	trimConversationHistory,
+} from "./hub-conversations.js";
 
 export interface HubTaskEvent {
 	botId: string;
@@ -16,11 +26,12 @@ export interface HubTaskEvent {
 	report?: string;
 }
 export interface HubRelay {
+	cancelTask?: (deviceId: string, taskId: string, attemptId: string) => Promise<{ stopped: boolean }>;
 	handleOpen?: (req: Request, res: Response, deviceId: string) => Promise<void>;
 	handleRequest?: (req: IncomingMessage, res: ServerResponse) => boolean;
 	handleAliasOpen?: (req: IncomingMessage, res: ServerResponse, deviceId: string) => Promise<void>;
 	onRevoke?: (deviceId: string) => unknown;
-	onTask?: (deviceId: string, task: HubTask) => unknown;
+	onTask?: (deviceId: string, task: DeliveryTask) => unknown;
 }
 export interface DeviceHubOptions {
 	/** An already bound loopback server may be supplied by the in-process local Hub. */
@@ -33,7 +44,7 @@ export interface DeviceHubOptions {
 	allowRegistration?: boolean;
 	relay?: HubRelay;
 	onRevoke?: (deviceId: string) => unknown;
-	onTask?: (deviceId: string, task: HubTask) => unknown;
+	onTask?: (deviceId: string, task: DeliveryTask) => unknown;
 	isOnline?: (deviceId: string) => boolean;
 }
 class HttpError extends Error {
@@ -74,7 +85,7 @@ function handoff(value: unknown): Handoff | undefined {
 }
 const token = () => randomBytes(32).toString("base64url");
 const PAIR_TTL = 10 * 60 * 1000;
-const HISTORY = 500;
+const HISTORY = GROUP_RETENTION_LIMIT;
 
 /** Does not listen. The caller may attach a relay, root page and additional routes before listening. */
 export async function createDeviceHub(options: DeviceHubOptions) {
@@ -144,11 +155,14 @@ export async function createDeviceHub(options: DeviceHubOptions) {
 			fail(401, "UI device authentication required; pair again");
 		if (req.method === "POST" && !agentWrites.allow("user:" + device.id)) fail(429, "Too many user writes");
 		const suffix = req.path.slice("/api/device-user".length);
+		const conversationRoute = /^\/rooms\/[^/]+\/conversations(?:\/[^/]+(?:\/(?:messages|stop))?)?$/.test(suffix);
 		if (!(
-			(req.method === "GET" && (["/devices", "/bots", "/rooms"].includes(suffix) || /^\/rooms\/[^/]+$/.test(suffix))) ||
+			(req.method === "GET" &&
+				(conversationRoute || ["/devices", "/bots", "/rooms"].includes(suffix) || /^\/rooms\/[^/]+$/.test(suffix))) ||
 			(req.method === "POST" &&
 				(suffix === "/rooms" ||
-					/^\/rooms\/[^/]+\/(messages|rename|members|delete)$/.test(suffix) ||
+					conversationRoute ||
+					/^\/rooms\/[^/]+\/(messages|rename|members|clear|delete)$/.test(suffix) ||
 					/^\/devices\/[^/]+\/open$/.test(suffix)))
 		))
 			fail(404, "User route missing");
@@ -165,8 +179,13 @@ export async function createDeviceHub(options: DeviceHubOptions) {
 		agents.set(req, agent);
 		const suffix = req.path.slice("/api/agent".length);
 		if (
-			(req.method === "GET" && (["/devices", "/bots", "/rooms"].includes(suffix) || /^\/rooms\/[^/]+$/.test(suffix))) ||
-			(req.method === "POST" && (suffix === "/rooms" || /^\/rooms\/[^/]+\/messages$/.test(suffix)))
+			(req.method === "GET" &&
+				(["/devices", "/bots", "/rooms"].includes(suffix) ||
+					/^\/rooms\/[^/]+(?:\/history)?$/.test(suffix) ||
+					/^\/rooms\/[^/]+\/conversations(?:\/[^/]+)?$/.test(suffix))) ||
+			(req.method === "POST" &&
+				(suffix === "/rooms" ||
+					/^\/rooms\/[^/]+\/(?:messages|conversations(?:\/[^/]+\/(?:messages|stop))?)$/.test(suffix)))
 		)
 			req.url = req.url.replace("/api/agent/", "/api/");
 		else if (!((suffix === "/transfers" && req.method === "POST") || (suffix === "/bots" && req.method === "PUT")))
@@ -528,7 +547,23 @@ export async function createDeviceHub(options: DeviceHubOptions) {
 			tasks: state.tasks.filter((t) => t.roomId === room.id),
 		});
 	});
-	for (const operation of ["rename", "members", "delete"] as const) {
+	app.get("/api/rooms/:id/history", (req, res) => {
+		const agent = agents.get(req);
+		if (!agent) fail(403, "Agent authentication required");
+		const state = store.snapshot();
+		const room = state.rooms.find((entry) => entry.id === req.params.id && entry.accountId === agent.account.id);
+		const source = state.bots.find(
+			(bot) =>
+				bot.id === req.query.sourceBotId &&
+				bot.deviceId === agent.device.id &&
+				bot.accountId === agent.account.id &&
+				bot.enabled,
+		);
+		if (!room || !source || !room.botIds.includes(source.id)) fail(404, "Room missing");
+		if (req.query.before !== undefined && typeof req.query.before !== "string") fail(400, "Invalid history cursor");
+		res.json(groupHistoryPage(room.id, state.messages, req.query.before as string | undefined));
+	});
+	for (const operation of ["rename", "members", "clear", "delete"] as const) {
 		app.post(`/api/rooms/:id/${operation}`, async (req, res) => {
 			const owner = account(req);
 			const result = await store.transact((draft) => {
@@ -538,196 +573,363 @@ export async function createDeviceHub(options: DeviceHubOptions) {
 				if (operation === "members") {
 					const members = ids(req.body?.botIds);
 					if (!members.length || members.some((id) => !validBot(draft, id, owner.id))) fail(400, "Invalid room Bot");
-					if (draft.tasks.some((t) => t.roomId === room.id && !isTerminal(t.status) && !members.includes(t.botId)))
+					if (draft.tasks.some((t) => t.roomId === room.id && taskPending(t) && !members.includes(t.botId)))
 						throw Object.assign(new Error("Stop removed Bots' active tasks first"), {
 							status: 409,
 							code: "ACTIVE_TASKS",
 						});
 					room.botIds = members;
 				}
-				if (operation === "delete") {
-					if (draft.tasks.some((t) => t.roomId === room.id && !isTerminal(t.status)))
-						throw Object.assign(new Error("Stop active tasks before deleting room"), {
+				if (operation === "delete" || operation === "clear") {
+					if (draft.tasks.some((t) => t.roomId === room.id && taskPending(t)))
+						throw Object.assign(new Error("Stop active tasks before clearing or deleting room"), {
 							status: 409,
 							code: "ACTIVE_TASKS",
 						});
-					draft.rooms = draft.rooms.filter((r) => r.id !== room.id);
+					if (operation === "delete") draft.rooms = draft.rooms.filter((r) => r.id !== room.id);
 					draft.messages = draft.messages.filter((m) => m.roomId !== room.id);
 					draft.tasks = draft.tasks.filter((t) => t.roomId !== room.id);
 					draft.receipts = draft.receipts.filter((r) => r.roomId !== room.id);
-					return { deleted: true };
+					const removedConversations = new Set(
+						draft.conversations.filter((c) => c.roomId === room.id).map((c) => c.id),
+					);
+					draft.conversations = draft.conversations.filter((c) => c.roomId !== room.id);
+					draft.conversationMessages = draft.conversationMessages.filter(
+						(m) => !removedConversations.has(m.conversationId),
+					);
+					return operation === "delete" ? { deleted: true } : { cleared: true };
 				}
 				return { room };
 			});
 			res.json(result);
 		});
 	}
-	app.post("/api/rooms/:id/messages", async (req, res) => {
+	app.post("/api/rooms/:id/conversations/:conversationId/stop", async (req, res) => {
 		const owner = account(req);
-		const content = text(req.body?.text);
-		const targets = ids(req.body?.targetBotIds ?? []);
-		const transfer = handoff(req.body?.handoff);
-		const parentTaskId = req.body?.parentTaskId === undefined ? undefined : text(req.body.parentTaskId, 128);
-		const key = req.body?.idempotencyKey === undefined ? randomUUID() : text(req.body.idempotencyKey, 128);
-		const fingerprint = hashSecret(
-			JSON.stringify({
-				content,
-				targets,
-				transfer,
-				parentTaskId,
-				sourceDeviceId: (agents.get(req) ?? users.get(req))?.device.id,
-				sourceBotId: agents.has(req) ? req.body?.sourceBotId : undefined,
-				senderType: agents.has(req) ? "bot" : "human",
-			}),
-		);
-		const result = await store.transact((draft) => {
-			const room = draft.rooms.find((r) => r.id === req.params.id && r.accountId === owner.id);
-			if (!room) fail(404, "Room missing");
-			const source = ownBot(req, draft);
-			const userSource = users.get(req)?.device;
-			if (source && !room.botIds.includes(source.id)) fail(403, "Source Bot is not a room member");
-			if (targets.some((id) => !room.botIds.includes(id) || !validBot(draft, id, owner.id)))
-				fail(400, "Invalid target Bot");
-			const receipt = draft.receipts.find((r) => r.roomId === room.id && r.accountId === owner.id && r.key === key);
-			if (receipt) {
-				if (receipt.fingerprint !== fingerprint) fail(409, "Idempotency key reused");
-				return {
-					message: draft.messages.find((m) => m.id === receipt.messageId),
-					tasks: draft.tasks.filter((t) =>
-						draft.messages.find((m) => m.id === receipt.messageId)?.taskIds.includes(t.id),
-					),
-					duplicate: true,
-				};
-			}
-			if (
-				parentTaskId &&
-				!draft.tasks.some(
-					(t) =>
-						t.id === parentTaskId &&
-						t.roomId === room.id &&
-						t.accountId === owner.id &&
-						(isTerminal(t.status) || (source?.id === t.botId && t.status === "running")),
-				)
-			)
-				fail(400, "Parent task must be terminal or the source device's running task in this room");
-			const parent = parentTaskId ? draft.tasks.find((t) => t.id === parentTaskId) : undefined;
-			if (source && targets.length && (!parent || parent.botId !== source.id))
-				fail(400, "Device dispatch requires its own running or terminal parent task");
-			const root = parent ? draft.tasks.find((t) => t.id === (parent.rootTaskId ?? parent.id)) : undefined;
-			if (parent && targets.length && !root) fail(409, "Dispatch root expired");
-			const depth = parent ? (parent.dispatchDepth ?? 0) + 1 : 0;
-			if (targets.length && depth > 8) fail(409, "Dispatch depth exhausted");
-			if (targets.length && (root?.dispatchCount ?? 0) + targets.length > 16) fail(409, "Dispatch budget exhausted");
-			if (root && targets.length) root.dispatchCount = (root.dispatchCount ?? 0) + targets.length;
-			if (draft.tasks.filter((t) => t.roomId === room.id && !isTerminal(t.status)).length + targets.length > HISTORY)
-				fail(409, "Too many active tasks");
-			const now = Date.now();
-			const rootId = root?.id ?? randomUUID();
-			const tasks: HubTask[] = targets.map((botId, index) => ({
-				id: !root && index === 0 ? rootId : randomUUID(),
-				rootTaskId: rootId,
-				dispatchDepth: depth,
-				...(!root && index === 0 ? { dispatchCount: targets.length } : {}),
-				attemptId: randomUUID(),
-				roomId: room.id,
-				accountId: owner.id,
-				botId,
-				deviceId: validBot(draft, botId, owner.id)!.deviceId,
-				botRevision: validBot(draft, botId, owner.id)!.revision,
-				...(source ? { sourceBotId: source.id } : {}),
-				text: content,
-				status: "queued",
-				createdAt: now,
-				updatedAt: now,
-				...(transfer ? { handoff: transfer } : {}),
-				...(parentTaskId ? { parentTaskId } : {}),
-			}));
-			const message = {
-				id: randomUUID(),
-				roomId: room.id,
-				accountId: owner.id,
-				text: content,
-				sender: source
-					? { type: "bot" as const, id: source.id, name: source.name, sourceDeviceId: source.deviceId }
-					: {
-							type: "human" as const,
-							id: owner.id,
-							name: userSource ? `${owner.username} · ${userSource.name}` : owner.username,
-							...(userSource ? { sourceDeviceId: userSource.id } : {}),
-						},
-				createdAt: now,
-				taskIds: tasks.map((t) => t.id),
-				targetBotIds: targets,
-			};
-			draft.tasks.push(...tasks);
-			draft.messages.push(message);
-			draft.receipts.push({ accountId: owner.id, roomId: room.id, key, fingerprint, messageId: message.id });
-			const oldMessages = draft.messages.filter((m) => m.roomId === room.id).slice(0, -HISTORY);
-			const removed = new Set(oldMessages.map((m) => m.id));
-			draft.messages = draft.messages.filter((m) => !removed.has(m.id));
-			draft.receipts = draft.receipts.filter((r) => !removed.has(r.messageId));
-			const oldTasks = new Set(
-				draft.tasks
-					.filter((t) => t.roomId === room.id && isTerminal(t.status))
-					.slice(0, -HISTORY)
-					.map((t) => t.id),
+		const pending = await store.transact((draft) => {
+			const conversation = draft.conversations.find(
+				(c) => c.id === req.params.conversationId && c.roomId === req.params.id && c.accountId === owner.id,
 			);
-			draft.tasks = draft.tasks.filter((t) => !oldTasks.has(t.id));
-			return { message, tasks, duplicate: false };
+			const room = draft.rooms.find((r) => r.id === req.params.id && r.accountId === owner.id);
+			if (!conversation || !room) fail(404, "Conversation missing");
+			const source = ownBot(req, draft);
+			if (source && (!room.botIds.includes(source.id) || conversation.botId !== source.id))
+				fail(403, "Bot may stop only its own conversation");
+			conversation.closed = true;
+			const tasks = draft.tasks.filter((t) => t.conversationId === conversation.id && taskPending(t));
+			for (const task of tasks) task.cancelRequested = true;
+			return tasks;
 		});
-		if (!result.duplicate) {
-			for (const task of result.tasks) {
-				const deliver = options.onTask ?? options.relay?.onTask;
-				try {
-					const latest = store.snapshot();
-					if (
-						validBot(latest, task.botId, task.accountId)?.revision !== task.botRevision ||
-						!latest.rooms.some((r) => r.id === task.roomId && r.botIds.includes(task.botId))
-					)
-						throw new Error("Bot no longer available");
-					if (!deliver || (await deliver(task.deviceId, task)) === false) throw new Error("Delivery rejected");
-				} catch {
-					await store.transact((draft) => {
-						const current = draft.tasks.find((entry) => entry.id === task.id && entry.attemptId === task.attemptId);
-						if (!current || isTerminal(current.status)) return;
-						const report = "Task delivery failed; submit a new request to retry.";
-						current.status = "failed";
-						current.updatedAt = Date.now();
-						current.report = report;
-						draft.messages.push({
-							id: randomUUID(),
-							roomId: current.roomId,
-							accountId: current.accountId,
-							text: report,
-							sender: {
-								type: "bot",
-								id: current.botId,
-								name: draft.bots.find((bot) => bot.id === current.botId)?.name ?? current.botId,
-								sourceDeviceId: current.deviceId,
-							},
-							createdAt: current.updatedAt,
-							taskIds: [current.id],
-						});
-						const remove = new Set(
-							draft.messages
-								.filter((message) => message.roomId === current.roomId)
-								.slice(0, -HISTORY)
-								.map((message) => message.id),
-						);
-						draft.messages = draft.messages.filter((message) => !remove.has(message.id));
-						draft.receipts = draft.receipts.filter((receipt) => !remove.has(receipt.messageId));
-					});
-				}
-			}
+		for (const task of pending) {
+			const confirmed = await options.relay
+				?.cancelTask?.(task.deviceId, task.id, task.attemptId)
+				.catch(() => ({ stopped: false }));
+			if (!confirmed?.stopped) continue;
+			await store.transact((draft) => {
+				const current = draft.tasks.find((t) => t.id === task.id && t.attemptId === task.attemptId);
+				if (!current) return;
+				current.stopConfirmed = true;
+				current.status = "interrupted";
+				current.updatedAt = Date.now();
+				current.report = "Conversation stopped.";
+			});
 		}
-		const state = store.snapshot();
-		res.json({
-			message: result.message,
-			tasks: result.tasks.map(
-				(task) => state.tasks.find((entry) => entry.id === task.id && entry.attemptId === task.attemptId) ?? task,
-			),
-		});
+		const remaining = store
+			.snapshot()
+			.tasks.filter((t) => t.conversationId === req.params.conversationId && taskPending(t));
+		res.json({ stopped: remaining.length === 0, pending: remaining.length });
 	});
+	app.get(["/api/rooms/:id/conversations", "/api/rooms/:id/conversations/:conversationId"], (req, res) => {
+		const state = store.snapshot();
+		const room = state.rooms.find((r) => r.id === req.params.id && r.accountId === account(req).id);
+		const agent = agents.get(req);
+		if (
+			!room ||
+			(agent &&
+				!state.bots.some(
+					(b) =>
+						b.id === req.query.sourceBotId &&
+						b.deviceId === agent.device.id &&
+						b.accountId === room.accountId &&
+						b.enabled &&
+						room.botIds.includes(b.id),
+				))
+		)
+			fail(404, "Room missing");
+		const conversations = state.conversations
+			.filter((c) => c.roomId === room.id && c.accountId === room.accountId)
+			.sort((a, b) => b.updatedAt - a.updatedAt)
+			.map((c) => ({ ...c, status: conversationStatus(state, c) }));
+		if (!req.params.conversationId) return res.json({ conversations });
+		const conversation = conversations.find((c) => c.id === req.params.conversationId);
+		if (!conversation) fail(404, "Conversation missing");
+		if (req.query.before !== undefined && typeof req.query.before !== "string")
+			fail(400, "Invalid conversation cursor");
+		res.json({ conversation, ...conversationPage(state, conversation.id, req.query.before as string | undefined) });
+	});
+	app.post(
+		[
+			"/api/rooms/:id/messages",
+			"/api/rooms/:id/conversations",
+			"/api/rooms/:id/conversations/:conversationId/messages",
+		],
+		async (req, res) => {
+			const owner = account(req);
+			const content = text(req.body?.text);
+			const conversationApi = req.path.includes("/conversations");
+			const conversationId = req.params.conversationId;
+			const kind = req.body?.kind ?? "message";
+			if (!["message", "request", "reply"].includes(kind)) fail(400, "Invalid message kind");
+			const requestId =
+				req.body?.requestId === undefined
+					? kind === "request"
+						? randomUUID()
+						: undefined
+					: text(req.body.requestId, 128);
+			if (kind === "reply" && !requestId) fail(400, "Reply requires requestId");
+			const targets = ids(
+				conversationApi ? (conversationId ? [] : [text(req.body?.targetBotId, 128)]) : (req.body?.targetBotIds ?? []),
+			);
+			const transfer = handoff(req.body?.handoff);
+			const parentTaskId = req.body?.parentTaskId === undefined ? undefined : text(req.body.parentTaskId, 128);
+			const key = req.body?.idempotencyKey === undefined ? randomUUID() : text(req.body.idempotencyKey, 128);
+			const fingerprint = hashSecret(
+				JSON.stringify({
+					content,
+					targets,
+					conversationId,
+					kind,
+					requestId: req.body?.requestId,
+					transfer,
+					parentTaskId,
+					sourceDeviceId: (agents.get(req) ?? users.get(req))?.device.id,
+					sourceBotId: agents.has(req) ? req.body?.sourceBotId : undefined,
+					senderType: agents.has(req) ? "bot" : "human",
+				}),
+			);
+			const result = await store.transact((draft) => {
+				const room = draft.rooms.find((r) => r.id === req.params.id && r.accountId === owner.id);
+				if (!room) fail(404, "Room missing");
+				const source = ownBot(req, draft);
+				const userSource = users.get(req)?.device;
+				const conversation = conversationId
+					? draft.conversations.find((c) => c.id === conversationId && c.roomId === room.id && c.accountId === owner.id)
+					: undefined;
+				if (conversationId && !conversation) fail(404, "Conversation missing");
+				if (conversation?.closed) fail(409, "Conversation is closed");
+				if (conversation) {
+					const bot = validBot(draft, conversation.botId, owner.id);
+					if (!bot || bot.revision !== conversation.botRevision || bot.deviceId !== conversation.deviceId)
+						fail(409, "Conversation Bot configuration changed");
+					targets.push(conversation.botId);
+				}
+				if (source && !room.botIds.includes(source.id)) fail(403, "Source Bot is not a room member");
+				if (targets.some((id) => !room.botIds.includes(id) || !validBot(draft, id, owner.id)))
+					fail(400, "Invalid target Bot");
+				if (
+					source &&
+					targets.length &&
+					!draft.tasks.some(
+						(t) =>
+							t.id === parentTaskId &&
+							t.botId === source.id &&
+							t.accountId === owner.id &&
+							t.roomId === room.id &&
+							(t.status === "running" || isTerminal(t.status)),
+					)
+				)
+					fail(400, "Device dispatch requires its own bound parent task");
+				{
+					const prior = draft.conversationMessages.find(
+						(m) =>
+							conversationId !== undefined &&
+							m.conversationId === conversationId &&
+							m.idempotencyKey === key &&
+							draft.conversations.some(
+								(c) => c.id === m.conversationId && c.roomId === room.id && c.accountId === owner.id,
+							),
+					);
+					if (prior) {
+						if (prior.fingerprint !== fingerprint) fail(409, "Idempotency key reused");
+						return {
+							message: draft.messages.find((m) => m.taskIds.includes(prior.taskId)),
+							tasks: draft.tasks.filter((t) => t.id === prior.taskId),
+							duplicate: true,
+						};
+					}
+				}
+				const receipt = draft.receipts.find((r) => r.roomId === room.id && r.accountId === owner.id && r.key === key);
+				if (receipt) {
+					if (receipt.fingerprint !== fingerprint) fail(409, "Idempotency key reused");
+					return {
+						message: draft.messages.find((m) => m.id === receipt.messageId),
+						tasks: draft.tasks.filter((t) =>
+							draft.messages.find((m) => m.id === receipt.messageId)?.taskIds.includes(t.id),
+						),
+						duplicate: true,
+					};
+				}
+				if (kind === "reply") {
+					const request = draft.conversationMessages.find(
+						(m) =>
+							m.kind === "request" &&
+							m.requestId === requestId &&
+							draft.conversations.some(
+								(c) => c.id === m.conversationId && c.roomId === room.id && c.accountId === owner.id,
+							),
+					);
+					const requestedConversation = draft.conversations.find((c) => c.id === request?.conversationId);
+					if (
+						!request ||
+						!requestedConversation ||
+						source?.id !== requestedConversation.botId ||
+						!conversation ||
+						conversation.botId !== request.sourceBotId ||
+						conversation.id !== draft.tasks.find((t) => t.id === request.taskId)?.sourceConversationId ||
+						draft.tasks.find((t) => t.id === parentTaskId)?.conversationId !== request.conversationId
+					)
+						fail(403, "Reply must address the original requester from the requested Bot");
+					if (draft.tasks.some((t) => t.resultOfTaskId === request.taskId)) fail(409, "Request already completed");
+					if (
+						draft.conversationMessages.some(
+							(m) =>
+								m.kind === "reply" &&
+								m.requestId === requestId &&
+								m.idempotencyKey !== key &&
+								draft.conversations.some((c) => c.id === m.conversationId && c.roomId === room.id),
+						)
+					)
+						fail(409, "Request already answered");
+				}
+				if (
+					parentTaskId &&
+					!draft.tasks.some(
+						(t) =>
+							t.id === parentTaskId &&
+							t.roomId === room.id &&
+							t.accountId === owner.id &&
+							(isTerminal(t.status) || (source?.id === t.botId && t.status === "running")),
+					)
+				)
+					fail(400, "Parent task must be terminal or the source device's running task in this room");
+				if (
+					kind === "request" &&
+					draft.conversationMessages.some(
+						(m) =>
+							m.kind === "request" &&
+							m.requestId === requestId &&
+							draft.conversations.some((c) => c.id === m.conversationId && c.roomId === room.id),
+					)
+				)
+					fail(409, "Request ID already exists");
+				const parent = parentTaskId ? draft.tasks.find((t) => t.id === parentTaskId) : undefined;
+				if (source && targets.length && (!parent || parent.botId !== source.id))
+					fail(400, "Device dispatch requires its own running or terminal parent task");
+				// Explicit human input grants a new lineage; autonomous work always inherits its real parent.
+				const root = parent ? draft.tasks.find((t) => t.id === (parent.rootTaskId ?? parent.id)) : undefined;
+				if (parent && targets.length && !root) fail(409, "Dispatch root expired");
+				const depth = parent ? (parent.dispatchDepth ?? 0) + 1 : 0;
+				if (targets.length && depth > 8) fail(409, "Dispatch depth exhausted");
+				if (targets.length && (root?.dispatchCount ?? 0) + targets.length > 16) fail(409, "Dispatch budget exhausted");
+				if (root && targets.length) root.dispatchCount = (root.dispatchCount ?? 0) + targets.length;
+				if (draft.tasks.filter((t) => t.roomId === room.id && taskPending(t)).length + targets.length > HISTORY)
+					fail(409, "Too many active tasks");
+				if (!conversation && draft.conversations.filter((c) => c.roomId === room.id).length + targets.length > HISTORY)
+					fail(409, "Conversation capacity reached; clear completed history first");
+				const now = Date.now();
+				const rootId = root?.id ?? randomUUID();
+				const tasks: HubTask[] = targets.map((botId, index) => ({
+					id: !root && index === 0 ? rootId : randomUUID(),
+					rootTaskId: rootId,
+					dispatchDepth: depth,
+					...(!root && index === 0 ? { dispatchCount: targets.length } : {}),
+					attemptId: randomUUID(),
+					roomId: room.id,
+					accountId: owner.id,
+					botId,
+					deviceId: validBot(draft, botId, owner.id)!.deviceId,
+					botRevision: validBot(draft, botId, owner.id)!.revision,
+					...(source ? { sourceBotId: source.id } : {}),
+					text: content,
+					status: "queued",
+					createdAt: now,
+					updatedAt: now,
+					...(transfer ? { handoff: transfer } : {}),
+					...(parentTaskId ? { parentTaskId } : {}),
+				}));
+				for (const task of tasks) {
+					task.kind = kind;
+					task.sourceConversationId = parent?.conversationId;
+					task.requestId = requestId;
+					if (conversation) {
+						task.conversationId = conversation.id;
+						task.resume = true;
+						conversation.latestTaskId = task.id;
+						conversation.rootTaskId = task.rootTaskId!;
+						conversation.updatedAt = now;
+						conversation.dispatchDepth = depth;
+					} else establishConversation(draft, task);
+					recordConversationTurn(draft, task, key, fingerprint);
+				}
+				const message = {
+					id: randomUUID(),
+					roomId: room.id,
+					accountId: owner.id,
+					text: content,
+					sender: source
+						? { type: "bot" as const, id: source.id, name: source.name, sourceDeviceId: source.deviceId }
+						: {
+								type: "human" as const,
+								id: owner.id,
+								name: userSource ? `${owner.username} · ${userSource.name}` : owner.username,
+								...(userSource ? { sourceDeviceId: userSource.id } : {}),
+							},
+					createdAt: now,
+					taskIds: tasks.map((t) => t.id),
+					targetBotIds: targets,
+					...(tasks.length === 1 ? { conversationId: tasks[0].conversationId } : {}),
+					...(tasks.length ? { conversationIds: tasks.map((task) => task.conversationId!) } : {}),
+				};
+				// Freeze shared context before any recipient starts. Parallel answers cannot leak into siblings.
+				const context = tasks.length ? groupTaskContext(room, draft.bots, draft.messages) : undefined;
+				draft.tasks.push(...tasks);
+				draft.messages.push(message);
+				draft.receipts.push({ accountId: owner.id, roomId: room.id, key, fingerprint, messageId: message.id });
+				const oldMessages = draft.messages.filter((m) => m.roomId === room.id).slice(0, -HISTORY);
+				const removed = new Set(oldMessages.map((m) => m.id));
+				draft.messages = draft.messages.filter((m) => !removed.has(m.id));
+				draft.receipts = draft.receipts.filter((r) => !removed.has(r.messageId));
+				const oldTasks = new Set(
+					draft.tasks
+						.filter(
+							(t) =>
+								t.roomId === room.id &&
+								isTerminal(t.status) &&
+								!draft.conversations.some((c) => c.rootTaskId === t.id || c.id === t.conversationId),
+						)
+						.slice(0, -HISTORY)
+						.map((t) => t.id),
+				);
+				draft.tasks = draft.tasks.filter((t) => !oldTasks.has(t.id));
+				trimConversationHistory(draft, room.id);
+				return { message, tasks, duplicate: false, context };
+			});
+			if (!result.duplicate) for (const task of result.tasks) await deliverTask(task, result.context);
+			const state = store.snapshot();
+			res.json({
+				...(conversationApi
+					? {
+							conversation: state.conversations.find((c) => c.id === result.tasks[0]?.conversationId),
+							task: state.tasks.find((t) => t.id === result.tasks[0]?.id),
+						}
+					: {}),
+				message: result.message,
+				tasks: result.tasks.map(
+					(task) => state.tasks.find((entry) => entry.id === task.id && entry.attemptId === task.attemptId) ?? task,
+				),
+			});
+		},
+	);
 	for (const action of ["alias", "portal"])
 		app.post(`/api/devices/:id/${action}`, async (req, res) => {
 			const owner = account(req);
@@ -807,6 +1009,69 @@ export async function createDeviceHub(options: DeviceHubOptions) {
 		if (options.relay?.handleRequest?.(req, res)) return;
 		app(req, res);
 	});
+	async function deliverTask(task: HubTask, context?: GroupTaskContext) {
+		const deliver = options.onTask ?? options.relay?.onTask;
+		try {
+			const latest = store.snapshot();
+			if (
+				latest.tasks.find((t) => t.id === task.id)?.cancelRequested ||
+				latest.conversations.find((c) => c.id === task.conversationId)?.closed ||
+				validBot(latest, task.botId, task.accountId)?.revision !== task.botRevision ||
+				!latest.rooms.some((r) => r.id === task.roomId && r.botIds.includes(task.botId))
+			)
+				throw new Error("Bot no longer available");
+			if (!deliver || (await deliver(task.deviceId, { ...task, context: context })) === false)
+				throw new Error("Delivery rejected");
+		} catch {
+			const failure = await store.transact((draft) => {
+				const current = draft.tasks.find((entry) => entry.id === task.id && entry.attemptId === task.attemptId);
+				if (!current || isTerminal(current.status) || current.cancelRequested) return;
+				const report = "Task delivery failed; submit a new request to retry.";
+				current.status = "failed";
+				current.updatedAt = Date.now();
+				current.report = report;
+				if (current.conversationId)
+					draft.conversationMessages.push({
+						id: randomUUID(),
+						conversationId: current.conversationId,
+						taskId: current.id,
+						kind: "result",
+						text: report,
+						sourceBotId: current.botId,
+						requestId: current.requestId,
+						createdAt: current.updatedAt,
+					});
+				const room = draft.rooms.find((r) => r.id === current.roomId);
+				const context = room ? groupTaskContext(room, draft.bots, draft.messages) : undefined;
+				const wake = queueParentResult(draft, current);
+				draft.messages.push({
+					id: randomUUID(),
+					roomId: current.roomId,
+					accountId: current.accountId,
+					text: report,
+					sender: {
+						type: "bot",
+						id: current.botId,
+						name: draft.bots.find((bot) => bot.id === current.botId)?.name ?? current.botId,
+						sourceDeviceId: current.deviceId,
+					},
+					createdAt: current.updatedAt,
+					taskIds: [current.id],
+				});
+				const remove = new Set(
+					draft.messages
+						.filter((message) => message.roomId === current.roomId)
+						.slice(0, -HISTORY)
+						.map((message) => message.id),
+				);
+				draft.messages = draft.messages.filter((message) => !remove.has(message.id));
+				draft.receipts = draft.receipts.filter((receipt) => !remove.has(receipt.messageId));
+				trimConversationHistory(draft, current.roomId);
+				return { wake, context };
+			});
+			if (failure?.wake) await deliverTask(failure.wake, failure.context);
+		}
+	}
 	async function acceptTaskEvent(deviceId: string, event: HubTaskEvent) {
 		if (
 			!event ||
@@ -816,9 +1081,16 @@ export async function createDeviceHub(options: DeviceHubOptions) {
 			!["running", "completed", "failed", "interrupted"].includes(event.status)
 		)
 			fail(400, "Invalid task event");
-		const report = event.report === undefined ? undefined : text(event.report);
+		const report =
+			event.report === undefined
+				? event.status === "failed"
+					? "Task execution failed without a report."
+					: event.status === "interrupted"
+						? "Task execution was interrupted without a report."
+						: undefined
+				: text(event.report);
 		if (event.status === "completed" && !report) fail(400, "Completed task requires agent report");
-		return store.transact((draft) => {
+		const result = await store.transact((draft) => {
 			const device = draft.devices.find((d) => d.id === deviceId);
 			const task = draft.tasks.find(
 				(t) =>
@@ -837,7 +1109,7 @@ export async function createDeviceHub(options: DeviceHubOptions) {
 				fail(409, "Bot configuration changed");
 			if (task.status === event.status) {
 				if (task.report !== report) fail(409, "Conflicting duplicate event");
-				return task;
+				return { task };
 			}
 			if (
 				isTerminal(task.status) ||
@@ -857,7 +1129,19 @@ export async function createDeviceHub(options: DeviceHubOptions) {
 					sender: { type: "bot", id: bot.id, name: bot.name, sourceDeviceId: deviceId },
 					createdAt: Date.now(),
 					taskIds: [task.id],
+					conversationId: task.conversationId,
 				});
+				if (task.conversationId)
+					draft.conversationMessages.push({
+						id: randomUUID(),
+						conversationId: task.conversationId,
+						taskId: task.id,
+						kind: "result",
+						text: report,
+						sourceBotId: bot.id,
+						requestId: task.requestId,
+						createdAt: Date.now(),
+					});
 				const remove = new Set(
 					draft.messages
 						.filter((m) => m.roomId === task.roomId)
@@ -867,8 +1151,14 @@ export async function createDeviceHub(options: DeviceHubOptions) {
 				draft.messages = draft.messages.filter((m) => !remove.has(m.id));
 				draft.receipts = draft.receipts.filter((r) => !remove.has(r.messageId));
 			}
-			return task;
+			const room = draft.rooms.find((r) => r.id === task.roomId)!;
+			const context = groupTaskContext(room, draft.bots, draft.messages);
+			const wake = queueParentResult(draft, task);
+			trimConversationHistory(draft, task.roomId);
+			return { task, wake, context };
 		});
+		if (result.wake) await deliverTask(result.wake, result.context);
+		return result.task;
 	}
 	return {
 		app,

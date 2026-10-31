@@ -3,7 +3,31 @@
  * 特性：一键播放全部、静默添加队列(无阻断弹窗)、多源搜索、热歌榜单、收藏夹持久化、播放队列抽屉、画中画桌面浮动歌词、音质切换、歌曲下载、快捷键
  */
 
+import { loadPlayer, savePlayer, PLAYER_STORAGE_KEY } from "./player-storage.mjs";
+
 let globalAudio = null;
+let storageKey = PLAYER_STORAGE_KEY;
+let restored = false;
+let lastProgressSave = 0;
+let storageWarningShown = false;
+let removeKeyboardListener = null;
+function persistPlayer() {
+	if (!restored) return;
+	try {
+		if (savePlayer(window.localStorage, globalState, storageKey)) return;
+	} catch {}
+	if (!storageWarningShown) {
+		storageWarningShown = true;
+		showToast("播放数据保存失败，请检查浏览器存储空间或权限", 5000);
+	}
+}
+function resumePlayback() {
+	if (!globalState.currentSong) return;
+	if (!globalAudio?.getAttribute("src")) {
+		return playSong(globalState.currentSong, false, globalState.currentTime);
+	}
+	return globalAudio.play().catch(() => showToast("播放失败，请重试"));
+}
 let globalState = {
 	currentSong: null,
 	isPlaying: false,
@@ -11,6 +35,8 @@ let globalState = {
 	duration: 0,
 	playMode: "loop", // loop | random | single
 	queue: [],
+	history: [],
+	searchKeyword: "",
 	favorites: [],
 	searchResults: [],
 	source: "wy",
@@ -22,6 +48,21 @@ let globalState = {
 	activeViewTab: "search", // search | top | favorites | queue
 	topChartType: "hot", // hot | soar | new
 };
+
+const transientKeys = new Set(["isPlaying", "lyrics", "currentLrcIndex", "activeUserApi"]);
+globalState = new Proxy(globalState, {
+	set(target, key, value) {
+		target[key] = value;
+		if (!transientKeys.has(key)) {
+			if (key !== "currentTime" && key !== "duration") persistPlayer();
+			else if (Date.now() - lastProgressSave >= 3000) {
+				lastProgressSave = Date.now();
+				persistPlayer();
+			}
+		}
+		return true;
+	},
+});
 
 // ==============================
 // 轻量无阻断 Toast 提示系统 (不弹 alert)
@@ -152,6 +193,7 @@ function ensureGlobalAudio(apiBase) {
 
 		globalAudio.addEventListener("pause", () => {
 			globalState.isPlaying = false;
+			persistPlayer();
 			updatePlayButtonState();
 			updateMediaSession();
 		});
@@ -293,9 +335,11 @@ function updateMediaSession() {
 	}
 }
 
-async function playSong(song, addToQueue = true) {
+async function playSong(song, addToQueue = true, resumeTime = 0) {
 	const audio = ensureGlobalAudio(apiBaseUrl);
 	globalState.currentSong = song;
+	globalState.currentTime = resumeTime;
+	globalState.duration = song.durationSec || 0;
 
 	if (addToQueue) {
 		const exists = globalState.queue.find((item) => item.id === song.id && item.source === song.source);
@@ -334,7 +378,24 @@ async function playSong(song, addToQueue = true) {
 			song._realPlayUrl = urlRes.url;
 			const streamUrl = `${apiBaseUrl}/stream?url=${encodeURIComponent(urlRes.url)}&source=${song.source}`;
 			audio.src = streamUrl;
+			if (resumeTime > 0) {
+				audio.addEventListener(
+					"loadedmetadata",
+					() => {
+						audio.currentTime = Math.min(
+							resumeTime,
+							Number.isFinite(audio.duration) ? Math.max(0, audio.duration - 0.1) : resumeTime,
+						);
+					},
+					{ once: true },
+				);
+			}
 			await audio.play();
+			globalState.history = [
+				song,
+				...globalState.history.filter((s) => s.id !== song.id || s.source !== song.source),
+			].slice(0, 500);
+			renderCurrentTable();
 		} else {
 			showToast(`无法获取播放链接: ${song.name}`);
 		}
@@ -351,7 +412,7 @@ function playNextSong() {
 	if (globalState.playMode === "random") {
 		idx = Math.floor(Math.random() * globalState.queue.length);
 	} else if (globalState.playMode === "single") {
-		if (globalAudio) {
+		if (globalAudio?.getAttribute("src")) {
 			globalAudio.currentTime = 0;
 			globalAudio.play();
 			return;
@@ -430,6 +491,8 @@ function getCurrentViewSongs() {
 		return globalState.topChartSongs || [];
 	} else if (globalState.activeViewTab === "favorites") {
 		return globalState.favorites || [];
+	} else if (globalState.activeViewTab === "history") {
+		return globalState.history;
 	} else if (globalState.activeViewTab === "queue") {
 		return globalState.queue || [];
 	}
@@ -550,6 +613,7 @@ function updateUserApiBadge() {
 }
 
 function updateQueueBadge() {
+	persistPlayer();
 	if (!activeRootEl) return;
 	const queueNavTab = activeRootEl.querySelector(".lx-nav-tab[data-tab='queue']");
 	if (queueNavTab) {
@@ -558,6 +622,7 @@ function updateQueueBadge() {
 }
 
 function renderCurrentTable() {
+	persistPlayer();
 	if (!activeRootEl) return;
 	const tbody = activeRootEl.querySelector("#lx-song-table-body");
 	const listCountEl = activeRootEl.querySelector("#lx-list-count");
@@ -577,6 +642,7 @@ function renderCurrentTable() {
 			top: "正在加载排行榜...",
 			favorites: "暂无收藏歌曲，点击歌曲行 ❤️ 即可收藏",
 			queue: "播放队列为空，点击歌曲直接入队",
+			history: "暂无播放记录，成功播放的歌曲会自动保存在这里",
 		};
 		tbody.innerHTML = `<tr><td colspan="6" style="text-align: center; color: var(--text-faint, #7e8798); padding: 40px;">${tips[globalState.activeViewTab] || "无数据"}</td></tr>`;
 		return;
@@ -594,30 +660,39 @@ function renderCurrentTable() {
 		if (isCur) tr.classList.add("playing-row");
 
 		tr.innerHTML = `
-			<td style="width: 50px;">
-				${isCur ? `<span class="lx-wave-icon">🔊</span>` : idx + 1}
+			<td style="width: 44px; text-align: center;">
+				${
+					isCur
+						? `<div class="lx-spectrum-anim">
+								<div class="lx-spectrum-bar"></div>
+								<div class="lx-spectrum-bar"></div>
+								<div class="lx-spectrum-bar"></div>
+						   </div>`
+						: `<span class="lx-row-idx">${idx + 1}</span>`
+				}
 			</td>
 			<td>
 				<div class="lx-song-name">
 					<button class="lx-fav-btn ${isFav ? "active" : ""}" title="${isFav ? "取消收藏" : "收藏"}">
 						${isFav ? "❤️" : "🤍"}
 					</button>
-					<span style="${isCur ? "color: var(--accent); font-weight: 700;" : ""}">${song.name}</span>
+					<span class="lx-song-title-text" style="${isCur ? "color: var(--accent, #60a5fa); font-weight: 700;" : ""}" title="${song.name}">${song.name}</span>
+					<span class="lx-sq-badge">SQ</span>
 				</div>
 			</td>
-			<td class="lx-singer">${song.singer}</td>
-			<td class="lx-singer">${song.album || "-"}</td>
-			<td class="lx-singer">${song.duration}</td>
+			<td class="lx-singer" title="${song.singer}">${song.singer}</td>
+			<td class="lx-album" title="${song.album || "-"}">${song.album || "-"}</td>
+			<td class="lx-duration">${song.duration}</td>
 			<td style="text-align: right;">
 				<div class="lx-table-actions" style="justify-content: flex-end;">
 					<button class="lx-icon-btn btn-play" title="立即播放">
-						<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+						<svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>
 					</button>
 					<button class="lx-icon-btn btn-add" title="直接加入播放队列(不弹窗)">
-						<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+						<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
 					</button>
 					<button class="lx-icon-btn btn-down" title="下载音频">
-						<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+						<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
 					</button>
 				</div>
 			</td>
@@ -639,206 +714,308 @@ function buildStyles() {
 			flex-direction: column;
 			height: 100%;
 			min-height: 100%;
-			background: var(--bg, #111216);
-			color: var(--text, #eceff4);
-			font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+			background: var(--bg, #0b0d14);
+			color: var(--text, #f8fafc);
+			font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", sans-serif;
 			user-select: none;
 			overflow: hidden;
 			box-sizing: border-box;
 			position: relative;
 		}
 
+		/* 精细暗色原生滚动条 */
+		.lx-wrap *::-webkit-scrollbar {
+			width: 6px;
+			height: 6px;
+		}
+		.lx-wrap *::-webkit-scrollbar-track {
+			background: transparent;
+		}
+		.lx-wrap *::-webkit-scrollbar-thumb {
+			background: rgba(255, 255, 255, 0.14);
+			border-radius: 4px;
+		}
+		.lx-wrap *::-webkit-scrollbar-thumb:hover {
+			background: rgba(255, 255, 255, 0.28);
+		}
+
+		/* 弥散背景动态流光 (方案 A: Liquid Glass) */
+		.lx-ambient-glow {
+			position: absolute;
+			top: 0;
+			left: 0;
+			width: 100%;
+			height: 100%;
+			pointer-events: none;
+			overflow: hidden;
+			z-index: 0;
+		}
+		.lx-glow-orb-1 {
+			position: absolute;
+			top: -10%;
+			right: -10%;
+			width: 480px;
+			height: 480px;
+			border-radius: 50%;
+			background: radial-gradient(circle, rgba(59, 130, 246, 0.2) 0%, rgba(139, 92, 246, 0.08) 50%, transparent 75%);
+			filter: blur(55px);
+			animation: lxFloatGlow 16s ease-in-out infinite alternate;
+		}
+		.lx-glow-orb-2 {
+			position: absolute;
+			bottom: -15%;
+			left: -5%;
+			width: 420px;
+			height: 420px;
+			border-radius: 50%;
+			background: radial-gradient(circle, rgba(236, 72, 153, 0.12) 0%, rgba(99, 102, 241, 0.06) 50%, transparent 75%);
+			filter: blur(60px);
+			animation: lxFloatGlow 20s ease-in-out infinite alternate-reverse;
+		}
+		@keyframes lxFloatGlow {
+			0% { transform: translate(0, 0) scale(1); }
+			100% { transform: translate(-30px, 30px) scale(1.08); }
+		}
+
 		/* 顶部操作条 */
 		.lx-header {
+			position: relative;
+			z-index: 10;
 			display: flex;
 			align-items: center;
 			justify-content: space-between;
 			padding: 10px 20px;
-			background: var(--card, #1a1c23);
-			border-bottom: 1px solid var(--border, #2e3440);
+			background: var(--card, rgba(20, 24, 38, 0.72));
+			backdrop-filter: blur(24px);
+			-webkit-backdrop-filter: blur(24px);
+			border-bottom: 1px solid var(--border, rgba(255, 255, 255, 0.08));
 			flex-shrink: 0;
-			gap: 16px;
-			flex-wrap: wrap;
+			gap: 14px;
 		}
 		.lx-brand {
 			display: flex;
 			align-items: center;
 			gap: 8px;
 			font-weight: 700;
-			font-size: 16px;
-			color: var(--accent, #5e81ac);
+			font-size: 15px;
+			color: #ffffff;
+			letter-spacing: -0.01em;
+			flex-shrink: 0;
+		}
+		.lx-brand-icon {
+			width: 26px;
+			height: 26px;
+			border-radius: 7px;
+			background: linear-gradient(135deg, var(--accent, #3b82f6), #8b5cf6);
+			display: flex;
+			align-items: center;
+			justify-content: center;
+			box-shadow: 0 4px 10px rgba(59, 130, 246, 0.4);
 		}
 		.lx-nav-tabs {
 			display: flex;
-			background: var(--bg, #111216);
+			background: rgba(0, 0, 0, 0.35);
 			border-radius: 8px;
 			padding: 3px;
 			gap: 2px;
+			border: 1px solid rgba(255, 255, 255, 0.05);
+			flex-shrink: 0;
 		}
 		.lx-nav-tab {
 			border: none;
 			background: transparent;
-			color: var(--text-faint, #7e8798);
-			padding: 6px 14px;
-			font-size: 13px;
+			color: var(--text-faint, #94a3b8);
+			padding: 5px 12px;
+			font-size: 12px;
+			font-weight: 500;
 			border-radius: 6px;
 			cursor: pointer;
-			transition: all 0.2s;
+			transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
 			display: flex;
 			align-items: center;
-			gap: 6px;
+			gap: 5px;
+			white-space: nowrap;
+		}
+		.lx-nav-tab:hover {
+			color: #ffffff;
 		}
 		.lx-nav-tab.active {
-			background: var(--accent, #5e81ac);
-			color: var(--accent-contrast, #ffffff);
+			background: rgba(255, 255, 255, 0.14);
+			color: #ffffff;
 			font-weight: 600;
+			box-shadow: 0 2px 6px rgba(0, 0, 0, 0.25);
 		}
 		.lx-badge-count {
-			background: rgba(255,255,255,0.2);
+			background: rgba(255, 255, 255, 0.18);
 			color: inherit;
-			font-size: 11px;
-			padding: 1px 6px;
+			font-size: 10px;
+			padding: 1px 5px;
 			border-radius: 10px;
 		}
 		.lx-search-box {
 			display: flex;
 			align-items: center;
-			background: var(--bg, #111216);
-			border: 1px solid var(--border, #2e3440);
+			background: rgba(0, 0, 0, 0.3);
+			border: 1px solid var(--border, rgba(255, 255, 255, 0.08));
 			border-radius: 8px;
 			padding: 0 10px;
 			flex: 1;
-			max-width: 380px;
-			min-width: 200px;
+			max-width: 280px;
+			min-width: 150px;
+			transition: all 0.2s;
+		}
+		.lx-search-box:focus-within {
+			border-color: var(--accent, #3b82f6);
+			box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.35);
+			background: rgba(0, 0, 0, 0.45);
 		}
 		.lx-search-input {
 			flex: 1;
 			background: transparent;
 			border: none;
-			color: var(--text, #eceff4);
-			font-size: 13px;
-			padding: 8px 6px;
+			color: #ffffff;
+			font-size: 12px;
+			padding: 6px 4px;
 			outline: none;
 		}
 		.lx-search-btn {
 			background: transparent;
 			border: none;
-			color: var(--text-faint, #7e8798);
+			color: var(--text-faint, #94a3b8);
 			cursor: pointer;
 			display: flex;
 			align-items: center;
-			padding: 4px;
+			padding: 3px;
 		}
 		.lx-search-btn:hover {
-			color: var(--accent, #5e81ac);
+			color: var(--accent, #3b82f6);
 		}
 		.lx-action-btns {
 			display: flex;
 			align-items: center;
 			gap: 8px;
+			flex-shrink: 0;
 		}
 		.lx-api-badge {
 			font-size: 11px;
-			padding: 4px 8px;
-			border-radius: 4px;
-			background: rgba(94, 129, 172, 0.15);
-			color: var(--accent, #5e81ac);
-			border: 1px solid rgba(94, 129, 172, 0.3);
+			padding: 3px 8px;
+			border-radius: 12px;
+			background: rgba(59, 130, 246, 0.15);
+			color: var(--accent, #60a5fa);
+			border: 1px solid rgba(59, 130, 246, 0.3);
 			display: none;
 			white-space: nowrap;
 		}
 		.lx-btn {
-			border: 1px solid var(--border, #2e3440);
-			background: var(--bg, #111216);
-			color: var(--text, #eceff4);
+			border: 1px solid var(--border, rgba(255, 255, 255, 0.1));
+			background: rgba(255, 255, 255, 0.05);
+			color: var(--text, #f8fafc);
 			border-radius: 6px;
-			padding: 6px 12px;
-			font-size: 12px;
+			padding: 5px 11px;
+			font-size: 11.5px;
+			font-weight: 500;
 			cursor: pointer;
 			display: flex;
 			align-items: center;
-			gap: 6px;
+			gap: 5px;
 			transition: all 0.2s;
+			white-space: nowrap;
+			backdrop-filter: blur(8px);
 		}
 		.lx-btn:hover {
-			background: var(--border, #2e3440);
+			background: rgba(255, 255, 255, 0.1);
+			border-color: rgba(255, 255, 255, 0.18);
 		}
 		.lx-btn-primary {
 			border: none;
-			background: var(--accent, #5e81ac);
+			background: linear-gradient(135deg, var(--accent, #3b82f6), #6366f1);
 			color: var(--accent-contrast, #ffffff);
-			border-radius: 6px;
+			border-radius: 16px;
 			padding: 6px 14px;
-			font-size: 12.5px;
+			font-size: 12px;
 			font-weight: 600;
 			cursor: pointer;
 			display: flex;
 			align-items: center;
 			gap: 6px;
-			transition: transform 0.15s, opacity 0.15s;
+			box-shadow: 0 3px 12px rgba(59, 130, 246, 0.35);
+			transition: transform 0.15s, box-shadow 0.15s;
+			white-space: nowrap;
 		}
 		.lx-btn-primary:hover {
 			transform: scale(1.02);
-			opacity: 0.95;
 		}
 
 		/* 次级工具栏 (音源切换/榜单切换) */
 		.lx-sub-bar {
+			position: relative;
+			z-index: 5;
 			display: flex;
 			align-items: center;
 			justify-content: space-between;
-			padding: 8px 20px;
-			background: rgba(255,255,255,0.02);
-			border-bottom: 1px solid var(--border, #2e3440);
-			font-size: 12px;
+			padding: 7px 20px;
+			background: rgba(14, 18, 28, 0.5);
+			backdrop-filter: blur(12px);
+			border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+			font-size: 11.5px;
 			flex-shrink: 0;
 		}
 		.lx-pill-group {
 			display: flex;
+			align-items: center;
 			gap: 6px;
 		}
 		.lx-pill-btn {
-			border: 1px solid var(--border, #2e3440);
-			background: transparent;
-			color: var(--text-faint, #7e8798);
+			border: 1px solid var(--border, rgba(255, 255, 255, 0.08));
+			background: rgba(255, 255, 255, 0.03);
+			color: var(--text-faint, #94a3b8);
 			border-radius: 12px;
-			padding: 3px 10px;
-			font-size: 12px;
+			padding: 2px 10px;
+			font-size: 11px;
 			cursor: pointer;
 			transition: all 0.2s;
+			white-space: nowrap;
+		}
+		.lx-pill-btn:hover {
+			color: #ffffff;
+			background: rgba(255, 255, 255, 0.08);
 		}
 		.lx-pill-btn.active {
-			background: var(--accent, #5e81ac);
+			background: linear-gradient(135deg, var(--accent, #3b82f6), #2563eb);
 			color: var(--accent-contrast, #ffffff);
-			border-color: var(--accent, #5e81ac);
+			border-color: transparent;
+			font-weight: 600;
+			box-shadow: 0 2px 6px rgba(37, 99, 235, 0.35);
 		}
 
-		/* 列表操作顶栏 (一键播放全部) */
+		/* 列表操作顶栏 */
 		.lx-list-action-bar {
 			display: flex;
 			align-items: center;
 			justify-content: space-between;
-			padding: 10px 0 12px 0;
-			border-bottom: 1px solid rgba(255,255,255,0.05);
+			padding-bottom: 8px;
 			margin-bottom: 6px;
+			border-bottom: 1px solid rgba(255, 255, 255, 0.04);
 		}
 		.lx-list-left-actions {
 			display: flex;
 			align-items: center;
-			gap: 10px;
+			gap: 8px;
 		}
 		.lx-list-count {
-			font-size: 12px;
-			color: var(--text-faint, #7e8798);
+			font-size: 11.5px;
+			color: var(--text-faint, #64748b);
+			white-space: nowrap;
 		}
 
 		/* 主体内容布局 */
 		.lx-main {
+			position: relative;
+			z-index: 5;
 			display: flex;
 			flex: 1;
 			min-height: 0;
 			overflow: hidden;
-			position: relative;
 		}
 		.lx-song-list-wrap {
 			flex: 1;
@@ -847,14 +1024,16 @@ function buildStyles() {
 			min-width: 0;
 		}
 		.lx-lyrics-panel {
-			width: 380px;
-			max-width: 38%;
-			background: var(--card, #1a1c23);
-			border-left: 1px solid var(--border, #2e3440);
+			width: 290px;
+			max-width: 34%;
+			background: var(--card, rgba(20, 24, 38, 0.72));
+			backdrop-filter: blur(28px);
+			-webkit-backdrop-filter: blur(28px);
+			border-left: 1px solid var(--border, rgba(255, 255, 255, 0.08));
 			display: flex;
 			flex-direction: column;
 			align-items: center;
-			padding: 24px 16px;
+			padding: 18px 16px;
 			overflow: hidden;
 			flex-shrink: 0;
 		}
@@ -864,44 +1043,85 @@ function buildStyles() {
 			}
 		}
 
-		/* 歌曲表格 */
+		/* 歌曲表格 - 悬浮圆角卡片化，定宽防纵向折行 */
 		.lx-table {
 			width: 100%;
-			border-collapse: collapse;
-			font-size: 13px;
+			table-layout: fixed;
+			border-collapse: separate;
+			border-spacing: 0 4px;
+			font-size: 12px;
 		}
 		.lx-table th {
 			text-align: left;
-			padding: 10px 12px;
-			color: var(--text-faint, #7e8798);
+			padding: 6px 10px;
+			color: var(--text-faint, #64748b);
 			font-weight: 500;
-			border-bottom: 1px solid var(--border, #2e3440);
+			font-size: 11px;
+			border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+			white-space: nowrap;
+		}
+		.lx-table tr {
+			border-radius: 6px;
+			cursor: pointer;
+			transition: all 0.15s cubic-bezier(0.16, 1, 0.3, 1);
 		}
 		.lx-table td {
-			padding: 10px 12px;
-			border-bottom: 1px solid rgba(255,255,255,0.03);
-			color: var(--text, #eceff4);
+			padding: 8px 10px;
+			color: var(--text, #f8fafc);
+			background: rgba(255, 255, 255, 0.015);
+			white-space: nowrap;
+			overflow: hidden;
+			text-overflow: ellipsis;
+			vertical-align: middle;
 		}
-		.lx-table tr:hover {
-			background: rgba(255,255,255,0.04);
+		.lx-table tr td:first-child {
+			border-top-left-radius: 6px;
+			border-bottom-left-radius: 6px;
 		}
-		.lx-table tr.playing-row {
-			background: rgba(94, 129, 172, 0.08);
+		.lx-table tr td:last-child {
+			border-top-right-radius: 6px;
+			border-bottom-right-radius: 6px;
+		}
+		.lx-table tr:hover td {
+			background: rgba(255, 255, 255, 0.07);
+		}
+		.lx-table tr.playing-row td {
+			background: rgba(59, 130, 246, 0.14);
+		}
+		.lx-row-idx {
+			color: var(--text-faint, #64748b);
 		}
 		.lx-song-name {
 			font-weight: 600;
-			color: var(--text, #eceff4);
+			color: #ffffff;
 			display: flex;
 			align-items: center;
 			gap: 8px;
+			overflow: hidden;
+		}
+		.lx-song-title-text {
+			overflow: hidden;
+			text-overflow: ellipsis;
+			white-space: nowrap;
+		}
+		.lx-sq-badge {
+			font-size: 9.5px;
+			padding: 1px 4px;
+			border-radius: 3px;
+			background: rgba(245, 158, 11, 0.15);
+			color: #fbbf24;
+			border: 1px solid rgba(245, 158, 11, 0.3);
+			font-weight: 600;
+			flex-shrink: 0;
 		}
 		.lx-fav-btn {
 			background: transparent;
 			border: none;
 			cursor: pointer;
 			padding: 2px;
-			font-size: 14px;
+			font-size: 13px;
 			transition: transform 0.15s;
+			flex-shrink: 0;
 		}
 		.lx-fav-btn:hover {
 			transform: scale(1.2);
@@ -909,40 +1129,86 @@ function buildStyles() {
 		.lx-singer {
 			color: var(--text-faint, #94a3b8);
 		}
+		.lx-album {
+			color: var(--text-faint, #64748b);
+		}
+		.lx-duration {
+			color: var(--text-faint, #64748b);
+			font-variant-numeric: tabular-nums;
+		}
 		.lx-table-actions {
 			display: flex;
-			gap: 6px;
+			gap: 4px;
+			justify-content: flex-end;
 		}
 		.lx-icon-btn {
 			background: transparent;
 			border: none;
-			color: var(--text-faint, #7e8798);
+			color: var(--text-faint, #94a3b8);
 			cursor: pointer;
-			padding: 5px;
+			padding: 4px;
 			border-radius: 4px;
 			display: flex;
 			align-items: center;
 			transition: all 0.2s;
 		}
 		.lx-icon-btn:hover {
-			color: var(--accent, #5e81ac);
-			background: rgba(255,255,255,0.08);
+			color: #ffffff;
+			background: rgba(255, 255, 255, 0.1);
 		}
 
-		/* 歌词与唱片 */
-		.lx-cover-disc {
-			width: 150px;
-			height: 150px;
+		/* 正在播放的 3 段动态音频跳动频谱柱 (Equalizer) */
+		.lx-spectrum-anim {
+			display: inline-flex;
+			align-items: flex-end;
+			gap: 2px;
+			height: 12px;
+			width: 12px;
+			flex-shrink: 0;
+		}
+		.lx-spectrum-bar {
+			width: 2.5px;
+			background: var(--accent, #60a5fa);
+			border-radius: 1px;
+			animation: lxEqWave 0.9s ease-in-out infinite alternate;
+		}
+		.lx-spectrum-bar:nth-child(1) { height: 40%; animation-duration: 0.6s; }
+		.lx-spectrum-bar:nth-child(2) { height: 95%; animation-duration: 0.8s; }
+		.lx-spectrum-bar:nth-child(3) { height: 65%; animation-duration: 0.5s; }
+		@keyframes lxEqWave {
+			0% { height: 20%; }
+			100% { height: 100%; }
+		}
+
+		/* 歌词与唱片右面板 */
+		.lx-cover-ambient-wrap {
+			position: relative;
+			margin-bottom: 14px;
+			display: flex;
+			justify-content: center;
+		}
+		.lx-cover-ambient-glow {
+			position: absolute;
+			width: 120px;
+			height: 120px;
 			border-radius: 50%;
-			background: #000;
-			border: 6px solid #222;
-			box-shadow: 0 10px 25px rgba(0,0,0,0.5);
+			background: radial-gradient(circle, rgba(59, 130, 246, 0.45) 0%, transparent 70%);
+			filter: blur(22px);
+			z-index: 1;
+		}
+		.lx-cover-disc {
+			position: relative;
+			z-index: 2;
+			width: 120px;
+			height: 120px;
+			border-radius: 10px;
+			background: #0f121a;
+			box-shadow: 0 10px 24px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(255, 255, 255, 0.1);
 			overflow: hidden;
 			display: flex;
 			align-items: center;
 			justify-content: center;
-			margin-bottom: 16px;
-			animation: rotateDisc 20s linear infinite;
+			animation: lxRotateDisc 18s linear infinite;
 			animation-play-state: paused;
 		}
 		.lx-cover-disc.playing {
@@ -953,7 +1219,7 @@ function buildStyles() {
 			height: 100%;
 			object-fit: cover;
 		}
-		@keyframes rotateDisc {
+		@keyframes lxRotateDisc {
 			from { transform: rotate(0deg); }
 			to { transform: rotate(360deg); }
 		}
@@ -962,77 +1228,90 @@ function buildStyles() {
 			width: 100%;
 			overflow-y: auto;
 			text-align: center;
-			padding: 20px 0;
-			mask-image: linear-gradient(to bottom, transparent, black 15%, black 85%, transparent);
-			-webkit-mask-image: linear-gradient(to bottom, transparent, black 15%, black 85%, transparent);
+			display: flex;
+			flex-direction: column;
+			align-items: center;
+			gap: 12px;
+			padding: 16px 0;
+			mask-image: linear-gradient(to bottom, transparent 0%, black 18%, black 82%, transparent 100%);
+			-webkit-mask-image: linear-gradient(to bottom, transparent 0%, black 18%, black 82%, transparent 100%);
 		}
 		.lx-lrc-line {
-			padding: 8px 16px;
-			color: var(--text-faint, #64748b);
-			font-size: 13.5px;
+			color: rgba(255, 255, 255, 0.32);
+			font-size: 13px;
+			font-weight: 500;
 			cursor: pointer;
-			transition: all 0.3s;
-			line-height: 1.5;
-		}
-		.lx-lrc-line.active {
-			color: var(--accent, #5e81ac);
-			font-weight: 700;
-			font-size: 15.5px;
-			transform: scale(1.05);
+			transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+			line-height: 1.4;
 		}
 		.lx-lrc-line:hover {
-			color: var(--text, #ffffff);
+			color: rgba(255, 255, 255, 0.7);
+		}
+		.lx-lrc-line.active {
+			color: #ffffff;
+			font-weight: 700;
+			font-size: 15.5px;
+			transform: scale(1.06);
+			text-shadow: 0 2px 14px rgba(96, 165, 250, 0.5);
 		}
 
 		/* 底部播放条 */
 		.lx-footer {
+			position: relative;
+			z-index: 10;
 			display: flex;
 			align-items: center;
 			justify-content: space-between;
-			padding: 10px 24px;
-			background: var(--card, #1a1c23);
-			border-top: 1px solid var(--border, #2e3440);
+			padding: 10px 20px;
+			background: var(--card, rgba(20, 24, 38, 0.72));
+			backdrop-filter: blur(28px);
+			-webkit-backdrop-filter: blur(28px);
+			border-top: 1px solid var(--border, rgba(255, 255, 255, 0.08));
 			flex-shrink: 0;
-			gap: 16px;
-			z-index: 10;
+			gap: 14px;
 		}
 		.lx-footer-left {
 			display: flex;
 			align-items: center;
-			gap: 12px;
-			width: 240px;
-			min-width: 180px;
+			gap: 10px;
+			width: 220px;
+			min-width: 160px;
+			overflow: hidden;
 		}
 		.lx-bar-cover {
-			width: 44px;
-			height: 44px;
+			width: 40px;
+			height: 40px;
 			border-radius: 6px;
 			object-fit: cover;
-			background: #2e3440;
+			background: #1e293b;
+			box-shadow: 0 3px 8px rgba(0, 0, 0, 0.3);
+			flex-shrink: 0;
 		}
 		.lx-bar-info {
 			display: flex;
 			flex-direction: column;
 			gap: 2px;
 			min-width: 0;
+			overflow: hidden;
 		}
 		.lx-bar-song-name {
-			font-size: 13px;
+			font-size: 12.5px;
 			font-weight: 600;
 			white-space: nowrap;
 			overflow: hidden;
 			text-overflow: ellipsis;
+			color: #ffffff;
 		}
 		.lx-bar-singer {
 			font-size: 11px;
-			color: var(--text-faint, #7e8798);
+			color: var(--text-faint, #94a3b8);
 			white-space: nowrap;
 			overflow: hidden;
 			text-overflow: ellipsis;
 		}
 		.lx-footer-center {
 			flex: 1;
-			max-width: 600px;
+			max-width: 500px;
 			display: flex;
 			flex-direction: column;
 			align-items: center;
@@ -1041,19 +1320,20 @@ function buildStyles() {
 		.lx-ctrl-btns {
 			display: flex;
 			align-items: center;
-			gap: 14px;
+			gap: 16px;
 		}
 		.lx-play-main-btn {
 			width: 36px;
 			height: 36px;
 			border-radius: 50%;
-			background: var(--accent, #5e81ac);
-			color: var(--accent-contrast, #ffffff);
+			background: #ffffff;
+			color: #0f172a;
 			border: none;
 			display: flex;
 			align-items: center;
 			justify-content: center;
 			cursor: pointer;
+			box-shadow: 0 3px 12px rgba(255, 255, 255, 0.25);
 			transition: transform 0.15s;
 		}
 		.lx-play-main-btn:hover {
@@ -1064,16 +1344,21 @@ function buildStyles() {
 			display: flex;
 			align-items: center;
 			gap: 10px;
-			font-size: 11px;
-			color: var(--text-faint, #7e8798);
+			font-size: 10.5px;
+			color: var(--text-faint, #64748b);
+			font-variant-numeric: tabular-nums;
 		}
 		.lx-progress-track {
 			flex: 1;
 			height: 4px;
-			background: rgba(255,255,255,0.1);
-			border-radius: 2px;
+			background: rgba(255, 255, 255, 0.12);
+			border-radius: 3px;
 			position: relative;
 			cursor: pointer;
+			transition: height 0.15s;
+		}
+		.lx-progress-track:hover {
+			height: 6px;
 		}
 		.lx-progress-inner {
 			position: absolute;
@@ -1081,48 +1366,49 @@ function buildStyles() {
 			top: 0;
 			height: 100%;
 			width: 0%;
-			background: var(--accent, #5e81ac);
-			border-radius: 2px;
+			background: linear-gradient(90deg, var(--accent, #3b82f6), #818cf8);
+			border-radius: 3px;
 		}
 		.lx-footer-right {
 			display: flex;
 			align-items: center;
 			gap: 12px;
+			width: 220px;
 			justify-content: flex-end;
 		}
 		.lx-vol-slider {
-			width: 70px;
-			accent-color: var(--accent, #5e81ac);
+			width: 65px;
+			accent-color: var(--accent, #3b82f6);
 			cursor: pointer;
 		}
 		.lx-quality-select {
-			background: var(--bg, #111216);
-			border: 1px solid var(--border, #2e3440);
-			color: var(--text, #eceff4);
+			background: rgba(255, 255, 255, 0.06);
+			border: 1px solid var(--border, rgba(255, 255, 255, 0.1));
+			color: var(--text, #f8fafc);
 			border-radius: 4px;
 			padding: 2px 6px;
-			font-size: 11px;
+			font-size: 10.5px;
 			outline: none;
 		}
 
 		/* 轻量非阻断 Toast 提示框 */
 		.lx-toast {
 			position: absolute;
-			bottom: 80px;
+			bottom: 75px;
 			left: 50%;
 			transform: translateX(-50%) translateY(20px);
-			background: rgba(20, 22, 29, 0.94);
-			border: 1px solid var(--border, #2e3440);
-			color: var(--text, #eceff4);
-			padding: 8px 18px;
+			background: rgba(20, 24, 38, 0.94);
+			border: 1px solid var(--border, rgba(255, 255, 255, 0.1));
+			color: var(--text, #f8fafc);
+			padding: 7px 16px;
 			border-radius: 20px;
-			font-size: 12.5px;
+			font-size: 12px;
 			box-shadow: 0 8px 24px rgba(0,0,0,0.4);
 			pointer-events: none;
 			opacity: 0;
 			transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
 			z-index: 99999;
-			backdrop-filter: blur(8px);
+			backdrop-filter: blur(10px);
 		}
 		.lx-toast.show {
 			opacity: 1;
@@ -1136,38 +1422,44 @@ function buildStyles() {
 			left: 0;
 			width: 100%;
 			height: 100%;
-			background: rgba(0,0,0,0.6);
+			background: rgba(0,0,0,0.65);
+			backdrop-filter: blur(4px);
 			display: none;
 			align-items: center;
 			justify-content: center;
 			z-index: 9999;
 		}
 		.lx-modal {
-			background: var(--card, #1a1c23);
-			border: 1px solid var(--border, #2e3440);
-			border-radius: 10px;
+			background: var(--card, #141826);
+			border: 1px solid var(--border, rgba(255, 255, 255, 0.1));
+			border-radius: 12px;
 			width: 480px;
 			max-width: 90%;
 			padding: 20px;
 			display: flex;
 			flex-direction: column;
 			gap: 14px;
+			box-shadow: 0 20px 40px rgba(0,0,0,0.6);
 		}
 		.lx-modal-title {
-			font-size: 16px;
+			font-size: 15px;
 			font-weight: 700;
 		}
 		.lx-textarea {
 			width: 100%;
 			height: 140px;
-			background: var(--bg, #111216);
-			border: 1px solid var(--border, #2e3440);
-			color: var(--text, #eceff4);
+			background: rgba(0, 0, 0, 0.3);
+			border: 1px solid var(--border, rgba(255, 255, 255, 0.1));
+			color: var(--text, #f8fafc);
 			border-radius: 6px;
 			padding: 8px;
 			font-family: monospace;
 			font-size: 12px;
 			resize: vertical;
+			outline: none;
+		}
+		.lx-textarea:focus {
+			border-color: var(--accent, #3b82f6);
 		}
 	`;
 }
@@ -1176,10 +1468,22 @@ function renderApp(el) {
 	el.innerHTML = `
 		<style>${buildStyles()}</style>
 		<div class="lx-wrap">
+			<!-- 弥散背景动态流光 (方案 A: Liquid Glass) -->
+			<div class="lx-ambient-glow">
+				<div class="lx-glow-orb-1"></div>
+				<div class="lx-glow-orb-2"></div>
+			</div>
+
 			<!-- 头部主导航 -->
 			<div class="lx-header">
 				<div class="lx-brand">
-					<span>🎵</span>
+					<div class="lx-brand-icon">
+						<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+							<path d="M9 18V5l12-2v13"></path>
+							<circle cx="6" cy="18" r="3"></circle>
+							<circle cx="18" cy="16" r="3"></circle>
+						</svg>
+					</div>
 					<span>洛雪音乐</span>
 				</div>
 
@@ -1188,12 +1492,13 @@ function renderApp(el) {
 					<button class="lx-nav-tab" data-tab="top">🔥 排行榜</button>
 					<button class="lx-nav-tab" data-tab="favorites">❤️ 我的收藏</button>
 					<button class="lx-nav-tab" data-tab="queue">📋 播放队列</button>
+					<button class="lx-nav-tab" data-tab="history">🕘 播放记录</button>
 				</div>
 
 				<div class="lx-search-box" id="lx-search-box-wrap">
 					<input type="text" id="lx-search-input" class="lx-search-input" placeholder="搜索歌曲、歌手、专辑..." />
 					<button id="lx-search-btn" class="lx-search-btn" title="搜索">
-						<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+						<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
 					</button>
 				</div>
 
@@ -1209,7 +1514,7 @@ function renderApp(el) {
 			<!-- 次级栏 (音源与榜单分类) -->
 			<div class="lx-sub-bar" id="lx-sub-bar">
 				<div class="lx-pill-group" id="lx-source-pills">
-					<span style="color: var(--text-faint); margin-right: 4px;">音源平台:</span>
+					<span style="color: var(--text-faint, #64748b); margin-right: 4px;">音源平台:</span>
 					<button class="lx-pill-btn active" data-src="wy">网易云</button>
 					<button class="lx-pill-btn" data-src="kw">酷我</button>
 					<button class="lx-pill-btn" data-src="kg">酷狗</button>
@@ -1217,13 +1522,13 @@ function renderApp(el) {
 				</div>
 
 				<div class="lx-pill-group" id="lx-top-pills" style="display: none;">
-					<span style="color: var(--text-faint); margin-right: 4px;">榜单分类:</span>
+					<span style="color: var(--text-faint, #64748b); margin-right: 4px;">榜单分类:</span>
 					<button class="lx-pill-btn active" data-chart="hot">🔥 热歌榜</button>
 					<button class="lx-pill-btn" data-chart="soar">🚀 飙升榜</button>
 					<button class="lx-pill-btn" data-chart="new">🌟 新歌榜</button>
 				</div>
 
-				<div style="color: var(--text-faint); font-size: 11px;">
+				<div style="color: var(--text-faint, #64748b); font-size: 11px;">
 					快捷键: 空格(播放/暂停) · 方向键(快进/音量)
 				</div>
 			</div>
@@ -1235,7 +1540,7 @@ function renderApp(el) {
 					<div class="lx-list-action-bar">
 						<div class="lx-list-left-actions">
 							<button class="lx-btn-primary" id="lx-play-all-btn">
-								<svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+								<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>
 								<span>播放全部</span>
 							</button>
 							<button class="lx-btn" id="lx-add-all-btn" title="将当前列表整张加入播放队列(无确认框)">
@@ -1249,14 +1554,22 @@ function renderApp(el) {
 					</div>
 
 					<table class="lx-table">
+						<colgroup>
+							<col style="width: 44px;">
+							<col style="width: 42%;">
+							<col style="width: 22%;">
+							<col style="width: 20%;">
+							<col style="width: 60px;">
+							<col style="width: 100px;">
+						</colgroup>
 						<thead>
 							<tr>
-								<th style="width: 50px;">#</th>
+								<th style="text-align: center;">#</th>
 								<th>歌曲标题</th>
 								<th>歌手</th>
 								<th>专辑</th>
-								<th style="width: 80px;">时长</th>
-								<th style="width: 120px; text-align: right;">操作</th>
+								<th>时长</th>
+								<th style="text-align: right;">操作</th>
 							</tr>
 						</thead>
 						<tbody id="lx-song-table-body">
@@ -1271,8 +1584,11 @@ function renderApp(el) {
 
 				<!-- 歌词与唱片右面板 -->
 				<div class="lx-lyrics-panel">
-					<div class="lx-cover-disc" id="lx-cover-disc">
-						<img id="lx-disc-img" src="" alt="Album Cover" />
+					<div class="lx-cover-ambient-wrap">
+						<div class="lx-cover-ambient-glow"></div>
+						<div class="lx-cover-disc" id="lx-cover-disc">
+							<img id="lx-disc-img" src="" alt="Album Cover" />
+						</div>
 					</div>
 					<div class="lx-lyrics-scroll" id="lx-lyrics-scroll">
 						<div class="lx-lrc-line">暂无歌词</div>
@@ -1296,16 +1612,16 @@ function renderApp(el) {
 							<span id="lx-mode-icon">🔁</span>
 						</button>
 						<button class="lx-icon-btn" id="lx-prev-btn" title="上一首 (Ctrl+Left)">
-							<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><polygon points="19 20 9 12 19 4 19 20"/><line x1="5" y1="19" x2="5" y2="5" stroke="currentColor" stroke-width="2"/></svg>
+							<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><polygon points="19 20 9 12 19 4 19 20"/><line x1="5" y1="19" x2="5" y2="5" stroke="currentColor" stroke-width="2.5"/></svg>
 						</button>
 						<button class="lx-play-main-btn" id="lx-play-btn" title="播放/暂停 (Space)">
-							<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+							<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>
 						</button>
 						<button class="lx-icon-btn" id="lx-next-btn" title="下一首 (Ctrl+Right)">
-							<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 4 15 12 5 20 5 4"/><line x1="19" y1="5" x2="19" y2="19" stroke="currentColor" stroke-width="2"/></svg>
+							<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 4 15 12 5 20 5 4"/><line x1="19" y1="5" x2="19" y2="19" stroke="currentColor" stroke-width="2.5"/></svg>
 						</button>
 						<button class="lx-icon-btn" id="lx-pip-btn" title="开启桌面画中画悬浮歌词">
-							<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><rect x="12" y="9" width="8" height="6" rx="1"/></svg>
+							<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><rect x="12" y="9" width="8" height="6" rx="1"/></svg>
 						</button>
 					</div>
 
@@ -1321,11 +1637,11 @@ function renderApp(el) {
 				<div class="lx-footer-right">
 					<select class="lx-quality-select" id="lx-quality-select" title="音质选择">
 						<option value="128k">标准 128k</option>
-						<option value="320k">高品 320k</option>
+						<option value="320k" selected>高品 320k</option>
 						<option value="flac">无损 FLAC</option>
 					</select>
 
-					<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"/></svg>
+					<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"/></svg>
 					<input type="range" class="lx-vol-slider" id="lx-vol-slider" min="0" max="1" step="0.05" value="0.8" />
 				</div>
 			</div>
@@ -1421,6 +1737,7 @@ function bindEvents(rootEl) {
 
 	const triggerSearch = async () => {
 		const kw = searchInput.value.trim();
+		globalState.searchKeyword = kw;
 		if (!kw) return;
 		const tbody = rootEl.querySelector("#lx-song-table-body");
 		tbody.innerHTML = `<tr><td colspan="6" style="text-align: center; padding: 40px;">正在检索 ${kw}...</td></tr>`;
@@ -1450,9 +1767,8 @@ function bindEvents(rootEl) {
 	// 5. 播控
 	const playBtn = rootEl.querySelector("#lx-play-btn");
 	playBtn.addEventListener("click", () => {
-		if (!globalAudio) return;
 		if (globalState.isPlaying) globalAudio.pause();
-		else globalAudio.play();
+		else resumePlayback();
 	});
 
 	rootEl.querySelector("#lx-prev-btn").addEventListener("click", playPrevSong);
@@ -1472,6 +1788,9 @@ function bindEvents(rootEl) {
 		{ type: "single", icon: "🔂", title: "单曲循环" },
 	];
 
+	const savedMode = modes.find((m) => m.type === globalState.playMode);
+	modeIcon.textContent = savedMode.icon;
+	modeBtn.title = savedMode.title;
 	modeBtn.addEventListener("click", () => {
 		const curIdx = modes.findIndex((m) => m.type === globalState.playMode);
 		const next = modes[(curIdx + 1) % modes.length];
@@ -1503,6 +1822,7 @@ function bindEvents(rootEl) {
 
 	// 11. 音量
 	const volSlider = rootEl.querySelector("#lx-vol-slider");
+	volSlider.value = globalState.volume;
 	volSlider.addEventListener("input", (e) => {
 		const val = parseFloat(e.target.value);
 		globalState.volume = val;
@@ -1560,10 +1880,8 @@ function bindEvents(rootEl) {
 
 		if (e.code === "Space") {
 			e.preventDefault();
-			if (globalAudio) {
-				if (globalState.isPlaying) globalAudio.pause();
-				else globalAudio.play();
-			}
+			if (globalState.isPlaying) globalAudio.pause();
+			else resumePlayback();
 		} else if (e.code === "ArrowLeft") {
 			if (e.ctrlKey) {
 				playPrevSong();
@@ -1588,13 +1906,18 @@ function bindEvents(rootEl) {
 			volSlider.value = globalState.volume;
 		}
 	};
+	removeKeyboardListener?.();
 	window.addEventListener("keydown", onKeyDown);
+	removeKeyboardListener = () => window.removeEventListener("keydown", onKeyDown);
 
 	// 14. 初始化恢复收藏夹与音源
 	fetch(`${apiBaseUrl}/favorites`)
 		.then((r) => r.json())
 		.then((d) => {
-			if (d?.favorites) globalState.favorites = d.favorites;
+			if (Array.isArray(d?.favorites) && !globalState.favorites.length) {
+				globalState.favorites = d.favorites;
+				renderCurrentTable();
+			}
 		})
 		.catch(() => {});
 
@@ -1614,6 +1937,17 @@ export default {
 	async mount(el, ctx) {
 		activeRootEl = el;
 		apiBaseUrl = `${ctx.appBaseUrl || ""}/plugins-api/lx-music`;
+		if (!restored) {
+			storageKey = `${PLAYER_STORAGE_KEY}:${ctx.appBaseUrl || "/"}`;
+			try {
+				Object.assign(globalState, loadPlayer(window.localStorage, storageKey));
+			} catch {}
+			restored = true;
+			window.addEventListener("pagehide", persistPlayer);
+			document.addEventListener("visibilitychange", () => {
+				if (document.visibilityState === "hidden") persistPlayer();
+			});
+		}
 
 		// 监听宿主 WebSocket 消息 (来自 AI Agent Tool 的点歌控制)
 		if (typeof ctx.onData === "function") {
@@ -1627,8 +1961,8 @@ export default {
 					showToast(`AI 已为你开始播放整份歌单 (${payload.songs.length} 首)`);
 				} else if (payload?.type === "lx:pause" && globalAudio) {
 					globalAudio.pause();
-				} else if (payload?.type === "lx:resume" && globalAudio) {
-					globalAudio.play();
+				} else if (payload?.type === "lx:resume") {
+					resumePlayback();
 				} else if (payload?.type === "lx:playlist_add" && payload?.song) {
 					globalState.queue.push(payload.song);
 					updateQueueBadge();
@@ -1639,13 +1973,29 @@ export default {
 
 		renderApp(el);
 		bindEvents(el);
+		el.querySelector("#lx-search-input").value = globalState.searchKeyword;
+		el.querySelectorAll(".lx-nav-tab").forEach((tab) =>
+			tab.classList.toggle("active", tab.dataset.tab === globalState.activeViewTab),
+		);
+		el.querySelectorAll("[data-src]").forEach((btn) =>
+			btn.classList.toggle("active", btn.dataset.src === globalState.source),
+		);
+		el.querySelectorAll("[data-chart]").forEach((btn) =>
+			btn.classList.toggle("active", btn.dataset.chart === globalState.topChartType),
+		);
+		// Restore the selected tab through its normal layout handler.
+		el.querySelector(`.lx-nav-tab[data-tab='${globalState.activeViewTab}']`)?.click();
 		renderPlayerBarInfo();
+		updateProgressBar();
 		updatePlayButtonState();
 		renderLyrics();
 		updateQueueBadge();
 	},
 
 	unmount() {
+		removeKeyboardListener?.();
+		removeKeyboardListener = null;
+		persistPlayer();
 		activeRootEl = null;
 	},
 };

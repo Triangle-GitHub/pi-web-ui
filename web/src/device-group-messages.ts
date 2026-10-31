@@ -9,6 +9,39 @@ export type GroupDevice = {
 	enabled?: boolean;
 	online?: boolean;
 };
+export type GroupBotConversation = { id: string; botId: string; name: string; status: string };
+
+export function groupConversationHits(
+	devices: readonly GroupDevice[],
+	conversations: readonly GroupBotConversation[],
+	query: string,
+	zh: boolean,
+): AtHit[] {
+	return devices.flatMap((bot) => {
+		const choices = [
+			{
+				providerId: "host:group-devices",
+				providerLabel: zh ? "新对话" : "New conversation",
+				title: bot.name,
+				hint: bot.id,
+				text: `@${bot.name} · ${zh ? "新对话" : "New conversation"}`,
+			},
+			...conversations
+				.filter((c) => c.botId === bot.id && c.status !== "closed")
+				.map((c) => ({
+					providerId: "host:group-conversations",
+					providerLabel: zh ? "继续对话" : "Continue conversation",
+					title: `${bot.name} · ${c.name || (zh ? "未命名对话" : "Untitled conversation")}`,
+					hint: c.id,
+					text: `@${bot.name} · ${zh ? "继续：" : "Continue: "}${c.name || (zh ? "未命名对话" : "Untitled conversation")}`,
+				})),
+		];
+		return choices.filter((hit) =>
+			`${hit.title} ${hit.providerLabel} ${bot.id}`.toLocaleLowerCase().includes(query.toLocaleLowerCase()),
+		);
+	});
+}
+
 export type GroupMessage = {
 	id: string;
 	text: string;

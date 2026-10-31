@@ -22,6 +22,27 @@ const bot = (): LocalBot => ({
 });
 
 describe("Bot execution capabilities", () => {
+	it("permits restoration only for the exact locally authorized path while active", () => {
+		const path = resolve("transcript.jsonl");
+		const binding = registerBotExecution(bot(), path);
+		try {
+			expect(botExecutionMessageAllowed(binding.clientId, "switch_session", { path })).toBe(true);
+			expect(botExecutionMessageAllowed(binding.clientId, "switch_session")).toBe(false);
+			expect(botExecutionMessageAllowed(binding.clientId, "switch_session", { path: resolve("other.jsonl") })).toBe(
+				false,
+			);
+			binding.capability.revoke();
+			expect(botExecutionMessageAllowed(binding.clientId, "switch_session", { path })).toBe(false);
+		} finally {
+			binding.release();
+		}
+		const fresh = registerBotExecution(bot());
+		try {
+			expect(botExecutionMessageAllowed(fresh.clientId, "switch_session", { path })).toBe(false);
+		} finally {
+			fresh.release();
+		}
+	});
 	it("captures immutable policy and a local default model exactly once", () => {
 		const config = bot();
 		const binding = registerBotExecution(config);

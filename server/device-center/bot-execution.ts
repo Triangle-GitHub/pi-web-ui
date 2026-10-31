@@ -5,6 +5,7 @@ import type { LocalBot } from "./bots.js";
 /** Process-local authority. Never accept a Bot configuration or capability over WS. */
 export interface BotExecutionCapability {
 	readonly bot: Readonly<LocalBot>;
+	readonly authorizedResumePath?: string;
 	assertActive(): void;
 	allowsTool(name: string): boolean;
 	filterSkills<T extends { name: string }>(skills: T[]): T[];
@@ -36,7 +37,10 @@ export function isBotToolAllowed(name: string): boolean {
 	return !barred.has(name) && !name.startsWith("subagent_") && !name.startsWith("team_");
 }
 
-export function registerBotExecution(bot: LocalBot): {
+export function registerBotExecution(
+	bot: LocalBot,
+	authorizedResumePath?: string,
+): {
 	clientId: string;
 	capability: BotExecutionCapability;
 	release(): void;
@@ -44,6 +48,8 @@ export function registerBotExecution(bot: LocalBot): {
 	if (!bot?.enabled || !bot.id || !isAbsolute(bot.cwd) || !Number.isSafeInteger(bot.revision)) {
 		throw new Error("An enabled, versioned local Bot with an absolute cwd is required");
 	}
+	if (authorizedResumePath !== undefined && !isAbsolute(authorizedResumePath))
+		throw new Error("Resume path must be absolute");
 	const snapshot = structuredClone(bot);
 	snapshot.cwd = resolve(snapshot.cwd);
 	Object.freeze(snapshot.tools);
@@ -57,6 +63,7 @@ export function registerBotExecution(bot: LocalBot): {
 	const skills = new Set(snapshot.skills);
 	const capability: BotExecutionCapability = {
 		bot: snapshot,
+		authorizedResumePath,
 		assertActive() {
 			if (!active) throw new Error("Bot execution capability has been revoked");
 		},
@@ -107,7 +114,7 @@ export function getBotExecution(clientId: string): BotExecutionCapability | unde
 }
 
 /** Executor uses only this control surface; all other public WS commands are denied. */
-export function botExecutionMessageAllowed(clientId: string, type: string): boolean {
+export function botExecutionMessageAllowed(clientId: string, type: string, message?: unknown): boolean {
 	const capability = getBotExecution(clientId);
 	if (!capability) return true;
 	if (["abort", "get_state", "pong"].includes(type)) return true;
@@ -116,5 +123,13 @@ export function botExecutionMessageAllowed(clientId: string, type: string): bool
 	} catch {
 		return false;
 	}
+	if (type === "switch_session")
+		return (
+			!!capability.authorizedResumePath &&
+			!!message &&
+			typeof message === "object" &&
+			"path" in message &&
+			message.path === capability.authorizedResumePath
+		);
 	return ["hello", "new_chat", "prompt"].includes(type);
 }

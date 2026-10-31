@@ -76,7 +76,145 @@ afterEach(() => {
 	vi.unstubAllGlobals();
 	vi.restoreAllMocks();
 });
+const conversation = {
+	id: "persistent-a",
+	botId: "alpha",
+	name: "Design review",
+	status: "idle",
+	latestTaskId: "task-private",
+};
+async function selectConversation(_value: string) {
+	await type("@");
+	await act(async () => host.querySelectorAll<HTMLButtonElement>(".slash-item")[1].click());
+}
+async function append(text: string) {
+	await type(host.querySelector("textarea")!.value + text);
+}
 describe("group stream lifecycle", () => {
+	it("routes new and continued Bot mentions without a separate dropdown", async () => {
+		const posts: { url: string; body: any }[] = [];
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (url: string, init: RequestInit) => {
+				if (init.method === "POST") {
+					posts.push({ url, body: JSON.parse(init.body as string) });
+					return response({});
+				}
+				return response(url.endsWith("/conversations") ? { conversations: [conversation] } : detail);
+			}),
+		);
+		await mount();
+		expect(host.querySelector("select")).toBeNull();
+		await type("@");
+		expect(host.querySelector(".slash-menu")?.textContent).toContain("Design review");
+		expect(host.querySelector(".slash-menu")?.textContent).not.toContain("persistent-a");
+		await act(async () => host.querySelector<HTMLButtonElement>(".slash-item")!.click());
+		await append("new work");
+		await send();
+		expect(posts[0].url).toMatch(/rooms\/one\/messages$/);
+		expect(posts[0].body.targetBotIds).toEqual(["alpha"]);
+		await selectConversation(conversation.id);
+		await append("follow up");
+		await send();
+		expect(posts[1].url).toMatch(/conversations\/persistent-a\/messages$/);
+		expect(posts[1].body.text).toBe("@Twin(alpha) follow up");
+	});
+	it("rejects mixed new and continued mentions before sending", async () => {
+		const posts: string[] = [];
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (url: string, init: RequestInit) => {
+				if (init.method === "POST") posts.push(url);
+				return response(url.endsWith("/conversations") ? { conversations: [conversation] } : detail);
+			}),
+		);
+		await mount();
+		await selectConversation(conversation.id);
+		await append("@alpha");
+		await act(async () => host.querySelector<HTMLButtonElement>(".slash-item")!.click());
+		await append("work");
+		await send();
+		expect(posts).toEqual([]);
+		expect(host.textContent).toMatch(/one conversation|一个对话/);
+	});
+	it("never falls back after a failed or deleted continued conversation", async () => {
+		let conversations = [conversation];
+		const posts: string[] = [];
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (url: string, init: RequestInit) => {
+				if (init.method === "POST") {
+					posts.push(url);
+					return response({ error: "missing" }, 404);
+				}
+				return response(url.endsWith("/conversations") ? { conversations } : detail);
+			}),
+		);
+		await mount();
+		await selectConversation(conversation.id);
+		await append("follow up");
+		await send();
+		await send();
+		expect(posts).toHaveLength(2);
+		expect(posts.every((url) => url.includes("/conversations/persistent-a/messages"))).toBe(true);
+		conversations = [];
+		await act(async () => vi.advanceTimersByTimeAsync(2000));
+		await send();
+		expect(posts).toHaveLength(2);
+		expect(host.textContent).toMatch(/unavailable|不可用/);
+	});
+	it("aborts a pending continuation on room change and ignores its late success", async () => {
+		let release!: (value: Response) => void;
+		let signal!: AbortSignal;
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (url: string, init: RequestInit) => {
+				if (init.method === "POST") {
+					signal = init.signal as AbortSignal;
+					return new Promise<Response>((resolve) => {
+						release = resolve;
+					});
+				}
+				return response(url.endsWith("/conversations") ? { conversations: [conversation] } : detail);
+			}),
+		);
+		await mount();
+		await selectConversation(conversation.id);
+		await append("old work");
+		await send();
+		await mount("two");
+		await type("new draft");
+		expect(signal.aborted).toBe(true);
+		await act(async () => release(response({})));
+		expect(host.querySelector("textarea")?.value).toBe("new draft");
+		expect(host.querySelector("select")).toBeNull();
+	});
+	it("bounds conversation polling and ignores an aborted list from the old room", async () => {
+		let release!: (value: Response) => void;
+		let oldSignal!: AbortSignal;
+		let requests = 0;
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (url: string, init: RequestInit) => {
+				if (url.endsWith("one/conversations")) {
+					requests++;
+					oldSignal = init.signal as AbortSignal;
+					return new Promise<Response>((resolve) => {
+						release = resolve;
+					});
+				}
+				return response(url.endsWith("/conversations") ? { conversations: [] } : detail);
+			}),
+		);
+		await mount();
+		await act(async () => vi.advanceTimersByTimeAsync(6000));
+		expect(requests).toBe(1);
+		await mount("two");
+		expect(oldSignal.aborted).toBe(true);
+		await act(async () => release(response({ conversations: [conversation] })));
+		await type("@");
+		expect(host.querySelector(".slash-menu")?.textContent).not.toContain("Design review");
+	});
 	it("keeps the device picker open across repeated Hub refreshes", async () => {
 		vi.stubGlobal(
 			"fetch",

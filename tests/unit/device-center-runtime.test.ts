@@ -327,12 +327,128 @@ describe("Bot-only device runtime", () => {
 			code: "BOT_BUSY",
 		});
 		await expect(f.options.bots.remove(f.registered[0].id, 1)).rejects.toMatchObject({ code: "BOT_BUSY" });
-		await expect(runtime.onTask(f.task("room1"))).rejects.toThrow("busy");
+		const queued = runtime.onTask(f.task("room1"));
+		expect(runs).toBe(1);
 		settle("old completion");
 		await rejected;
 		await disconnected;
 		expect(f.held()).toBe(0);
-		expect(await runtime.onTask(f.task("room1"))).toBe("new task");
+		expect(await queued).toBe("new task");
+	});
+
+	it("persists a Hub address across runtime restart and refuses missing or changed ownership", async () => {
+		const f = await fixture();
+		const conversationId = "12345678-1234-4234-8234-123456789abc";
+		const path = join(f.options.dataDir, "session.jsonl");
+		await writeFile(path, "transcript");
+		const seen: (string | undefined)[] = [];
+		const executorFactory: NonNullable<Parameters<typeof createDeviceRuntime>[0]["executorFactory"]> = (options) => ({
+			async run(task) {
+				seen.push(options.resumePath);
+				options.onSession?.(task.id, "sdk-session");
+				options.onSessionPath?.(task.id, path);
+				return options.resumePath ? "continued" : "created";
+			},
+			close() {},
+		});
+		const first = createDeviceRuntime({ ...f.options, executorFactory });
+		expect(await first.onTask({ ...f.task("room0"), conversationId })).toBe("created");
+		await first.close();
+		const second = createDeviceRuntime({
+			...f.options,
+			config: { ...f.options.config, credential: "rotated-credential" },
+			executorFactory,
+		});
+		cleanups.push(() => second.close());
+		expect(await second.onTask({ ...f.task("room0"), conversationId, resume: true })).toBe("continued");
+		expect(seen).toEqual([undefined, path]);
+		await expect(second.onTask({ ...f.task("room0"), conversationId })).rejects.toThrow("explicit resume");
+		await expect(second.onTask({ ...f.task("room1"), conversationId, resume: true })).rejects.toThrow(
+			"configuration changed",
+		);
+		await expect(
+			second.onTask({ ...f.task("room0"), conversationId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", resume: true }),
+		).rejects.toThrow("unavailable");
+		expect(seen).toHaveLength(2);
+		const changed = createDeviceRuntime({
+			...f.options,
+			config: { ...f.options.config, hubUrl: "http://different-hub" },
+			executorFactory,
+		});
+		cleanups.push(() => changed.close());
+		await expect(changed.onTask({ ...f.task("room0"), conversationId, resume: true })).rejects.toThrow(
+			"configuration changed",
+		);
+	});
+
+	it("retains the captured transcript after a failed first turn for recovery after restart", async () => {
+		const f = await fixture();
+		const conversationId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+		const path = join(f.options.dataDir, "failed-session.jsonl");
+		await writeFile(path, "retained transcript");
+		const failed = createDeviceRuntime({
+			...f.options,
+			executorFactory: (options) => ({
+				async run(task) {
+					options.onSession?.(task.id, "retained-sdk");
+					options.onSessionPath?.(task.id, path);
+					throw new Error("local approval required");
+				},
+				close() {},
+			}),
+		});
+		await expect(failed.onTask({ ...f.task("room0"), conversationId })).rejects.toThrow("approval required");
+		await failed.close();
+		const recovered = createDeviceRuntime({
+			...f.options,
+			executorFactory: (options) => ({
+				async run(task) {
+					expect(options.resumePath).toBe(path);
+					options.onSession?.(task.id, "retained-sdk");
+					options.onSessionPath?.(task.id, path);
+					return "recovered";
+				},
+				close() {},
+			}),
+		});
+		cleanups.push(() => recovered.close());
+		expect(await recovered.onTask({ ...f.task("room0"), conversationId, resume: true })).toBe("recovered");
+	});
+
+	it("cancels queued tasks without starting them and bounds waiting admission", async () => {
+		const f = await fixture();
+		let finish!: (value: string) => void;
+		let started!: () => void;
+		const ready = new Promise<void>((resolve) => {
+			started = resolve;
+		});
+		let runs = 0;
+		const runtime = createDeviceRuntime({
+			...f.options,
+			executorFactory: () => ({
+				run() {
+					runs++;
+					started();
+					return new Promise<string>((resolve) => {
+						finish = resolve;
+					});
+				},
+				close() {},
+			}),
+		});
+		cleanups.push(() => runtime.close());
+		const first = runtime.onTask(f.task("room0"));
+		await ready;
+		const controller = new AbortController();
+		const waiting = Array.from({ length: 32 }, () => runtime.onTask(f.task("room0"), controller.signal));
+		const results = Promise.allSettled(waiting);
+		await expect(runtime.onTask(f.task("room0"))).rejects.toThrow("queue full");
+		controller.abort();
+		expect((await results).every((result) => result.status === "rejected")).toBe(true);
+		expect(runs).toBe(1);
+		finish("done");
+		expect(await first).toBe("done");
+		expect(f.held()).toBe(0);
 	});
 
 	it("retains the lease and blocks new tasks when executor stop is uncertain", async () => {
@@ -350,11 +466,14 @@ describe("Bot-only device runtime", () => {
 				};
 			},
 		});
-		await expect(runtime.onTask(f.task("room0"))).rejects.toThrow("stop uncertain");
+		await expect(runtime.onTask(f.task("room0"))).rejects.toMatchObject({
+			message: "stop uncertain",
+			stopUnconfirmed: true,
+		});
 		expect(f.held()).toBe(1);
 		await expect(f.options.bots.remove(f.registered[0].id, 1)).rejects.toMatchObject({ code: "BOT_BUSY" });
 		await expect(runtime.onTask(f.task("room1"))).rejects.toThrow("blocked");
-		await expect(runtime.onDisconnect()).rejects.toThrow("stop uncertain");
+		await expect(runtime.onDisconnect()).rejects.toMatchObject({ stopUnconfirmed: true });
 		await expect(runtime.close()).rejects.toThrow("stop uncertain");
 	});
 

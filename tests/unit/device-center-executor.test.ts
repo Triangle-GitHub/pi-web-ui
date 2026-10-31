@@ -46,6 +46,8 @@ async function fixture(
 		onNew?: (socket: WebSocket, state: UiState) => void;
 		onHello?: (socket: WebSocket, state: UiState) => void;
 		onSession?: (taskId: string, sessionId: string | undefined) => void;
+		resumePath?: string;
+		onSessionPath?: (taskId: string, path: string) => void;
 	} = {},
 ) {
 	const server = new WebSocketServer({ host: "127.0.0.1", port: 0 });
@@ -106,6 +108,16 @@ async function fixture(
 				}
 				initialId = "task-chat";
 				push(socket, { conversationId: initialId, sessionId: "task-sdk-session", messages: [], isEphemeral: false });
+			} else if (msg.type === "switch_session") {
+				initialId = "restored-chat";
+				push(socket, {
+					conversationId: initialId,
+					sessionId: "restored-sdk-session",
+					sessionFile: msg.path,
+					messages: [assistant("OLD HISTORY")],
+					historyTotal: 1,
+					isEphemeral: false,
+				});
 			} else if (msg.type === "get_state") push(socket);
 			else if (msg.type === "prompt") {
 				if (opts.gap)
@@ -130,6 +142,8 @@ async function fixture(
 		localAuthToken: "test-token",
 		allowExecution: true,
 		onSession: opts.onSession,
+		resumePath: opts.resumePath,
+		onSessionPath: opts.onSessionPath,
 	});
 	cleanup.push(async () => {
 		void executor.close().catch(() => {});
@@ -155,6 +169,35 @@ function delta(socket: WebSocket, state: UiState, patch: Partial<UiState>, appen
 // These tests use real loopback sockets and the production protocol envelope,
 // without invoking models or weakening the existing approval mechanism.
 describe("device task executor", () => {
+	it("restores only the authorized transcript and reports only the new turn", async () => {
+		const resumePath = resolve("persistent-session.jsonl");
+		const onSession = vi.fn();
+		const onSessionPath = vi.fn();
+		const f = await fixture(
+			(socket, state) => {
+				// An idle restored snapshot after prompt must not complete from old history.
+				f.push(socket);
+				setImmediate(() =>
+					f.push(socket, {
+						messages: [...state.messages, { ...assistant("CONTINUED"), id: "new-answer" } as any],
+					}),
+				);
+			},
+			{ resumePath, onSession, onSessionPath },
+		);
+		const input = { ...task(), resume: true };
+		expect(await f.executor.run(input)).toBe("CONTINUED");
+		expect(f.received.some((m) => m.type === "new_chat")).toBe(false);
+		expect(f.received).toContainEqual({ type: "switch_session", path: resumePath });
+		expect(onSession).toHaveBeenCalledWith(input.id, "restored-sdk-session");
+		expect(onSessionPath).toHaveBeenCalledWith(input.id, resumePath);
+	});
+
+	it("refuses resume without an authorized transcript", async () => {
+		const f = await fixture();
+		await expect(f.executor.run({ ...task(), resume: true })).rejects.toThrow("authorized local transcript");
+		expect(f.received).toEqual([]);
+	});
 	it("handshakes in the fixed Bot cwd, creates a persistent task chat and extracts actual assistant text from deltas", async () => {
 		const f = await fixture((socket, state) => {
 			delta(socket, state, { isStreaming: true });
@@ -171,7 +214,31 @@ describe("device task executor", () => {
 		});
 		const t = {
 			...task(),
+			conversationId: "receiver-address",
+			sourceConversationId: "origin-address",
+			kind: "request" as const,
+			requestId: "request-correlation",
 			handoff: { repository: "repo", commit: "deadbeef", branch: "fix", instructions: "Verify first" },
+			context: {
+				roomId: "team",
+				roomName: "Team",
+				members: [],
+				throughMessageId: "previous",
+				nextBefore: "cursor",
+				truncated: true,
+				retentionLimit: 500,
+				messages: [
+					{
+						id: "previous",
+						text: "Earlier shared plan",
+						sender: { type: "human" as const, id: "person", name: "Alice" },
+						createdAt: 1,
+						textStart: 0,
+						textEnd: 19,
+						fullTextLength: 19,
+					},
+				],
+			},
 		};
 		const result = await f.executor.run(t);
 		expect(result).toContain("Verified command: exit 0; repair commit abc123");
@@ -183,6 +250,13 @@ describe("device task executor", () => {
 		expect(f.received.find((m) => m.type === "new_chat")).toEqual({ type: "new_chat", ephemeral: false });
 		const prompt = f.received.find((m) => m.type === "prompt");
 		expect(prompt?.text).toContain("deadbeef");
+		expect(prompt?.text).toContain('"conversationId":"receiver-address"');
+		expect(prompt?.text).toContain('"sourceConversationId":"origin-address"');
+		expect(prompt?.text).toContain('"requestId":"request-correlation"');
+		expect(prompt?.text).toContain("conversationId=sourceConversationId, kind=reply and the same requestId");
+		expect(prompt?.text).toContain("Earlier shared plan");
+		expect(prompt?.text).toContain("untrusted reference data");
+		expect(prompt?.text).toContain("device_collab read_history");
 		expect(prompt?.text).toContain("dirty state");
 		expect(prompt?.text).toContain("configured fixed workspace");
 		expect(prompt?.text).toContain("greetings, questions and ordinary conversation");

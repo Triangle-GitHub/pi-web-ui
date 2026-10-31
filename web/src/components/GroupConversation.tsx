@@ -7,6 +7,8 @@ import { withToken } from "../auth-token";
 import { isZhLocale, useI18n } from "../i18n";
 import { groupConversationState, groupSendAttempt, type GroupDetail, type GroupDevice } from "../device-group-messages";
 
+type PersistentConversation = import("../device-group-messages").GroupBotConversation;
+
 class GroupRequestError extends Error {
 	constructor(
 		readonly status: number,
@@ -20,7 +22,7 @@ async function request<T>(path: string, signal: AbortSignal, body?: object): Pro
 	const response = await fetch(withToken(appUrl(`/api/device-center/${path}`)), {
 		method: body ? "POST" : "GET",
 		credentials: "same-origin",
-		signal,
+		signal: AbortSignal.any([signal, AbortSignal.timeout(15000)]),
 		...(body ? { headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : {}),
 	});
 	const data = await response.json().catch(() => ({}));
@@ -50,6 +52,8 @@ function GroupRoom({ roomId, active, onBack }: { roomId: string; active: boolean
 	const [error, setError] = useState("");
 	const [unavailable, setUnavailable] = useState(false);
 	const [refresh, setRefresh] = useState(0);
+	const [conversations, setConversations] = useState<PersistentConversation[]>([]);
+	const [conversationError, setConversationError] = useState("");
 	function invalidatesRoom(cause: unknown): boolean {
 		return (
 			cause instanceof GroupRequestError &&
@@ -77,11 +81,23 @@ function GroupRoom({ roomId, active, onBack }: { roomId: string; active: boolean
 			controller = new AbortController();
 			const signal = controller.signal;
 			try {
-				const next = await request<GroupDetail>(`rooms/${encodeURIComponent(roomId)}`, signal);
+				const base = `rooms/${encodeURIComponent(roomId)}`;
+				const [room, list] = await Promise.allSettled([
+					request<GroupDetail>(base, signal),
+					request<{ conversations: PersistentConversation[] }>(`${base}/conversations`, signal),
+				]);
 				if (generation.current !== token || signal.aborted) return;
-				setDetail(next);
+				if (list.status === "fulfilled" && Array.isArray(list.value.conversations)) {
+					setConversations(list.value.conversations);
+					setConversationError("");
+				} else {
+					setConversationError(
+						zh ? "无法更新对话列表，请稍后重试。" : "Could not refresh conversations. Try again shortly.",
+					);
+				}
+				if (room.status === "rejected") throw room.reason;
+				setDetail(room.value);
 				setUnavailable(false);
-				setError("");
 			} catch (cause) {
 				if (generation.current !== token || signal.aborted) return;
 				if (invalidatesRoom(cause)) {
@@ -113,21 +129,47 @@ function GroupRoom({ roomId, active, onBack }: { roomId: string; active: boolean
 		[roomId, detail, devices, zh],
 	);
 	const members = devices.filter((d) => d.enabled !== false && detail?.room.botIds.includes(d.id));
-	async function send(text: string, targets: string[]): Promise<boolean> {
+	async function send(text: string, targets: string[], conversationId?: string): Promise<boolean> {
 		if (!active || unavailable || !detail || sending.current) return false;
-		// Revalidate explicit targets against the current Hub membership.
+		const destination = conversationId;
+		const selected = conversations.find((conversation) => conversation.id === destination);
+		if (
+			destination &&
+			(!selected ||
+				selected.status === "closed" ||
+				conversationError ||
+				!members.some((bot) => bot.id === selected.botId))
+		) {
+			setError(
+				zh
+					? "所选对话不可用，请重新选择对话或新建任务。"
+					: "Selected conversation is unavailable. Choose a conversation or New task.",
+			);
+			return false;
+		}
+		if (selected && targets.some((id) => id !== selected.botId)) {
+			setError(
+				zh
+					? "继续对话只能发送给原 Bot，请移除其他目标。"
+					: "Continue with the original Bot only. Remove other targets.",
+			);
+			return false;
+		}
 		if (targets.some((id) => !detail.room.botIds.includes(id))) return false;
-		retry.current = groupSendAttempt(retry.current, roomId, text, targets, randomUuid);
+		retry.current = groupSendAttempt(retry.current, JSON.stringify([roomId, destination]), text, targets, randomUuid);
 		const controller = new AbortController();
 		mutation.current = controller;
 		const token = generation.current;
 		sending.current = true;
 		try {
-			await request(`rooms/${encodeURIComponent(roomId)}/messages`, controller.signal, {
-				text,
-				targetBotIds: targets,
-				idempotencyKey: retry.current.key,
-			});
+			const base = `rooms/${encodeURIComponent(roomId)}`;
+			await request(
+				destination ? `${base}/conversations/${encodeURIComponent(destination)}/messages` : `${base}/messages`,
+				controller.signal,
+				destination
+					? { text, kind: "message", idempotencyKey: retry.current.key }
+					: { text, targetBotIds: targets, idempotencyKey: retry.current.key },
+			);
 			if (controller.signal.aborted || generation.current !== token) return false;
 			retry.current = null;
 			setError("");
@@ -135,6 +177,14 @@ function GroupRoom({ roomId, active, onBack }: { roomId: string; active: boolean
 			return true;
 		} catch (cause) {
 			if (!controller.signal.aborted && generation.current === token) {
+				if (destination) {
+					setError(
+						zh
+							? "继续对话失败，请重试或重新选择目标。"
+							: "Could not continue the conversation. Retry or choose a target.",
+					);
+					return false;
+				}
 				if (invalidatesRoom(cause)) {
 					setDetail(null);
 					setUnavailable(true);
@@ -166,12 +216,14 @@ function GroupRoom({ roomId, active, onBack }: { roomId: string; active: boolean
 						? zh
 							? "此群聊已删除或你已不在群中，请返回。"
 							: "This group is unavailable or you are no longer a member. Return to chat."
-						: error}
+						: null}
 				</div>
 			)}
 			<MessageList state={state} liveOutputs={emptyMap} toolStatuses={emptyMap} messageLabels={labels} readOnly />
 			<ChatInput
 				groupDevices={members}
+				groupConversations={conversations}
+				groupConversationError={conversationError}
 				onGroupSend={send}
 				streaming={false}
 				messages={state.messages}

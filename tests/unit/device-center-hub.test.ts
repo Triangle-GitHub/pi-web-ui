@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { request as httpRequest } from "node:http";
 import { createDeviceHub } from "../../server/device-center/hub.js";
-import { DeviceHubStore } from "../../server/device-center/store.js";
+import { DeviceHubStore, hashSecret } from "../../server/device-center/store.js";
 
 const cleanups: (() => Promise<unknown>)[] = [];
 afterEach(async () => {
@@ -113,6 +113,162 @@ async function fixture(
 }
 
 describe("device center hub", () => {
+	it("clears only the authorized room history atomically, preserves membership and rejects active tasks", async () => {
+		const { hub, request, register, pair, dataDir } = await fixture();
+		const cookie = await register();
+		const device = await pair(cookie);
+		const otherCookie = await register("bob");
+		const room = (await request("/api/rooms", { name: "Team", botIds: [device.botId] }, cookie)).body.room;
+		const otherRoom = (await request("/api/rooms", { name: "Other", botIds: [device.botId] }, cookie)).body.room;
+		for (const id of [room.id, otherRoom.id])
+			await request(`/api/rooms/${id}/messages`, { text: "history", idempotencyKey: "history" }, cookie);
+		await hub.store.transact((state) => {
+			for (const id of [room.id, otherRoom.id])
+				state.tasks.push({
+					id,
+					attemptId: "attempt",
+					roomId: id,
+					accountId: room.accountId,
+					botId: device.botId,
+					botRevision: 1,
+					deviceId: device.deviceId,
+					text: "task",
+					status: "queued",
+					createdAt: 1,
+					updatedAt: 1,
+				});
+		});
+		const before = hub.store.snapshot();
+		expect((await request(`/api/rooms/${room.id}/clear`, {}, otherCookie)).status).toBe(404);
+		expect(
+			(
+				await request(`/api/agent/rooms/${room.id}/clear`, {}, "", {
+					Authorization: `Bearer ${device.credential}`,
+					"X-Device-Id": device.deviceId,
+				})
+			).status,
+		).toBe(404);
+		for (const status of ["queued", "running"] as const) {
+			await hub.store.transact((state) => {
+				state.tasks.find((task) => task.roomId === room.id)!.status = status;
+			});
+			const response = await request(`/api/rooms/${room.id}/clear`, {}, cookie);
+			expect(response.status).toBe(409);
+			expect(response.body.code).toBe("ACTIVE_TASKS");
+			expect(hub.store.snapshot().messages).toEqual(before.messages);
+		}
+		await hub.store.transact((state) => {
+			state.tasks.find((task) => task.roomId === room.id)!.status = "completed";
+		});
+		await hub.store.transact((state) => {
+			state.devices.find((entry) => entry.id === device.deviceId)!.uiCredentialHash = hashSecret("clear-ui");
+		});
+		const response = await request(`/api/device-user/rooms/${room.id}/clear`, {}, "", {
+			Authorization: "Bearer clear-ui",
+			"X-Device-Id": device.deviceId,
+		});
+		expect(response.status).toBe(200);
+		expect(response.body).toEqual({ cleared: true });
+		const after = hub.store.snapshot();
+		expect(after.rooms).toEqual(before.rooms);
+		for (const key of ["messages", "tasks", "receipts"] as const) {
+			expect(after[key].filter((entry) => entry.roomId === room.id)).toEqual([]);
+			expect(after[key].filter((entry) => entry.roomId === otherRoom.id)).toEqual(
+				before[key].filter((entry) => entry.roomId === otherRoom.id),
+			);
+		}
+		const restored = await DeviceHubStore.open(dataDir);
+		const recovered = restored.snapshot();
+		expect(recovered.tasks.every((task) => task.status === "interrupted")).toBe(true);
+		expect({ ...recovered, tasks: after.tasks }).toEqual(after);
+		expect((await request(`/api/rooms/${room.id}/clear`, {}, cookie)).status).toBe(200);
+		expect(
+			(await request(`/api/rooms/${room.id}/messages`, { text: "new message", idempotencyKey: "history" }, cookie))
+				.status,
+		).toBe(200);
+	});
+	it("freezes identical context for parallel recipients and never persists context copies", async () => {
+		const { hub, request, register, pair, onTask } = await fixture();
+		const cookie = await register();
+		const first = await pair(cookie);
+		const second = await pair(cookie, "Linux");
+		const room = (await request("/api/rooms", { name: "Parallel", botIds: [first.botId, second.botId] }, cookie)).body
+			.room;
+		await request(`/api/rooms/${room.id}/messages`, { text: "Shared requirements" }, cookie);
+		onTask.mockImplementation(async (_deviceId, task) => {
+			expect(task.context.messages.map((message: { text: string }) => message.text)).toEqual(["Shared requirements"]);
+			if (task.botId === first.botId)
+				await hub.store.transact((state) => {
+					state.messages.push({
+						id: "fast-answer",
+						accountId: room.accountId,
+						roomId: room.id,
+						text: "Do not leak to sibling",
+						sender: { type: "bot", id: first.botId, name: "Windows" },
+						createdAt: Date.now(),
+						taskIds: [task.id],
+					});
+				});
+			return true;
+		});
+		await request(
+			`/api/rooms/${room.id}/messages`,
+			{ text: "Review independently", targetBotIds: [first.botId, second.botId] },
+			cookie,
+		);
+		expect(onTask).toHaveBeenCalledTimes(2);
+		expect(onTask.mock.calls[0][1].context).toEqual(onTask.mock.calls[1][1].context);
+		expect(onTask.mock.calls[1][1].context.messages.map((message: { text: string }) => message.text)).toEqual([
+			"Shared requirements",
+		]);
+		for (const task of hub.store.snapshot().tasks) expect(task).not.toHaveProperty("context");
+		await hub.store.transact((state) => {
+			for (const task of state.tasks) task.status = "completed";
+		});
+		expect((await request(`/api/rooms/${room.id}/clear`, {}, cookie)).status).toBe(200);
+		onTask.mockImplementation(async (_deviceId, task) => {
+			expect(task.context.messages).toEqual([]);
+			return true;
+		});
+		await request(`/api/rooms/${room.id}/messages`, { text: "Fresh start", targetBotIds: [first.botId] }, cookie);
+		expect(onTask.mock.calls.at(-1)![1].context.messages).toEqual([]);
+	});
+	it("shares pre-dispatch context and permits history reads only from an enabled member Bot", async () => {
+		const { hub, request, register, pair, onTask } = await fixture();
+		const cookie = await register();
+		const member = await pair(cookie);
+		const outsider = await pair(cookie, "outsider");
+		const room = (await request("/api/rooms", { name: "Discussion", botIds: [member.botId] }, cookie)).body.room;
+		await request(`/api/rooms/${room.id}/messages`, { text: "Earlier plan: use SQLite" }, cookie);
+		onTask.mockImplementation(async (_deviceId, task) => {
+			expect(task.context.messages.map((message: { text: string }) => message.text)).toEqual([
+				"Earlier plan: use SQLite",
+			]);
+			expect(task.context.members).toEqual([{ id: member.botId, name: "Windows" }]);
+			return true;
+		});
+		await request(`/api/rooms/${room.id}/messages`, { text: "Review that plan", targetBotIds: [member.botId] }, cookie);
+		expect(onTask).toHaveBeenCalledOnce();
+		const headers = (device: typeof member) => ({
+			Authorization: `Bearer ${device.credential}`,
+			"X-Device-Id": device.deviceId,
+		});
+		const path = `/api/agent/rooms/${room.id}/history?sourceBotId=`;
+		const page = await request(path + member.botId, undefined, "", headers(member));
+		expect(page.status).toBe(200);
+		expect(page.body.messages.map((message: { text: string }) => message.text)).toEqual([
+			"Earlier plan: use SQLite",
+			"Review that plan",
+		]);
+		expect(JSON.stringify(page.body)).not.toContain("accountId");
+		expect((await request(path + outsider.botId, undefined, "", headers(outsider))).status).toBe(404);
+		expect((await request(path + outsider.botId, undefined, "", headers(member))).status).toBe(404);
+		expect((await request(`/api/rooms/${room.id}/history`, undefined, cookie)).status).toBe(403);
+		await hub.store.transact((state) => {
+			state.bots.find((bot) => bot.id === member.botId)!.enabled = false;
+		});
+		expect((await request(path + member.botId, undefined, "", headers(member))).status).toBe(404);
+	});
 	it("syncs stable Bot identities atomically, rejects impersonation and stale revisions", async () => {
 		const f = await fixture();
 		const cookie = await f.register();

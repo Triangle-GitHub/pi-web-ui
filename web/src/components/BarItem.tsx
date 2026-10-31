@@ -20,7 +20,7 @@ import {
 	FiSun,
 	FiTerminal,
 } from "react-icons/fi";
-import { LuFlaskConical, LuMessageSquareDashed, LuWorkflow } from "react-icons/lu";
+import { LuFlaskConical, LuFolders, LuMessageSquareDashed, LuWorkflow } from "react-icons/lu";
 import { REQUIRED_TOPBAR_ITEM_IDS, restoreUiItem, type UiSlotEntry, type UiSlotId } from "../ui-slots";
 import type { ChatState } from "../use-chat";
 import { useFormattedCost } from "../cost-format";
@@ -840,7 +840,7 @@ export function BarItem({
 			if (!worktree) return null;
 			const paths = new Set(worktree.linkedWorktrees.map((row) => row.path));
 			if (worktree.isLinkedWorktree) paths.add(worktree.currentPath);
-			iconNode = <FiGitBranch className="bar-item-icon" />;
+			iconNode = <LuFolders className="bar-item-icon" />;
 			labelText = named(t("worktreeViewTitle"));
 			extraClasses = "chip worktree-entry";
 			isActive = view === "worktrees";

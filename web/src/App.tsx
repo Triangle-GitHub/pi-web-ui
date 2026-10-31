@@ -2286,6 +2286,8 @@ export function App() {
 				)}
 			</div>
 			<TemplateProvider currentModelId={model ? `${model.provider}/${model.id}` : null}>
+				{/* 全局右键菜单须常驻，群组及其他视图也会通过 contextmenu.* 槽位打开它。 */}
+				<ContextMenu onAction={(entry, target, value) => onUiAction(entry, value, target)} />
 				<div
 					ref={layoutRef}
 					className="layout"
@@ -2595,8 +2597,6 @@ export function App() {
 										</div>
 									)}
 									{/* 扩展问卷：非模态内联面板，插在输入框上方，对话内容保持可见 */}
-									{/* 通用右键菜单（contextmenu.* 槽位）：各处的 onContextMenu 打开它。 */}
-									<ContextMenu onAction={(entry, target, value) => onUiAction(entry, value, target)} />
 									{chat.dialog && <Dialog dialog={chat.dialog} />}
 									{/* 本地插件对话框（host.dialogs.*）：复用 .dialog-inline 样式，按钮 resolve 后清态 */}
 									{pluginDialog && (

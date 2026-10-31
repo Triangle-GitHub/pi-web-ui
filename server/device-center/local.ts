@@ -268,7 +268,9 @@ export async function installLocalDeviceCenter(options: Options) {
 			req.once("aborted", cancel);
 			res.once("close", cancel);
 			try {
-				const suffix = path.replace(":id", encodeURIComponent(String((req.params as Record<string, string>).id)));
+				const suffix = path.replace(/:([A-Za-z]+)/g, (_match, key: string) =>
+					encodeURIComponent(String((req.params as Record<string, string>)[key])),
+				);
 				const response = await fetch(`${captured.hubUrl}/api/device-user/${suffix}`, {
 					method: method.toUpperCase(),
 					redirect: "error",
@@ -302,7 +304,7 @@ export async function installLocalDeviceCenter(options: Options) {
 					if (response.status === 409 && failure?.code === "ACTIVE_TASKS")
 						return res.status(409).json({
 							code: "ACTIVE_TASKS",
-							error: "Stop active tasks before removing members or deleting this group",
+							error: "Stop active tasks before removing members, clearing messages or deleting this group",
 						});
 					const status = [400, 401, 403, 404, 409, 429].includes(response.status) ? response.status : 502;
 					return res.status(status === 401 ? 409 : status).json({
@@ -420,9 +422,19 @@ export async function installLocalDeviceCenter(options: Options) {
 	userRoute("post", "devices/:id/open", []);
 	userRoute("get", "rooms", []);
 	userRoute("get", "rooms/:id", []);
+	userRoute("get", "rooms/:id/conversations", []);
+	userRoute("get", "rooms/:id/conversations/:conversationId", []);
+	userRoute("post", "rooms/:id/conversations", ["name", "targetBotId", "text", "idempotencyKey"]);
+	userRoute("post", "rooms/:id/conversations/:conversationId/messages", [
+		"text",
+		"kind",
+		"requestId",
+		"idempotencyKey",
+	]);
 	userRoute("post", "rooms", ["name", "botIds"]);
 	userRoute("post", "rooms/:id/rename", ["name"]);
 	userRoute("post", "rooms/:id/members", ["botIds"]);
+	userRoute("post", "rooms/:id/clear", []);
 	userRoute("post", "rooms/:id/delete", []);
 	userRoute("post", "rooms/:id/messages", [
 		"text",

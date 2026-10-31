@@ -92,6 +92,51 @@ async function fixture() {
 	};
 }
 describe("device transfer receipts", () => {
+	it("projects bounded exclusion metadata through the real remote transfer response without opaque fields", async () => {
+		const f = await fixture();
+		const post = await f.start();
+		const exclusions = Array.from({ length: 150 }, (_, i) => ({
+			path: `project/.env${String(i).padStart(3, "0")}${"密".repeat(50)}`,
+			reason: "sensitive",
+			base64: "OPAQUE_PAYLOAD",
+		}));
+		f.relay.callDevice.mockResolvedValueOnce({
+			id: "local-secret",
+			revision: "rev",
+			manifest: { version: 1, totalExcluded: 150, exclusions, token: "OPAQUE_PAYLOAD" },
+		} as any);
+		const response = await post({ action: "stage", bundle: {} });
+		expect(response.status).toBe(200);
+		const result = await response.json();
+		const manifest = result.manifest;
+		expect(manifest.totalExcluded).toBe(150);
+		expect(manifest.exclusions.length).toBeGreaterThan(0);
+		expect(manifest.exclusions.length).toBeLessThanOrEqual(128);
+		expect(Buffer.byteLength(JSON.stringify(manifest.exclusions))).toBeLessThanOrEqual(8192);
+		expect(manifest.exclusions[0]).toEqual({ path: exclusions[0].path, reason: "sensitive" });
+		expect(JSON.stringify(result)).not.toContain("OPAQUE_PAYLOAD");
+		f.relay.callDevice.mockResolvedValueOnce({
+			revision: "rev",
+			totalExcluded: 200,
+			exclusions: Array.from({ length: 200 }, (_, i) => ({ path: `tree/.env${i}`, reason: "sensitive" })),
+		} as any);
+		const preview = await (await post({ action: "preview", transferId: result.transferId })).json();
+		expect(preview.exclusions).toHaveLength(128);
+		expect(preview.totalExcluded).toBe(200);
+		f.relay.callDevice.mockResolvedValueOnce({
+			revision: "rev",
+			totalExcluded: -1,
+			exclusions: [
+				{ path: "../bad", reason: "sensitive" },
+				{ path: "C:/bad", reason: "sensitive" },
+				{ path: "tree/.env", reason: "unknown" },
+				{ path: "tree/node_modules", reason: "ignored", token: "OPAQUE_PAYLOAD" },
+			],
+		} as any);
+		const sanitized = await (await post({ action: "preview", transferId: result.transferId })).json();
+		expect(sanitized.totalExcluded).toBeUndefined();
+		expect(sanitized.exclusions).toEqual([{ path: "tree/node_modules", reason: "ignored" }]);
+	});
 	it("persists only authorization metadata, returns opaque IDs and restores authorization", async () => {
 		const f = await fixture();
 		const post = await f.start();
@@ -190,10 +235,25 @@ describe("device collaboration service", () => {
 		const signal = new AbortController().signal;
 		await service.execute(
 			"send_task",
-			{ roomId: "room", sourceBotId: "source-bot", targetBotId: "target-bot", prompt: "work", parentTaskId: "forged" },
+			{ roomId: "room", sourceBotId: "source-bot", targetBotId: "target-bot", prompt: "work", parentTaskId: "trusted" },
 			signal,
 			{ cwd: process.cwd(), sessionId: "s" },
 		);
+		await expect(
+			service.execute(
+				"send_task",
+				{
+					roomId: "room",
+					sourceBotId: "source-bot",
+					targetBotId: "target-bot",
+					prompt: "work",
+					parentTaskId: "forged",
+				},
+				signal,
+				{ cwd: process.cwd(), sessionId: "s" },
+			),
+		).rejects.toThrow("Device collaboration request failed.");
+		expect(request).toHaveBeenCalledTimes(1);
 		const init = request.mock.calls[0][1]!;
 		expect(JSON.parse(init.body as string)).toMatchObject({
 			parentTaskId: "trusted",
@@ -215,7 +275,10 @@ describe("device collaboration service", () => {
 	});
 	it("blocks writes with execution disabled and strips bundle data from stage reports", async () => {
 		let enabled = false;
-		const prepare = vi.fn().mockResolvedValue({ files: [{ base64: "SECRET" }] });
+		const prepare = vi.fn().mockResolvedValue({
+			manifest: { version: 1, files: [{ path: "x", sha256: "hash", size: 1 }], totalBytes: 1 },
+			files: [{ path: "x", base64: "SECRET" }],
+		});
 		const request = vi.fn<typeof fetch>().mockResolvedValue(
 			new Response(
 				JSON.stringify({

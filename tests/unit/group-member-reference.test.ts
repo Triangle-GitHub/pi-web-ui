@@ -3,10 +3,21 @@ import { expect, it, vi } from "vitest";
 import { insertGroupMember, referenceGroupMember, registerGroupMemberSink } from "../../web/src/group-member-reference";
 import { groupMessageTargets } from "../../web/src/device-group-messages";
 import {
+	groupReferenceDestination,
 	groupMemberDeletion,
 	serializeGroupMemberReferences,
 	updateGroupMemberReferences,
 } from "../../web/src/group-member-reference";
+
+it("keeps conversation identity through edits and rejects mixed destinations", () => {
+	const member = { id: "bot", name: "Bot" };
+	const ref = { start: 0, end: 4, member, conversationId: "original" };
+	expect(groupReferenceDestination(updateGroupMemberReferences("@Bot", "@Bot follow up", [ref]))).toBe("original");
+	expect(groupReferenceDestination(updateGroupMemberReferences("@Bot", "hello", [ref]))).toBeUndefined();
+	expect(() => groupReferenceDestination([ref, { ...ref, conversationId: undefined }])).toThrow();
+	expect(() => groupReferenceDestination([ref, { ...ref, conversationId: "other" }])).toThrow();
+	expect(groupReferenceDestination([{ ...ref, conversationId: undefined }])).toBeUndefined();
+});
 
 it("queues references for the matching group and delivers once when its composer mounts", () => {
 	const member = { id: "stable-bot", name: "Same name" };

@@ -123,6 +123,10 @@ describe("device collaboration full wiring", () => {
 				onTask: async (task, signal) => {
 					expect(task).toMatchObject({ botId: "target-bot", deviceId: targetDevice.deviceId, botRevision: 1 });
 					receivedTasks.push(task.id);
+					if (task.text === "Continue the same review") {
+						expect(task).toMatchObject({ resume: true, kind: "message" });
+						return "Continued the original conversation.";
+					}
 					if (task.text === "Review transferred code") {
 						expect(await readFile(join(targetRoot, "answer.ts"), "utf8")).toContain("export const answer = 42;");
 						return report;
@@ -254,13 +258,38 @@ describe("device collaboration full wiring", () => {
 					}),
 				]),
 			);
+			const original = completed.tasks.find((task: { id: string }) => task.id === completedId);
+			expect(original.conversationId).toBeTruthy();
+			expect(original.resume).toBe(false);
+			const continuedResponse = await browser(
+				`/api/rooms/${roomId}/conversations/${original.conversationId}/messages`,
+				{
+					text: "Continue the same review",
+					kind: "message",
+					idempotencyKey: "continue-once",
+				},
+			);
+			expect(continuedResponse.status).toBe(200);
+			const continued = await continuedResponse.json();
+			expect(continued.task).toMatchObject({ conversationId: original.conversationId, resume: true });
+			await waitForTask(continued.task.id, "completed");
+			const duplicateResponse = await browser(
+				`/api/rooms/${roomId}/conversations/${original.conversationId}/messages`,
+				{
+					text: "Continue the same review",
+					kind: "message",
+					idempotencyKey: "continue-once",
+				},
+			);
+			expect(duplicateResponse.status).toBe(200);
+			expect((await duplicateResponse.json()).task.id).toBe(continued.task.id);
 			const interruptedId = await dispatch("Wait until disconnected", "interrupt-once");
 			await waitForTask(interruptedId, "running");
 			expect(interruptedSignal?.aborted).toBe(false);
 			connector.close();
 			const interrupted = await waitForTask(interruptedId, "interrupted");
 			expect(interruptedSignal?.aborted).toBe(true);
-			expect(receivedTasks).toEqual([completedId, interruptedId]);
+			expect(receivedTasks).toEqual([completedId, continued.task.id, interruptedId]);
 			expect(interrupted.tasks.find((task: { id: string }) => task.id === interruptedId)).toMatchObject({
 				report: "Device connection lost; task is not replayed",
 			});

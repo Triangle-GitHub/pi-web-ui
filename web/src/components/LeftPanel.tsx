@@ -1234,7 +1234,7 @@ export const LeftPanel = memo(function LeftPanel({
 																{/* 「另一处」行本体：插件伪客户端（如微信/QQ）点击直接打开过户；真实多端保留两段确认防误触 */}
 																<button
 																	type="button"
-																	className={`session-item elsewhere-item${canTakeover ? "" : " elsewhere-static"}${confirming ? " confirm" : ""}`}
+																	className={`session-item elsewhere-item${c.isStreaming || hasStreaming ? " is-running" : ""}${canTakeover ? "" : " elsewhere-static"}${confirming ? " confirm" : ""}`}
 																	title={tooltip}
 																	tabIndex={canTakeover ? 0 : -1}
 																	onClick={
@@ -1263,11 +1263,7 @@ export const LeftPanel = memo(function LeftPanel({
 																	}
 																>
 																	<span className="session-icon-wrap">
-																		{c.isStreaming ? (
-																			<span className="conv-streaming" title={t("streaming")} />
-																		) : (
-																			<FiMessageSquare className="session-icon" />
-																		)}
+																		<FiMessageSquare className="session-icon" />
 																	</span>
 																	<span className="session-info">
 																		<span className="session-title">
@@ -1353,7 +1349,7 @@ export const LeftPanel = memo(function LeftPanel({
 															)}
 															<button
 																type="button"
-																className={`session-item ${active ? "active" : ""}`}
+																className={`session-item ${active ? "active" : ""}${c.isStreaming || hasStreaming ? " is-running" : ""}`}
 																title={`${c.title}${g.isCurrent ? "" : ` — ${g.cwd}`}`}
 																onClick={() => {
 																	if (!active) panelSend({ type: "switch_conversation", id: c.id });
@@ -1362,8 +1358,6 @@ export const LeftPanel = memo(function LeftPanel({
 																<span className="session-icon-wrap">
 																	{hasKids ? (
 																		<span className="session-icon-placeholder" />
-																	) : c.isStreaming ? (
-																		<span className="conv-streaming" title={t("streaming")} />
 																	) : c.isSubagent ? (
 																		<FiGitBranch className="session-icon subagent-icon" />
 																	) : (
@@ -1398,9 +1392,7 @@ export const LeftPanel = memo(function LeftPanel({
 																					📌
 																				</span>
 																			)}
-																			{hasKids && c.isStreaming && (
-																				<span className="conv-streaming-dot" title={t("streaming")} />
-																			)}
+
 																			{c.isEphemeral && <span className="ephemeral-badge">{t("ephemeralBadge")}</span>}
 																			{c.forkFrom && (
 																				<span
@@ -1452,7 +1444,6 @@ export const LeftPanel = memo(function LeftPanel({
 																						toggleSubagents(c.id);
 																					}}
 																				>
-																					{hasStreaming && <span className="subagent-dot streaming" />}
 																					{hasQuestion && <span className="subagent-dot question">?</span>}
 																					{hasError && <span className="subagent-dot error" />}
 																					<span className="subagents-count-text">
@@ -1549,7 +1540,7 @@ export const LeftPanel = memo(function LeftPanel({
 																					panelSend({ type: "dismiss_finished_subagents", parentId: c.id });
 																				}}
 																			>
-																				{t("dismissFinishedOnly", { n: nFinished })}
+																				{t("dismissFinishedOnly")}
 																			</button>
 																		)}
 																		<button
@@ -1562,7 +1553,7 @@ export const LeftPanel = memo(function LeftPanel({
 																				panelSend({ type: "dismiss_conversation", id: c.id, force: true });
 																			}}
 																		>
-																			{t("dismissForceAll", { n: nAll })}
+																			{t("dismissForceAll")}
 																		</button>
 																	</span>
 																);

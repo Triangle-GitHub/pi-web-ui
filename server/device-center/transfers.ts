@@ -4,6 +4,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdir, open, readFile, rename, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import type { Device, DeviceHubStore } from "./store.js";
+import { DEVICE_FILE_SYNC_LIMITS } from "./file-sync.js";
 
 export type TransferRelay = {
 	callDevice(
@@ -76,6 +77,44 @@ export function transferSummary(value: unknown): Record<string, unknown> {
 				}
 			return entry;
 		});
+	}
+	if (Number.isSafeInteger(source.totalExcluded) && (source.totalExcluded as number) >= 0)
+		result.totalExcluded = source.totalExcluded;
+	if (Array.isArray(source.exclusions)) {
+		const exclusions: { path: string; reason: "ignored" | "sensitive" }[] = [];
+		let bytes = 2; // JSON array brackets, including UTF-8 path bytes and escaping.
+		for (const item of source.exclusions.slice(0, DEVICE_FILE_SYNC_LIMITS.exclusions)) {
+			if (!item || typeof item !== "object") continue;
+			const { path, reason } = item;
+			if (
+				typeof path !== "string" ||
+				!path ||
+				Buffer.byteLength(path) > 1024 ||
+				Buffer.from(path).toString("utf8") !== path ||
+				path.normalize("NFC") !== path ||
+				/[\\:\x00-\x1f\x7f<>"|?*]/.test(path) ||
+				path.split("/").length > 32 ||
+				path
+					.split("/")
+					.some(
+						(part) =>
+							!part ||
+							part === "." ||
+							part === ".." ||
+							/[. ]$/.test(part) ||
+							Buffer.byteLength(part) > 255 ||
+							/^(con|prn|aux|nul|com[0-9]|lpt[0-9])(?:\.|$)/i.test(part),
+					) ||
+				(reason !== "ignored" && reason !== "sensitive")
+			)
+				continue;
+			const entry = { path, reason };
+			const additional = Buffer.byteLength(JSON.stringify(entry)) + (exclusions.length ? 1 : 0);
+			if (bytes + additional > DEVICE_FILE_SYNC_LIMITS.exclusionBytes) break;
+			bytes += additional;
+			exclusions.push(entry);
+		}
+		result.exclusions = exclusions;
 	}
 	for (const key of ["manifest", "preview"])
 		if (source[key] && typeof source[key] === "object") result[key] = transferSummary(source[key]);

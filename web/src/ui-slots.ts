@@ -317,7 +317,7 @@ export const BUILTIN_UI_ITEMS: BuiltinUiItem[] = [
 		id: "host:worktrees",
 		slot: "topbar.primary",
 		labelKey: "worktreeViewTitle",
-		icon: "branch",
+		icon: "folders",
 		kind: "action",
 		order: 4,
 		group: "primary",

@@ -1110,6 +1110,7 @@
 	/* ------------------------------------------------------------------ sessions */
 
 	.session-item {
+		position: relative;
 		display: flex;
 		align-items: center;
 		gap: 8px;
@@ -1237,18 +1238,6 @@
 		width: 16px;
 		height: 16px;
 		flex-shrink: 0;
-	}
-	.conv-streaming-dot {
-		display: inline-block;
-		width: 6px;
-		height: 6px;
-		margin-right: 6px;
-		border-radius: 50%;
-		background: var(--green);
-		box-shadow: 0 0 6px var(--green);
-		vertical-align: 1px;
-		flex-shrink: 0;
-		animation: lp-plugin-pulse 1.4s ease-in-out infinite;
 	}
 
 	.session-info {
@@ -1388,29 +1377,32 @@
 		margin: 6px 10px;
 	}
 
-	/* Streaming indicator on running-conversation entries (left panel).
-   呼吸指示灯：有呼吸灯时独占图标位置居中呈现，免除与消息气泡图标叠合的杂乱感 */
-	.conv-streaming {
-		width: 7.5px;
-		height: 7.5px;
-		border-radius: 50%;
-		flex-shrink: 0;
-		background: var(--green);
-		box-shadow:
-			0 0 0 1.5px var(--panel-bg, var(--bg-elev)),
-			0 0 6px var(--green);
-		animation: conv-pulse 1.4s ease-in-out infinite;
+	/* One quiet running indicator per row, including running descendants. */
+	.session-item.is-running::after {
+		content: "";
+		position: absolute;
+		inset: auto 8px 0;
+		height: 2px;
+		border-radius: 2px;
+		background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--green) 65%, transparent), transparent);
+		background-size: 55% 100%;
+		background-repeat: no-repeat;
+		animation: conversation-running-flow 5s linear infinite;
 		pointer-events: none;
 	}
-	.session-item:hover .conv-streaming {
-		box-shadow:
-			0 0 0 1.5px var(--bg-elev2),
-			0 0 7px var(--green);
+	@keyframes conversation-running-flow {
+		from {
+			background-position: -125% 0;
+		}
+		to {
+			background-position: 225% 0;
+		}
 	}
-	.session-item.active .conv-streaming {
-		box-shadow:
-			0 0 0 1.5px var(--accent-soft),
-			0 0 8px var(--green);
+	@media (prefers-reduced-motion: reduce) {
+		.session-item.is-running::after {
+			animation: none;
+			background-size: 100% 100%;
+		}
 	}
 
 	@keyframes conv-pulse {
@@ -1786,11 +1778,6 @@
 		border-radius: 50%;
 		flex-shrink: 0;
 	}
-	.subagents-collapsed-badge .subagent-dot.streaming {
-		background: var(--green);
-		box-shadow: 0 0 4px var(--green);
-		animation: conv-pulse 1.2s ease-in-out infinite;
-	}
 	.subagents-collapsed-badge .subagent-dot.question {
 		width: auto;
 		height: auto;
@@ -1878,11 +1865,16 @@
 		display: none;
 		gap: 4px;
 		align-items: center;
+		min-width: 0;
+		max-width: calc(100% - 8px);
 	}
 	.lp-row:hover .lp-del-group {
 		display: inline-flex;
 	}
 	.lp-del-opt {
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
 		font-size: 11px;
 		line-height: 1.4;
 		padding: 2px 7px;
