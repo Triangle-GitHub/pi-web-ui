@@ -1,13 +1,14 @@
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useEscapeKey } from "../shortcut-stack";
+import { LocalBots } from "./LocalBots";
 import { FiUsers, FiPlus, FiMessageSquare, FiMonitor } from "react-icons/fi";
 import type { DeviceGroupNavigation } from "../device-group-navigation";
 import { appUrl } from "../base-url";
 import { withToken } from "../auth-token";
 import { isZhLocale, useI18n } from "../i18n";
 
-type Device = { id: string; deviceId: string; name: string; enabled: boolean; online?: boolean };
+type Device = { id: string; deviceId?: string; name: string; enabled: boolean; online?: boolean };
 type Room = { id: string; name: string; botIds: string[] };
 type Detail = { room: Room };
 const words = {
@@ -80,7 +81,9 @@ function openChat(roomId: string) {
 export function DeviceGroupCreateDialog({ onClose }: { onClose: () => void }) {
 	const { locale } = useI18n();
 	const w = words[isZhLocale(locale) ? "zh" : "en"];
-	useEscapeKey(onClose);
+	useEscapeKey(() => {
+		if (!document.querySelector("dialog[open]")) onClose();
+	});
 	return createPortal(
 		<div className="modal-backdrop" onClick={onClose}>
 			<div
@@ -118,6 +121,7 @@ export function DeviceGroups({
 	const [error, setError] = useState("");
 	const [creating, setCreating] = useState(createOnly);
 	const [managing, setManaging] = useState(false);
+	const [creatingBot, setCreatingBot] = useState(false);
 	const [name, setName] = useState("");
 	const [selected, setSelected] = useState<string[]>([]);
 	const [busy, setBusy] = useState(false);
@@ -354,6 +358,14 @@ export function DeviceGroups({
 						<div className="dc-actions">
 							<button
 								className="dc-button"
+								type="button"
+								disabled={busy || !active || creatingBot}
+								onClick={() => setCreatingBot(true)}
+							>
+								<FiPlus /> {isZhLocale(locale) ? "新建 Bot" : "Create Bot"}
+							</button>
+							<button
+								className="dc-button"
 								type="submit"
 								disabled={busy || !active || (creating ? !name.trim() : !detail)}
 							>
@@ -402,6 +414,25 @@ export function DeviceGroups({
 					<p className="dg-empty">{w.choose}</p>
 				)}
 			</div>
+			{creatingBot && (
+				<LocalBots
+					createOnly
+					onCancel={() => setCreatingBot(false)}
+					onCreated={(bot, synced) => {
+						setCreatingBot(false);
+						if (synced && bot.enabled) {
+							setDevices((old) => [...old.filter((item) => item.id !== bot.id), bot]);
+							setSelected((old) => [...new Set([...old, bot.id])]);
+						} else {
+							setError(
+								isZhLocale(locale)
+									? "Bot 已保存；请启用并同步到中心后，再加入群组。"
+									: "Bot saved. Enable and sync it to the hub before adding it to the group.",
+							);
+						}
+					}}
+				/>
+			)}
 		</section>
 	);
 }

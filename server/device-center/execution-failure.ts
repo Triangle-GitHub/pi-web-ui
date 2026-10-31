@@ -1,6 +1,6 @@
 import { DeviceTaskError } from "./task-error.js";
 
-export type ExecutionPhase = "handshake" | "init" | "new_chat" | "model" | "tool" | "approval";
+export type ExecutionPhase = "handshake" | "init" | "new_chat" | "switch_session" | "model" | "tool" | "approval";
 
 // Only fixed vocabulary crosses the device boundary. Never redact arbitrary provider
 // prose and then publish the remainder: credentials can appear in any shape or field.

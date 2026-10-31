@@ -11,6 +11,7 @@ import {
 export { MACHINE_ROOT, browseQuery, joinProjectPath, isValidProjectName, parentOf };
 
 interface ProjectPickerProps {
+	portalContainer?: HTMLElement;
 	localOnly?: boolean;
 	open: boolean;
 	currentCwd: string;
@@ -34,12 +35,14 @@ export function ProjectPicker({
 	onCreateProject,
 	mode = "project",
 	localOnly,
+	portalContainer,
 }: ProjectPickerProps) {
 	const t = useT();
 	if (!open) return null;
 
 	return (
 		<DirectoryBrowser
+			portalContainer={portalContainer}
 			localOnly={localOnly}
 			currentCwd={currentCwd}
 			pathCompletions={pathCompletions}

@@ -107,6 +107,18 @@ it("opens a modal drawer and restores the page when dismissed with Escape", asyn
 	expect(document.body.style.overflow).toBe(previousOverflow);
 	expect(host.querySelector(".dc-bot-item")?.textContent).toContain("Helper");
 });
+it("keeps the directory browser inside the Bot modal and closes only the browser with Escape", async () => {
+	await mount([bot]);
+	await click("Helper");
+	const drawer = host.querySelector<HTMLDialogElement>("dialog")!;
+	await act(async () => drawer.querySelector<HTMLButtonElement>(".universal-path-browse-btn")!.click());
+	expect(drawer.querySelector(".project-picker")).toBeTruthy();
+	await act(async () =>
+		document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })),
+	);
+	expect(drawer.querySelector(".project-picker")).toBeNull();
+	expect(host.contains(drawer)).toBe(true);
+});
 it("switches configuration tabs without losing unsaved fields", async () => {
 	await mount([bot]);
 	await click("Helper");

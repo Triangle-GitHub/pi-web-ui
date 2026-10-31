@@ -14697,7 +14697,7 @@ export class ClientSession {
 					try {
 						await this.restoreProjectProviderKeysForCwd(targetCwd);
 						if (this.disposed || this.activeId !== convId || this.cwd !== targetCwd) return;
-						await this.restoreProjectModelForCwd(targetCwd);
+						if (!this.botExecution) await this.restoreProjectModelForCwd(targetCwd);
 						if (this.disposed || this.activeId !== convId || this.cwd !== targetCwd) return;
 						this.flushSnapshot();
 					} catch {

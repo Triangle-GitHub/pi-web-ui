@@ -340,13 +340,14 @@ describe("Bot-only device runtime", () => {
 		const f = await fixture();
 		const conversationId = "12345678-1234-4234-8234-123456789abc";
 		const path = join(f.options.dataDir, "session.jsonl");
-		await writeFile(path, "transcript");
 		const seen: (string | undefined)[] = [];
 		const executorFactory: NonNullable<Parameters<typeof createDeviceRuntime>[0]["executorFactory"]> = (options) => ({
 			async run(task) {
 				seen.push(options.resumePath);
 				options.onSession?.(task.id, "sdk-session");
 				options.onSessionPath?.(task.id, path);
+				// The SDK creates a fresh transcript only after the initial snapshot.
+				if (!options.resumePath) await writeFile(path, "transcript");
 				return options.resumePath ? "continued" : "created";
 			},
 			close() {},
@@ -385,13 +386,13 @@ describe("Bot-only device runtime", () => {
 		const f = await fixture();
 		const conversationId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 		const path = join(f.options.dataDir, "failed-session.jsonl");
-		await writeFile(path, "retained transcript");
 		const failed = createDeviceRuntime({
 			...f.options,
 			executorFactory: (options) => ({
 				async run(task) {
 					options.onSession?.(task.id, "retained-sdk");
 					options.onSessionPath?.(task.id, path);
+					await writeFile(path, "retained transcript");
 					throw new Error("local approval required");
 				},
 				close() {},
@@ -413,6 +414,32 @@ describe("Bot-only device runtime", () => {
 		});
 		cleanups.push(() => recovered.close());
 		expect(await recovered.onTask({ ...f.task("room0"), conversationId, resume: true })).toBe("recovered");
+	});
+
+	it("rejects completion and resume when a newly bound transcript never materializes", async () => {
+		const f = await fixture();
+		const conversationId = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+		let runs = 0;
+		const runtime = createDeviceRuntime({
+			...f.options,
+			executorFactory: (options) => ({
+				async run(task) {
+					runs++;
+					options.onSession?.(task.id, "empty-sdk");
+					options.onSessionPath?.(task.id, join(f.options.dataDir, "missing.jsonl"));
+					return "no transcript";
+				},
+				close() {},
+			}),
+		});
+		cleanups.push(() => runtime.close());
+		await expect(runtime.onTask({ ...f.task("room0"), conversationId })).rejects.toThrow(
+			"transcript unavailable after execution",
+		);
+		await expect(runtime.onTask({ ...f.task("room0"), conversationId, resume: true })).rejects.toThrow(
+			"Conversation transcript unavailable",
+		);
+		expect(runs).toBe(1);
 	});
 
 	it("cancels queued tasks without starting them and bounds waiting admission", async () => {

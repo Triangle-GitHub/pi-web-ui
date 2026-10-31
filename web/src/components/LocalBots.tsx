@@ -3,6 +3,7 @@ import { createPortal } from "react-dom";
 import { appUrl } from "../base-url";
 import { withToken } from "../auth-token";
 import { useT } from "../i18n";
+import { useEscapeKey } from "../shortcut-stack";
 import type { ModelInfo } from "../types";
 import { resolveBotCwd } from "../local-bot-path";
 import { UniversalPathPicker } from "./UniversalPathPicker";
@@ -83,6 +84,7 @@ export function LocalBots({
 	const [loading, setLoading] = useState(false);
 	const [reload, setReload] = useState(0);
 	const [modelOpen, setModelOpen] = useState(false);
+	const [catalogTab, setCatalogTab] = useState<"tools" | "skills" | "mcpServers">("tools");
 	const [tab, setTab] = useState<"identity" | "runtime" | "permissions">("identity");
 	const controller = useRef<AbortController | null>(null);
 	const baseCwd = useRef("");
@@ -146,14 +148,7 @@ export function LocalBots({
 			});
 		return () => current.abort();
 	}, [cwd, reload]);
-	useEffect(() => {
-		if (!modelOpen) return;
-		const close = (event: KeyboardEvent) => {
-			if (event.key === "Escape") setModelOpen(false);
-		};
-		window.addEventListener("keydown", close);
-		return () => window.removeEventListener("keydown", close);
-	}, [modelOpen]);
+	useEscapeKey(() => setModelOpen(false), modelOpen);
 	async function mutate(remove = false) {
 		if (!draft || busy) return;
 		const current = new AbortController();
@@ -440,6 +435,28 @@ export function LocalBots({
 											{optionsError ? t("deviceHubRetry") : t("localBotReload")}
 										</button>
 									</div>
+									<div className="dc-bot-catalog-tabs" role="tablist" aria-label={t("localBotPermissions")}>
+										{(
+											[
+												["tools", t("localBotTools")],
+												["skills", t("localBotSkills")],
+												["mcpServers", t("localBotMcpServers")],
+											] as const
+										).map(([key, title]) => (
+											<button
+												key={key}
+												type="button"
+												role="tab"
+												id={`bot-catalog-tab-${key}`}
+												aria-controls={`bot-catalog-${key}`}
+												aria-selected={catalogTab === key}
+												onClick={() => setCatalogTab(key)}
+											>
+												{title}
+												<span>{draft[key].length}</span>
+											</button>
+										))}
+									</div>
 									<div className="dc-bot-permissions">
 										{(
 											[
@@ -448,15 +465,22 @@ export function LocalBots({
 												["mcpServers", t("localBotMcpServers")],
 											] as const
 										).map(([key, title]) => (
-											<LocalBotCatalogPicker
+											<div
 												key={key}
-												title={title}
-												entries={options?.[key] ?? []}
-												selected={draft[key]}
-												disabled={busy}
-												pending={loading || !!optionsError}
-												onChange={(ids) => setDraft({ ...draft, [key]: ids })}
-											/>
+												role="tabpanel"
+												id={`bot-catalog-${key}`}
+												aria-labelledby={`bot-catalog-tab-${key}`}
+												hidden={catalogTab !== key}
+											>
+												<LocalBotCatalogPicker
+													title={title}
+													entries={options?.[key] ?? []}
+													selected={draft[key]}
+													disabled={busy}
+													pending={loading || !!optionsError}
+													onChange={(ids) => setDraft({ ...draft, [key]: ids })}
+												/>
+											</div>
 										))}
 									</div>
 								</div>

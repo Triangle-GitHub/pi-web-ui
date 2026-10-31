@@ -222,6 +222,7 @@ export function UniversalPathPicker({
 			{/* 自带弹窗：未外接 onOpenProjectPicker 时挂载，创建走内置回退或 onCreateProject */}
 			{!onOpenProjectPicker && pickerOpen && (
 				<ProjectPicker
+					portalContainer={wrapRef.current?.closest("dialog") ?? undefined}
 					localOnly={localOnly}
 					open
 					currentCwd={pickerCwd}

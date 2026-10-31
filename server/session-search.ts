@@ -163,7 +163,7 @@ export function piSessionsRoot(): string | undefined {
 export function isInsideSessionsDir(agentDir: string, targetPath: string): boolean {
 	const fold = (p: string) => (process.platform === "win32" ? p.toLowerCase() : p);
 	const abs = fold(resolve(targetPath));
-	const roots = [fold(resolve(agentDir, "sessions"))];
+	const roots = [fold(resolve(agentDir, "sessions")), fold(resolve(agentDir, "bot-sessions"))];
 	const extra = piSessionsRoot();
 	if (extra) roots.push(fold(resolve(extra)));
 	return roots.some((root) => abs.startsWith(root + sep));

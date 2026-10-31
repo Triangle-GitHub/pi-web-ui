@@ -44,6 +44,7 @@ async function fixture(
 		gap?: boolean;
 		refuseNew?: boolean;
 		onNew?: (socket: WebSocket, state: UiState) => void;
+		onSwitch?: (socket: WebSocket, state: UiState) => void;
 		onHello?: (socket: WebSocket, state: UiState) => void;
 		onSession?: (taskId: string, sessionId: string | undefined) => void;
 		resumePath?: string;
@@ -109,6 +110,7 @@ async function fixture(
 				initialId = "task-chat";
 				push(socket, { conversationId: initialId, sessionId: "task-sdk-session", messages: [], isEphemeral: false });
 			} else if (msg.type === "switch_session") {
+				if (opts.onSwitch) return opts.onSwitch(socket, snapshot);
 				initialId = "restored-chat";
 				push(socket, {
 					conversationId: initialId,
@@ -169,6 +171,30 @@ function delta(socket: WebSocket, state: UiState, patch: Partial<UiState>, appen
 // These tests use real loopback sockets and the production protocol envelope,
 // without invoking models or weakening the existing approval mechanism.
 describe("device task executor", () => {
+	it("reports transcript restoration failures as switch_session without sending a prompt", async () => {
+		const f = await fixture(
+			() => {
+				throw new Error("A failed restoration must not prompt the model");
+			},
+			{
+				resumePath: resolve("bot-sessions/previous-task/history.jsonl"),
+				onSwitch(socket) {
+					socket.send(
+						JSON.stringify({
+							type: "notice",
+							level: "error",
+							text: "Only transcripts inside the session directory can be opened",
+						}),
+					);
+				},
+			},
+		);
+		await expect(f.executor.run({ ...task(), resume: true })).rejects.toMatchObject({
+			failure: { phase: "switch_session" },
+		});
+		expect(f.received.some((message) => message.type === "prompt")).toBe(false);
+		expect(f.received.some((message) => message.type === "new_chat")).toBe(false);
+	});
 	it("restores only the authorized transcript and reports only the new turn", async () => {
 		const resumePath = resolve("persistent-session.jsonl");
 		const onSession = vi.fn();

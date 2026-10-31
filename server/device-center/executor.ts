@@ -72,6 +72,12 @@ function report(text: string): string {
 	return body + suffix;
 }
 
+function samePath(a?: string, b?: string): boolean {
+	if (!a || !b) return false;
+	const fold = (p: string) => (process.platform === "win32" ? resolve(p).toLowerCase() : resolve(p));
+	return fold(a) === fold(b);
+}
+
 function taskPrompt(task: DeviceExecutorTask): string {
 	return [
 		`Device task ${JSON.stringify(task.id)}, attempt ${JSON.stringify(task.attemptId)}.`,
@@ -245,7 +251,9 @@ export function createDeviceTaskExecutor(options: DeviceTaskExecutorOptions) {
 											: phase === "initial" || phase === "cwd"
 												? "init"
 												: phase === "new"
-													? "new_chat"
+													? options.resumePath
+														? "switch_session"
+														: "new_chat"
 													: "model"),
 								),
 								result,
@@ -359,7 +367,7 @@ export function createDeviceTaskExecutor(options: DeviceTaskExecutorOptions) {
 					if (phase === "new") {
 						if (state.rev <= baselineRev || state.isStreaming) return;
 						if (options.resumePath) {
-							if (state.sessionFile !== options.resumePath) return;
+							if (!samePath(state.sessionFile, options.resumePath)) return;
 						} else if (state.messages.length || state.historyTotal) return;
 						if (state.isEphemeral || resolve(state.cwd) !== cwd) {
 							finish("Task session is not persistent in requested cwd");
@@ -409,12 +417,12 @@ export function createDeviceTaskExecutor(options: DeviceTaskExecutorOptions) {
 					if (
 						resolve(state.cwd) !== cwd ||
 						state.isEphemeral ||
-						(options.resumePath && state.sessionFile !== options.resumePath)
+						(options.resumePath && !samePath(state.sessionFile, options.resumePath))
 					) {
 						finish("Task transcript or fixed workspace ownership changed");
 						return;
 					}
-					if (state.sessionFile && state.sessionFile !== capturedPath) {
+					if (state.sessionFile && !samePath(state.sessionFile, capturedPath)) {
 						try {
 							options.onSessionPath?.(task.id, state.sessionFile);
 							capturedPath = state.sessionFile;

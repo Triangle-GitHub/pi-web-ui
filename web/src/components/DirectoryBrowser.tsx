@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import { useEscapeKey } from "../shortcut-stack";
 import {
 	FiArrowRight,
 	FiArrowUp,
@@ -74,6 +75,7 @@ export const parentOf = (p: string): string | null => {
 };
 
 interface DirectoryBrowserProps {
+	portalContainer?: HTMLElement;
 	localOnly?: boolean;
 	currentCwd: string;
 	pathCompletions: { name: string; path: string; type: "dir" | "file" }[];
@@ -101,6 +103,7 @@ export function DirectoryBrowser({
 	role,
 	ariaLabel,
 	localOnly = false,
+	portalContainer,
 }: DirectoryBrowserProps) {
 	const t = useT();
 	const isZh = isZhLocale(useLocale());
@@ -192,25 +195,18 @@ export function DirectoryBrowser({
 		return () => cancelAnimationFrame(frame);
 	}, [activeTab]);
 
-	// 全局 Escape 键监听
-	useEffect(() => {
-		const handleKeyDown = (e: KeyboardEvent) => {
-			if (e.key === "Escape") {
-				if (showNew || showRemoteNew) {
-					setShowNew(false);
-					setNewName("");
-					setLocalError(null);
-					setShowRemoteNew(false);
-					setRemoteNewName("");
-					setRemoteCreateError(null);
-				} else {
-					onClose();
-				}
-			}
-		};
-		window.addEventListener("keydown", handleKeyDown);
-		return () => window.removeEventListener("keydown", handleKeyDown);
-	}, [showNew, showRemoteNew, onClose]);
+	useEscapeKey(() => {
+		if (showNew || showRemoteNew) {
+			setShowNew(false);
+			setNewName("");
+			setLocalError(null);
+			setShowRemoteNew(false);
+			setRemoteNewName("");
+			setRemoteCreateError(null);
+		} else {
+			onClose();
+		}
+	});
 
 	// 本地目录浏览请求（60ms 防抖）
 	useEffect(() => {
@@ -1177,6 +1173,6 @@ export function DirectoryBrowser({
 				)}
 			</div>
 		</>,
-		document.body,
+		portalContainer ?? document.body,
 	);
 }

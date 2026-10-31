@@ -17,6 +17,12 @@ type Transcript = { binding: string; path: string };
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const MAX_WAITING_TASKS = 32;
 
+function samePath(a?: string, b?: string): boolean {
+	if (!a || !b) return false;
+	const fold = (p: string) => (process.platform === "win32" ? resolve(p).toLowerCase() : resolve(p));
+	return fold(a) === fold(b);
+}
+
 /** The task settled, but its executor has not confirmed that execution stopped. */
 export class DeviceTaskStopUnconfirmedError extends Error {
 	readonly stopUnconfirmed = true;
@@ -281,7 +287,7 @@ export function createDeviceRuntime(options: {
 							!boundSession ||
 							sessions.get(boundSession)?.taskId !== task.id ||
 							!isAbsolute(path) ||
-							(resumePath && path !== resumePath)
+							(resumePath && !samePath(path, resumePath))
 						)
 							throw new Error("Transcript ownership mismatch");
 						if (task.conversationId) {
@@ -294,7 +300,10 @@ export function createDeviceRuntime(options: {
 							)
 								throw new DeviceTaskError("Conversation transcript ownership changed");
 							try {
-								if (!statSync(path).isFile()) throw new Error();
+								// Fresh SDK sessions allocate a path before the first message creates
+								// the file. Bind it now so failed first turns remain recoverable.
+								// Existing resume paths must still refer to a real transcript.
+								if (resumePath && !statSync(path).isFile()) throw new Error();
 								const next = { ...transcripts, [task.conversationId]: { binding, path } };
 								writeJsonAtomicSync(transcriptFile!, next);
 								transcripts = next;
@@ -328,6 +337,11 @@ export function createDeviceRuntime(options: {
 						resolve(currentBot.cwd) !== resolve(lease.root)
 					)
 						throw new DeviceTaskError("Conversation transcript capture failed");
+					try {
+						if (!statSync(transcriptPath).isFile()) throw new Error();
+					} catch {
+						throw new DeviceTaskError("Conversation transcript unavailable after execution");
+					}
 				}
 				return result;
 			} finally {

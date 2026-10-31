@@ -6,6 +6,19 @@ import { DeviceGroups } from "../../web/src/components/DeviceGroups";
 import type { DeviceGroupNavigation } from "../../web/src/device-group-navigation";
 
 vi.mock("../../web/src/i18n", () => ({ useI18n: () => ({ locale: "en" }), isZhLocale: () => false }));
+vi.mock("../../web/src/components/LocalBots", () => ({
+	LocalBots: ({ onCreated, onCancel }: any) =>
+		createElement(
+			"div",
+			{ "data-testid": "bot-creator" },
+			createElement(
+				"button",
+				{ onClick: () => onCreated({ id: "new-bot", name: "New helper", enabled: true }, true) },
+				"Save Bot",
+			),
+			createElement("button", { onClick: onCancel }, "Cancel Bot"),
+		),
+}));
 vi.mock("../../web/src/auth-token", () => ({ withToken: (url: string) => `${url}?token=local-test` }));
 const devices = [
 	{ id: "alpha", name: "Twin", online: true },
@@ -80,6 +93,27 @@ afterEach(() => {
 });
 
 describe("device group management", () => {
+	it("creates and selects a Bot without losing the group draft", async () => {
+		mockApi((path, init) =>
+			path === "rooms" && init.method === "POST"
+				? response({ room: { id: "created", name: "Draft group", botIds: ["new-bot"] } })
+				: undefined,
+		);
+		await render();
+		await click("Create group");
+		await input("Draft group");
+		await click("Create Bot");
+		expect(host.querySelector("[data-testid=bot-creator]")).toBeTruthy();
+		await click("Cancel Bot");
+		expect(host.querySelector("[data-testid=bot-creator]")).toBeNull();
+		await click("Create Bot");
+		await click("Save Bot");
+		expect(host.querySelector<HTMLInputElement>("#device-group-name")!.value).toBe("Draft group");
+		const choice = [...host.querySelectorAll(".dg-device")].find((label) => label.textContent?.includes("New helper"));
+		expect(choice?.querySelector<HTMLInputElement>("input")?.checked).toBe(true);
+		await submit();
+		expect(bodies("/rooms?")).toEqual([{ name: "Draft group", botIds: ["new-bot"] }]);
+	});
 	it("creates a group with stable device IDs, announces the change and opens the main chat", async () => {
 		let created = false;
 		mockApi((path, init) => {

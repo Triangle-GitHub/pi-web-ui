@@ -263,14 +263,20 @@ try {
 		return value.bots.some((item) => item.id === bot.id && item.enabled);
 	}, "Bot published to Hub");
 	const { room } = (await api(hubOrigin, "/api/rooms", { name: "Bot live tasks", botIds: [bot.id] }, 201)).value;
-	async function dispatch(taskMode, expectedStatus) {
+	async function dispatch(taskMode, expectedStatus, conversationId) {
 		mode = taskMode;
 		const before = requests.length;
-		const { value } = await api(hubOrigin, `/api/rooms/${room.id}/messages`, {
-			text: `BOT_LIVE_${taskMode}: ${taskMode === "read" ? "Read probe.txt, then report its exact content." : "Reply with the deterministic completion."}`,
-			targetBotIds: [bot.id],
-			idempotencyKey: `bot-live-${taskMode}`,
-		});
+		const { value } = await api(
+			hubOrigin,
+			conversationId
+				? `/api/rooms/${room.id}/conversations/${conversationId}/messages`
+				: `/api/rooms/${room.id}/messages`,
+			{
+				text: `BOT_LIVE_${taskMode}: ${taskMode === "read" ? "Read probe.txt, then report its exact content." : "Reply with the deterministic completion."}`,
+				targetBotIds: [bot.id],
+				idempotencyKey: `bot-live-${taskMode}-${conversationId ?? "new"}`,
+			},
+		);
 		const id = value.tasks[0].id;
 		const task = await until(
 			async () => {
@@ -301,6 +307,21 @@ try {
 	assert.equal(plain.calls[0].authorization, "Bearer bot-live-known-test-key");
 	assert.ok(plain.calls[0].body.messages.some((message) => JSON.stringify(message).includes("BOT_LIVE_plain")));
 	console.log("PASS real capability hello/new_chat/prompt -> SDK HTTP -> assistant -> Hub completion");
+	assert.ok(plain.task.conversationId, "First task must create a persistent conversation");
+	const continued = await dispatch("plain", "completed", plain.task.conversationId);
+	assert.equal(continued.task.resume, true);
+	assert.equal(continued.task.conversationId, plain.task.conversationId);
+	assert.match(continued.task.report, /BOT_LIVE_PLAIN_DONE/);
+	assert.equal(continued.calls.length, 1);
+	assert.ok(
+		continued.calls[0].body.messages.some(
+			(message) => message.role === "assistant" && JSON.stringify(message.content).includes("BOT_LIVE_PLAIN_DONE"),
+		),
+		"Continued SDK inference must contain the previous assistant response",
+	);
+	console.log(
+		"PASS same group conversation resumed persisted Bot transcript and supplied prior assistant history to SDK inference",
+	);
 	// Reload from an ordinary local UI after the first executor releases its capability.
 	// A disposed Bot resource loader must never run under a revoked capability.
 	control = new WebSocket(`${localOrigin.replace("http:", "ws:")}/ws`, { origin: localOrigin });

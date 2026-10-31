@@ -3272,13 +3272,68 @@
 		min-width: 0;
 		max-width: 100%;
 	}
-	.dc-bot-catalog-actions input {
-		flex: 1 1 100%;
+	.dc-bot-catalog-tabs {
+		display: flex;
+		gap: 4px;
+		padding: 4px;
+		min-width: 0;
+		max-width: 100%;
+		border-radius: 10px;
+		background: var(--bg-elev);
+	}
+	.dc-bot-catalog-tabs button {
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		gap: 8px;
+		flex: 1;
+		min-width: 0;
+		padding: 9px 6px;
+		border: 0;
+		border-radius: 7px;
+		background: transparent;
+		color: var(--text-dim);
+		cursor: pointer;
+	}
+	.dc-bot-catalog-tabs button[aria-selected="true"] {
+		background: var(--bg);
+		color: var(--text);
+		box-shadow: 0 1px 4px #0002;
+	}
+	.dc-bot-catalog-tabs button span {
+		font-size: 11px;
+		font-variant-numeric: tabular-nums;
+		color: var(--text-dim);
+	}
+	.dc-bot-editor .dc-bot-catalog {
+		padding: 0;
+		border: 0;
+		background: transparent;
+	}
+	.dc-bot-editor .dc-bot-catalog legend {
+		padding: 0 0 12px;
+	}
+	.dc-bot-catalog-actions {
+		flex-wrap: nowrap;
+		margin-bottom: 10px;
+	}
+	.dc-bot-catalog-actions > input[type="search"] {
+		flex: 1;
 		min-width: 0;
 		width: 100%;
+		padding: 9px 10px;
+		border: 1px solid var(--border);
+		border-radius: 8px;
+		background: var(--bg-elev);
+		color: var(--text);
+	}
+	.dc-bot-catalog-actions .dc-button {
+		flex: none;
+		padding: 7px 9px;
+		font-size: 12px;
 	}
 	.dc-bot-catalog-list {
-		max-height: 240px;
+		max-height: min(480px, 50dvh);
 		overflow-y: auto;
 		overscroll-behavior: contain;
 	}
@@ -3299,6 +3354,39 @@
 		min-width: 0;
 		overflow-wrap: anywhere;
 		word-break: break-word;
+	}
+	.dc-bot-option {
+		padding: 10px;
+		border-radius: 8px;
+		transition: background 0.15s;
+	}
+	.dc-bot-option:hover {
+		background: var(--bg-elev);
+	}
+	.dc-bot-option.is-selected {
+		background: color-mix(in srgb, var(--accent) 9%, transparent);
+	}
+	.dc-bot-option input {
+		accent-color: var(--accent);
+	}
+	.dc-bot-option strong {
+		font-size: 12.5px;
+		font-weight: 600;
+	}
+	.dc-bot-option .dc-bot-option-description {
+		display: -webkit-box;
+		-webkit-line-clamp: 2;
+		-webkit-box-orient: vertical;
+		overflow: hidden;
+		line-height: 1.5;
+		margin-top: 3px;
+	}
+	.dc-bot-option .dc-bot-option-path {
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		font-family: var(--mono);
+		font-size: 10px;
 	}
 	.dc-bot-option small {
 		display: block;
@@ -30228,8 +30316,18 @@
 		position: relative;
 		display: flex;
 		align-items: center;
-		gap: 6px;
+		gap: 4px;
 		width: 100%;
+		min-width: 0;
+		max-width: 100%;
+		padding: 4px;
+		background: var(--bg);
+		border: 1px solid var(--border);
+		border-radius: 8px;
+	}
+
+	.universal-path-picker-root:focus-within {
+		border-color: var(--accent);
 	}
 
 	.universal-path-input-group {
@@ -30238,15 +30336,17 @@
 		align-items: center;
 		flex: 1;
 		min-width: 0;
-		background: var(--bg);
-		border: 1px solid var(--border);
-		border-radius: 6px;
-		padding: 2px 6px;
+		padding: 0 6px;
 		transition: border-color 0.15s ease;
 	}
 
-	.universal-path-input-group:focus-within {
-		border-color: var(--accent);
+	.universal-path-input-group > input.universal-path-input {
+		background: transparent;
+		border: 0;
+		border-radius: 0;
+		box-shadow: none;
+		outline: none;
+		padding: 7px 0;
 	}
 
 	.universal-path-icon {
@@ -30288,11 +30388,11 @@
 		display: inline-flex;
 		align-items: center;
 		justify-content: center;
-		background: var(--bg);
-		border: 1px solid var(--border);
+		background: transparent;
+		border: 0;
 		color: var(--text);
-		border-radius: 6px;
-		padding: 4px 7px;
+		border-radius: 5px;
+		padding: 8px;
 		font-size: 13px;
 		line-height: 1;
 		cursor: pointer;

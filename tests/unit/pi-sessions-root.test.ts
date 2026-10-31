@@ -48,6 +48,15 @@ describe("isInsideSessionsDir", () => {
 		expect(isInsideSessionsDir(agentDir, inside)).toBe(true);
 	});
 
+	it("allows a transcript under <agentDir>/bot-sessions", () => {
+		expect(isInsideSessionsDir(agentDir, "/tmp/agent/bot-sessions/client-1/a.jsonl")).toBe(true);
+	});
+
+	it("rejects siblings and traversal outside the Bot session root", () => {
+		expect(isInsideSessionsDir(agentDir, "/tmp/agent/bot-sessions-other/a.jsonl")).toBe(false);
+		expect(isInsideSessionsDir(agentDir, "/tmp/agent/bot-sessions/../../evil.jsonl")).toBe(false);
+	});
+
 	it("rejects /tmp/evil.jsonl outside the sessions root", () => {
 		expect(isInsideSessionsDir(agentDir, "/tmp/evil.jsonl")).toBe(false);
 	});

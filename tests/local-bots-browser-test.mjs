@@ -229,9 +229,27 @@ async function main() {
 					.then((value) => value === work),
 			"initial catalog cwd",
 		);
+		await form.getByRole("tab", { name: "Runtime", exact: true }).click();
 		// Browse a real child directory over the real application's WebSocket.
 		await form.locator(".universal-path-browse-btn").click();
 		const picker = page.locator(".project-picker");
+		await picker.waitFor({ state: "visible" });
+		assert.equal(await picker.evaluate((element) => element.closest("dialog")?.open), true);
+		const pickerBox = await picker.boundingBox();
+		assert.ok(pickerBox);
+		assert.equal(
+			await picker.evaluate((element) => {
+				const rect = element.getBoundingClientRect();
+				return element.contains(document.elementFromPoint(rect.x + rect.width / 2, rect.y + 30));
+			}),
+			true,
+			"Directory picker must receive pointer input above the modal drawer",
+		);
+		await page.keyboard.press("Escape");
+		await picker.waitFor({ state: "hidden" });
+		assert.equal(await form.isVisible(), true, "Escape closes only the directory picker");
+		await form.locator(".universal-path-browse-btn").click();
+		await picker.waitFor({ state: "visible" });
 		await picker
 			.locator(".cwd-enter")
 			.filter({ hasText: /^review-project$/ })
@@ -262,6 +280,7 @@ async function main() {
 		await models.locator(".dd-item").filter({ hasText: "Review Reasoner" }).click();
 		await models.waitFor({ state: "hidden" });
 		assert.equal(await form.locator('button[aria-haspopup="dialog"]').innerText(), "Review Reasoner");
+		await form.getByRole("tab", { name: "Capabilities", exact: true }).click();
 		const catalogs = form.locator(".dc-bot-catalog");
 		assert.equal(await catalogs.count(), 3);
 		for (const [index, query, label, rejected] of [
@@ -269,6 +288,7 @@ async function main() {
 			[1, "review checklist", "Review guide", "Release guide"],
 			[2, "docs-regression", "Documentation", "Issue tracker"],
 		]) {
+			await form.locator(".dc-bot-catalog-tabs button").nth(index).click();
 			const catalog = catalogs.nth(index);
 			await waitFor(() => catalog.getByRole("checkbox", { name: new RegExp(label) }).count(), `${label} catalog`);
 			await catalog.getByRole("searchbox").fill(query);
@@ -293,12 +313,14 @@ async function main() {
 			.nth(2)
 			.getByText(/Connect this server in MCP settings/)
 			.waitFor();
+		await form.locator(".dc-bot-catalog-tabs button").nth(1).click();
 		// Filtered bulk selection must select only the currently visible results.
 		await catalogs.nth(1).getByRole("button", { name: "Clear", exact: true }).click();
 		await catalogs.nth(1).getByRole("searchbox").fill("Review guide");
 		await catalogs.nth(1).getByRole("button", { name: "Select results", exact: true }).click();
 		await catalogs.nth(1).getByRole("searchbox").fill("");
 		assert.equal(await catalogs.nth(1).locator('input[type="checkbox"]:checked').count(), 1);
+		await form.locator(".dc-bot-catalog-tabs button").nth(0).click();
 		// Bulk selection must use catalog IDs, and Clear must reset even filtered selections.
 		await catalogs.nth(0).getByRole("button", { name: "Select all", exact: true }).click();
 		assert.equal(await catalogs.nth(0).locator('input[type="checkbox"]:checked').count(), 2);
@@ -313,12 +335,14 @@ async function main() {
 		const desktop = await page.screenshot({ fullPage: true, animations: "disabled" });
 		await page.setViewportSize({ width: 390, height: 844 });
 		await assertNoOverflow(page, "narrow");
+		await form.getByRole("tab", { name: "Runtime", exact: true }).click();
 		await form.locator('button[aria-haspopup="dialog"]').click();
 		await models.locator(".dd-search").waitFor();
 		const modelBounds = await models.boundingBox();
 		assert.ok(modelBounds.x >= 0 && modelBounds.x + modelBounds.width <= 391, "Model portal fits narrow viewport");
 		await models.locator(".dd-search").press("Escape");
 		await models.waitFor({ state: "hidden" });
+		await form.getByRole("tab", { name: "Capabilities", exact: true }).click();
 		await catalogs.nth(0).scrollIntoViewIfNeeded();
 		const narrow = await page.screenshot({ fullPage: true, animations: "disabled" });
 		const savedResponse = page.waitForResponse(
@@ -352,11 +376,13 @@ async function main() {
 					.then((text) => text === "Review Reasoner"),
 			"saved model restored",
 		);
+		await form.getByRole("tab", { name: "Capabilities", exact: true }).click();
 		for (const [index, label] of [
 			[0, "Read files"],
 			[1, "Review guide"],
 			[2, "Documentation"],
-		])
+		]) {
+			await form.locator(".dc-bot-catalog-tabs button").nth(index).click();
 			assert.equal(
 				await catalogs
 					.nth(index)
@@ -365,6 +391,7 @@ async function main() {
 				true,
 				"Saved selections must reopen checked",
 			);
+		}
 		let releaseCatalog;
 		let markStarted;
 		const started = new Promise((resolve) => {
@@ -376,6 +403,8 @@ async function main() {
 				releaseCatalog = resolve;
 			}),
 		};
+		await form.getByRole("tab", { name: "Capabilities", exact: true }).click();
+		await form.locator(".dc-bot-catalog-tabs button").nth(0).click();
 		await form.locator(".dc-bot-options-status button").click();
 		await started;
 		await waitFor(() => form.locator(".dc-bot-options-status button").isDisabled(), "catalog loading state");
@@ -384,8 +413,10 @@ async function main() {
 			true,
 			"Loading retains stored permission IDs",
 		);
+		await form.getByRole("tab", { name: "Runtime", exact: true }).click();
 		await form.locator("#local-bot-cwd").fill(work);
 		await form.locator("#local-bot-cwd").press("Tab");
+		await form.getByRole("tab", { name: "Capabilities", exact: true }).click();
 		await catalogs
 			.nth(0)
 			.getByRole("checkbox", { name: /Read files/ })
@@ -425,9 +456,11 @@ async function main() {
 				.count(),
 			0,
 		);
+		await form.getByRole("tab", { name: "Runtime", exact: true }).click();
 		// Edit permissions and explicitly return to the inherited model.
 		await form.locator('button[aria-haspopup="dialog"]').click();
 		await models.getByRole("button", { name: "Inherit default model", exact: true }).click();
+		await form.getByRole("tab", { name: "Capabilities", exact: true }).click();
 		await catalogs
 			.nth(0)
 			.getByRole("checkbox", { name: /Read files/ })
@@ -436,11 +469,14 @@ async function main() {
 			.nth(0)
 			.getByRole("checkbox", { name: /Edit files/ })
 			.check();
+		await form.locator(".dc-bot-catalog-tabs button").nth(1).click();
 		await catalogs.nth(1).getByRole("button", { name: "Clear", exact: true }).click();
+		await form.locator(".dc-bot-catalog-tabs button").nth(2).click();
 		await catalogs
 			.nth(2)
 			.getByRole("checkbox", { name: /Issue tracker/ })
 			.check();
+		await form.getByRole("tab", { name: "Identity and prompt", exact: true }).click();
 		await form.getByLabel("Name", { exact: true }).fill("Updated Review Bot");
 		const editResponse = page.waitForResponse(
 			(response) =>
@@ -459,6 +495,8 @@ async function main() {
 		await form.waitFor({ state: "hidden" });
 		await bots.getByRole("button", { name: /Updated Review Bot/ }).click();
 		assert.equal(await form.locator('button[aria-haspopup="dialog"]').innerText(), "Inherit default model");
+		await form.getByRole("tab", { name: "Capabilities", exact: true }).click();
+		await form.locator(".dc-bot-catalog-tabs button").nth(0).click();
 		await waitFor(
 			() =>
 				catalogs

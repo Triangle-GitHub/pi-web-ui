@@ -66,7 +66,11 @@ export function LocalBotCatalogPicker({
 			</div>
 			<div className="dc-bot-catalog-list">
 				{visible.map((entry, index) => (
-					<label className="dc-bot-option" key={entry.id} htmlFor={`${id}-${index}`}>
+					<label
+						className={`dc-bot-option${selected.includes(entry.id) ? " is-selected" : ""}`}
+						key={entry.id}
+						htmlFor={`${id}-${index}`}
+					>
 						<input
 							id={`${id}-${index}`}
 							type="checkbox"
@@ -83,11 +87,21 @@ export function LocalBotCatalogPicker({
 						<span>
 							<strong>{entry.name}</strong>
 							{!known.has(entry.id) && <small>{pending ? t("localBotUnverified") : t("localBotUnavailable")}</small>}
-							{entry.description && <small>{entry.description}</small>}
+							{entry.description && (
+								<small className="dc-bot-option-description" title={entry.description}>
+									{entry.description}
+								</small>
+							)}
 							{entry.status === "not_loaded" && <small>{t("localBotMcpNotLoaded")}</small>}
 							{entry.status === "disabled" && <small>{t("localBotMcpDisabled")}</small>}
-							{entry.source && <small>{entry.source}</small>}
-							{entry.path && <small>{entry.path}</small>}
+							{entry.source && entry.source !== "builtin" && (
+								<small className="dc-bot-option-source">{entry.source}</small>
+							)}
+							{entry.path && (
+								<small className="dc-bot-option-path" title={entry.path}>
+									{entry.path}
+								</small>
+							)}
 						</span>
 					</label>
 				))}
