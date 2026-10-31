@@ -263,7 +263,7 @@ export function applyUiSlotCardinality<T extends { id: string; hidden: boolean }
  *                    file.preview.toolbar 在 FilePreview 的 .fp-head-actions 尾部。
  */
 export const BUILTIN_UI_ITEMS: BuiltinUiItem[] = [
-	// ---- 左栏三个分区（P2：布局页可隐藏 / 调序；LeftPanel 按此计划挂载，见 left-sections.ts） ----
+	// ---- 左栏四个分区（P2：布局页可隐藏 / 调序；LeftPanel 按此计划挂载，见 left-sections.ts） ----
 	{
 		id: "host:lp-projects",
 		slot: "leftpanel.sections",
@@ -271,6 +271,14 @@ export const BUILTIN_UI_ITEMS: BuiltinUiItem[] = [
 		icon: "folder",
 		kind: "action",
 		order: 10,
+	},
+	{
+		id: "host:lp-groups",
+		slot: "leftpanel.sections",
+		labelKey: "leftPanelGroups",
+		icon: "users",
+		kind: "action",
+		order: 15,
 	},
 	{
 		id: "host:lp-running",
@@ -1458,7 +1466,7 @@ export const BUILTIN_UI_ITEMS: BuiltinUiItem[] = [
 	// leftpanel.sessions / leftpanel.running / leftpanel.history / notice.actions 等行内槽位在宿主侧
 	// 没有可整理的独立入口（会话点行即打开、通知条无常驻按钮），保持空数组，
 	// 无插件贡献时渲染层返回 null / 不渲染，DOM 与旧版一字不差。
-	// 左栏三个分区本身已登记为 host:lp-*（见上方 BUILTIN）。
+	// 左栏四个分区本身已登记为 host:lp-*（见上方 BUILTIN）。
 ];
 
 /** 插件视图 tab 的合成条目 id（`<pluginId>:__view`，`__view` 为保留字）。 */
@@ -2116,7 +2124,7 @@ export function buildUiSlots(
 		mark(id, "order");
 	});
 
-	// 左栏三个分区只能待在 leftpanel.sections：它们由 LeftPanel 按计划挂载，搬到别的槽位就会整块消失。
+	// 左栏四个分区只能待在 leftpanel.sections：它们由 LeftPanel 按计划挂载，搬到别的槽位就会整块消失。
 	for (const id of Object.values(LP_SECTION_ENTRY_ID)) {
 		const entry = byId.get(id);
 		if (entry && entry.slot !== "leftpanel.sections") {

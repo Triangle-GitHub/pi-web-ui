@@ -54,6 +54,41 @@ describe("群组分区的拖动布局", () => {
 		).toEqual(["groups", "convs"]);
 		expect(parseLpWeights('{"groups":0.4}', { projects: 1, groups: 1, convs: 1, sessions: 1 }).groups).toBe(0.4);
 	});
+
+	it("合并引擎已给出 groups 条目时显隐跟随布局页（hidden → 不渲染），不兑底重排", () => {
+		const plan = withDeviceGroupSection(
+			planLeftSections([
+				entry(LP_SECTION_ENTRY_ID.projects),
+				entry(LP_SECTION_ENTRY_ID.groups, true),
+				entry(LP_SECTION_ENTRY_ID.convs),
+			]),
+		);
+		expect(plan.map((item) => item.key)).toEqual(["projects", "groups", "convs", "sessions"]);
+		expect(plan.find((item) => item.key === "groups")?.shown).toBe(false);
+		const shown = plan.filter((item) => item.shown).map((item) => item.key);
+		expect(shown).toEqual(["projects", "convs", "sessions"]);
+		// 隐藏后分隔条重新配对：projects 直接连 convs
+		expect(
+			sashPairs(
+				flexSectionKeys(plan, () => true),
+				() => false,
+			),
+		).toEqual([
+			["projects", "convs"],
+			["convs", "sessions"],
+		]);
+	});
+
+	it("合并引擎已给出 groups 条目时顺序跟随引擎（调序生效，不再插到项目后）", () => {
+		const plan = withDeviceGroupSection(
+			planLeftSections([
+				entry(LP_SECTION_ENTRY_ID.sessions),
+				entry(LP_SECTION_ENTRY_ID.groups),
+				entry(LP_SECTION_ENTRY_ID.projects),
+			]),
+		);
+		expect(plan.map((item) => item.key)).toEqual(["sessions", "groups", "projects", "convs"]);
+	});
 });
 
 describe("planLeftSections（顺序 + 显隐）", () => {

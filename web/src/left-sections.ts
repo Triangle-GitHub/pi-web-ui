@@ -2,7 +2,7 @@
  * 左栏分区（最近项目 / 运行的对话 / 历史对话 + 插件自定义分区）的**顺序、显隐与权重**纯函数。
  *
  * 数据来源是宿主挂载点 `leftpanel.sections`：
- *   - 三条 `host:lp-*` 是宿主内置分区（P2）；
+ *   - 四条 `host:lp-*` 是宿主内置分区（P2）；
  *   - 插件可以用 `kind="view"` 往这里加**自定义分区**（P4）：分区正文由插件的客户端
  *     bundle 挂载（同 tasks.panel 的 PluginPage 口径）。插件**不能替换**内置分区，
  *     只能新增；内置分区的隐藏 / 调序仍走布局页与 arrange hide。
@@ -16,12 +16,13 @@
 /** 插件自定义分区的键：`plugin:<插件id>:<条目id>`（条目 id 即合并引擎的全局 id）。 */
 export type PluginSectionKey = `plugin:${string}`;
 
-/** 左栏分区键：三个宿主分区 + 插件自定义分区。 */
+/** 左栏分区键：四个宿主分区 + 插件自定义分区。 */
 export type LpSectionKey = "projects" | "groups" | "convs" | "sessions" | PluginSectionKey;
 
 /** 宿主分区键 → 挂载点条目 id（用户偏好与插件 arrange 都用这个 id）。 */
-export const LP_SECTION_ENTRY_ID: Readonly<Record<"projects" | "convs" | "sessions", string>> = {
+export const LP_SECTION_ENTRY_ID: Readonly<Record<"projects" | "groups" | "convs" | "sessions", string>> = {
 	projects: "host:lp-projects",
+	groups: "host:lp-groups",
 	convs: "host:lp-running",
 	sessions: "host:lp-history",
 };
@@ -33,8 +34,10 @@ export const LP_SECTION_DEFAULT_ORDER: readonly ("projects" | "convs" | "session
 	"sessions",
 ];
 
-const HOST_KEY_BY_ENTRY_ID: ReadonlyMap<string, "projects" | "convs" | "sessions"> = new Map(
-	(Object.keys(LP_SECTION_ENTRY_ID) as ("projects" | "convs" | "sessions")[]).map((k) => [LP_SECTION_ENTRY_ID[k], k]),
+const HOST_KEY_BY_ENTRY_ID: ReadonlyMap<string, "projects" | "groups" | "convs" | "sessions"> = new Map(
+	(Object.keys(LP_SECTION_ENTRY_ID) as ("projects" | "groups" | "convs" | "sessions")[]).map(
+		(k) => [LP_SECTION_ENTRY_ID[k], k] as const,
+	),
 );
 
 /** 插件分区键前缀（权重持久化时用来区分「宿主键」与「插件键」）。 */
@@ -92,11 +95,16 @@ export function planLeftSections<E extends LpSectionEntryLike>(
 	return order;
 }
 
-/** 群组紧随可见项目区；项目区隐藏时置顶，并参与同一套权重与分隔条计算。 */
+/**
+ * 群组分区的兑底：合并引擎已给出 `host:lp-groups` 条目时，显隐与顺序完全跟随布局页（用户可在
+ * 「界面布局」里隐藏 / 调序，与项目 / 运行 / 历史三分区同一套规则）；只有条目不在场时（旧快照、
+ * 未升级的数据）才补出来，插到可见项目区之后，保持改造前的常显行为。
+ */
 export function withDeviceGroupSection<E extends LpSectionEntryLike>(
 	plan: readonly LpSectionPlanItem<E>[],
 ): LpSectionPlanItem<E>[] {
-	const result = plan.filter((item) => item.key !== "groups");
+	if (plan.some((item) => item.key === "groups")) return [...plan];
+	const result = [...plan];
 	const projectIndex = result.findIndex((item) => item.key === "projects" && item.shown);
 	result.splice(projectIndex + 1, 0, { key: "groups", shown: true });
 	return result;

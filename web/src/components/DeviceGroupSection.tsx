@@ -7,6 +7,7 @@ import { withToken } from "../auth-token";
 import { isZhLocale, useI18n } from "../i18n";
 import { openContextMenu } from "../context-menu-state";
 import type { UiSlotEntry } from "../ui-slots";
+import { hostEntryIcon } from "../host-icon";
 
 export type SidebarDeviceGroup = { id: string; name: string; botIds: string[] };
 export const DEVICE_GROUPS_CHANGED = "pi-web-ui:device-groups-changed";
@@ -148,17 +149,20 @@ function openGroup(detail: { roomId?: string; create?: boolean; manage?: boolean
 
 export function DeviceGroupSection({
 	active = true,
+	entry,
 	selectedRoomId,
 	flex,
 	onCollapsedChange,
 }: {
 	active?: boolean;
+	entry?: UiSlotEntry;
 	selectedRoomId?: string | null;
 	flex?: number;
 	onCollapsedChange?: (collapsed: boolean) => void;
 }) {
 	const { locale } = useI18n();
 	const w = words[isZhLocale(locale) ? "zh" : "en"];
+	const title = entry?.labelExplicit ? entry.label : w.groups;
 	const [collapsed, setCollapsed] = useState(false);
 	const [addingBots, setAddingBots] = useState<SidebarDeviceGroup | null>(null);
 	const [expandedRooms, setExpandedRooms] = useState<Set<string>>(() => new Set());
@@ -289,7 +293,7 @@ export function DeviceGroupSection({
 	return (
 		<section
 			className={`lp-section dg-side-section ${collapsed ? "collapsed" : ""}`}
-			aria-label={w.groups}
+			aria-label={title}
 			style={!collapsed && flex !== undefined ? { flex: `${flex} 1 0px` } : undefined}
 		>
 			<div className="lp-section-header">
@@ -301,7 +305,7 @@ export function DeviceGroupSection({
 					onClick={() => setCollapsed(!collapsed)}
 				>
 					<span className="lp-section-title-text">
-						{w.groups} ({rooms.length})
+						{entry && hostEntryIcon(entry)} {title} ({rooms.length})
 					</span>
 					<span className="lp-section-chevron">{collapsed ? <FiChevronDown /> : <FiChevronUp />}</span>
 				</button>
