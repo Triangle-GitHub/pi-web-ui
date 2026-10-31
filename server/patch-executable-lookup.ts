@@ -107,6 +107,8 @@ export function patchExecutableLookupSource(
 	return { code: `${source.replace(old, replacement)}\n${SENTINEL}\n`, status: "patched" };
 }
 
+const LOG_PREFIX = "[executable-lookup]";
+
 const OPT_OUT = new Set(["off", "0", "false", "no"]);
 const OPT_IN = new Set(["on", "1", "true", "yes"]);
 
@@ -121,9 +123,39 @@ export function shouldPatchExecutableLookup(
 	return platform === "android" || Boolean(env.TERMUX_VERSION);
 }
 
+/** Logged once per target, so every restart states whether the patch is really in place. */
+export function describeLookupResult(
+	target: ExecutableLookupTarget,
+	status: PatchStatus,
+	url: string,
+): { level: "log" | "warn"; message: string } {
+	if (status === "unsupported")
+		return {
+			level: "warn",
+			message:
+				`${LOG_PREFIX} ${target}: NOT patched — unrecognized SDK source, falling back to the child-process lookup, ` +
+				`which can hang on Android/Termux (${url})`,
+		};
+	return { level: "log", message: `${LOG_PREFIX} ${target}: ${status === "patched" ? "patched" : "already patched"}` };
+}
+
+function report(target: ExecutableLookupTarget, status: PatchStatus, url: string): void {
+	const { level, message } = describeLookupResult(target, status, url);
+	if (level === "warn") console.warn(message);
+	else console.log(message);
+}
+
 /* SDK sources are transformed in memory before compilation, never on disk. */
-export function registerExecutableLookupPatch(): void {
-	if (!shouldPatchExecutableLookup()) return;
+export function registerExecutableLookupPatch(
+	platform: string = process.platform,
+	env: NodeJS.ProcessEnv = process.env,
+): void {
+	if (!shouldPatchExecutableLookup(platform, env)) return;
+	const forced = OPT_IN.has((env.PI_WEB_EXEC_LOOKUP ?? "").trim().toLowerCase());
+	console.log(
+		`${LOG_PREFIX} enabled (${forced ? "PI_WEB_EXEC_LOOKUP" : platform === "android" ? "android" : "termux"}) — ` +
+			"resolving SDK host executables from PATH; PI_WEB_EXEC_LOOKUP=off disables",
+	);
 	registerHooks({
 		load(url, context, nextLoad) {
 			const target = executableLookupTarget(url);
@@ -132,8 +164,7 @@ export function registerExecutableLookupPatch(): void {
 			if (loaded.source == null) return loaded;
 			const source = typeof loaded.source === "string" ? loaded.source : new TextDecoder().decode(loaded.source);
 			const result = patchExecutableLookupSource(source, target);
-			if (result.status === "unsupported")
-				console.warn(`[executable-lookup] SDK lookup patch not applied (unrecognized source): ${url}`);
+			report(target, result.status, url);
 			return result.status === "patched" ? { ...loaded, source: result.code } : loaded;
 		},
 	});

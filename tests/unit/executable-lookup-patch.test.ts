@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+	describeLookupResult,
 	executableLookupTarget,
 	patchExecutableLookupSource,
 	shouldPatchExecutableLookup,
@@ -139,6 +140,22 @@ describe("fork-free executable lookup patch", () => {
 		expect(
 			executableLookupTarget("file:///app/node_modules/@earendil-works/pi-coding-agent/dist/utils/child-process.js"),
 		).toBeNull();
+	});
+
+	it("states its verdict on every load, so a restart shows whether the patch is in place", () => {
+		const url = "file:///x/@earendil-works/pi-coding-agent/dist/utils/shell.js";
+		expect(describeLookupResult("shell", "patched", url)).toEqual({
+			level: "log",
+			message: "[executable-lookup] shell: patched",
+		});
+		expect(describeLookupResult("tools-manager", "already", url)).toEqual({
+			level: "log",
+			message: "[executable-lookup] tools-manager: already patched",
+		});
+		const unsupported = describeLookupResult("shell", "unsupported", url);
+		expect(unsupported.level).toBe("warn");
+		expect(unsupported.message).toContain("[executable-lookup] shell: NOT patched");
+		expect(unsupported.message).toContain("can hang on Android/Termux");
 	});
 
 	it("is enabled on Android/Termux only, unless explicitly forced", () => {
