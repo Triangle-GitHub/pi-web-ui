@@ -37,6 +37,8 @@ import { parseCronSpec } from "./plugin-schedule.js";
 export interface ScheduleToolHost {
 	/** 调度存储（未接入的引擎回 undefined，工具直接报错）。 */
 	store: () => SchedulerStore | undefined;
+	/** Resolve the executing SDK session at call time, including ownership transfers. */
+	executionSource?: () => { cwd: string; conversationId: string; sessionFile: string };
 	/** 任务执行目标项目（创建时刻的当前 cwd，之后切项目不影响已建任务）。 */
 	cwd: () => string;
 	/** 当前活动对话 id（owner 缺席时的回落；可能为空串 = 无头）。 */
@@ -210,7 +212,9 @@ export function makeScheduleTool(
 			),
 			id: Type.Optional(Type.String({ description: "cancel: task id from action=list." })),
 		}),
-		execute: async (_id, p) => {
+		execute: async (_id, p, signal) => {
+			signal?.throwIfAborted();
+			const source = host.executionSource?.();
 			const action = (p.action ?? "").trim().toLowerCase();
 			if (!action) {
 				return text(
@@ -264,7 +268,7 @@ export function makeScheduleTool(
 							),
 						);
 					}
-					const cwd = String(host.cwd() ?? "").trim();
+					const cwd = String(source?.cwd ?? host.cwd() ?? "").trim();
 					if (!cwd) {
 						return text(
 							pick(
@@ -277,15 +281,18 @@ export function makeScheduleTool(
 					}
 					const labelRaw = typeof p.label === "string" ? p.label.trim().slice(0, 80) : "";
 					const name = labelRaw || prompt.split("\n")[0]!.slice(0, 40) || (isCanvas ? `Canvas ${graphId}` : "定时任务");
-					const convId = (ownerConversationId ?? "").trim() || String(host.activeConversationId() ?? "").trim();
+					const convId =
+						source?.conversationId ??
+						((ownerConversationId ?? "").trim() || String(host.activeConversationId() ?? "").trim());
 					// 稳定绑定（issue #231）：owner 对话的落盘会话文件 —— 压缩/重启后靠它重认同一会话，
 					// 内存对话 id（c1/c2…）只做首选唤醒键。宿主没实现 conversationInfo 时按原来只绑 id。
 					let bindCwd = cwd;
-					let bindSessionFile = "";
+					let bindSessionFile = source?.sessionFile ?? "";
 					try {
-						const info = isCanvas
-							? undefined
-							: host.conversationInfo?.((ownerConversationId ?? "").trim() || convId || undefined);
+						const info =
+							isCanvas || source
+								? undefined
+								: host.conversationInfo?.((ownerConversationId ?? "").trim() || convId || undefined);
 						if (info) {
 							if (String(info.cwd ?? "").trim()) bindCwd = String(info.cwd).trim();
 							bindSessionFile = String(info.sessionFile ?? "")
@@ -298,19 +305,24 @@ export function makeScheduleTool(
 					const recurring = p.recurring === true;
 					let task;
 					try {
-						task = store.upsert({
-							name,
-							target: isCanvas ? "canvas" : "conversation",
-							...(isCanvas ? { graphId } : {}),
-							cwd: bindCwd,
-							kind: parsed.kind,
-							spec: parsed.spec,
-							prompt,
-							conversationId: convId,
-							sessionFile: bindSessionFile,
-							oneShot: !recurring,
-						});
+						signal?.throwIfAborted();
+						task = store.upsert(
+							{
+								name,
+								target: isCanvas ? "canvas" : "conversation",
+								...(isCanvas ? { graphId } : {}),
+								cwd: bindCwd,
+								kind: parsed.kind,
+								spec: parsed.spec,
+								prompt,
+								conversationId: convId,
+								sessionFile: bindSessionFile,
+								oneShot: !recurring,
+							},
+							source?.sessionFile ? { sessionFile: source.sessionFile, toolCallId: _id } : undefined,
+						);
 					} catch (err) {
+						signal?.throwIfAborted();
 						const L = getLang();
 						if (err instanceof SchedulerValidationError) {
 							return text(L === "zh" ? err.messageZh : err.messageEn);

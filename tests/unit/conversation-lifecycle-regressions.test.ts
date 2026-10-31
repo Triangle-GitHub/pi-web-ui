@@ -95,6 +95,7 @@ describe("editMessage ownership across abort/reload awaits", () => {
 		});
 		Object.assign(a.session.sessionManager, {
 			branch: vi.fn(),
+			getLeafId: vi.fn(() => "original-leaf"),
 			resetLeaf: vi.fn(),
 			appendCustomEntry: vi.fn(),
 			buildSessionContext: () => ({ messages: [] }),

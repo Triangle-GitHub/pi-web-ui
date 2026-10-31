@@ -18,6 +18,12 @@ import { writeJsonAtomicSync } from "./atomic-file.js";
 export type SchedulerKind = "cron" | "interval";
 export type SchedulerCatchUp = "skip" | "once";
 
+/** Creation identity, independent of the mutable delivery binding. */
+export interface SchedulerTaskOrigin {
+	sessionFile: string;
+	toolCallId: string;
+}
+
 export interface SchedulerTaskInput {
 	target?: "conversation" | "canvas";
 	graphId?: string;
@@ -46,6 +52,9 @@ export interface SchedulerTaskInput {
 }
 
 export interface SchedulerTask {
+	origin?: SchedulerTaskOrigin;
+	/** Persisted before invoking the executor; an attempted external operation is never rolled back. */
+	startedAt?: number;
 	/** Missing on legacy task objects means conversation. */
 	target?: "conversation" | "canvas";
 	graphId?: string;
@@ -298,6 +307,19 @@ export function describeIntervalMs(ms: number): string {
 	return `每 ${d} 天`;
 }
 
+function validOrigin(value: unknown): value is SchedulerTaskOrigin {
+	if (!value || typeof value !== "object") return false;
+	const origin = value as SchedulerTaskOrigin;
+	return (
+		typeof origin.sessionFile === "string" &&
+		origin.sessionFile.length > 0 &&
+		origin.sessionFile.length <= 4096 &&
+		typeof origin.toolCallId === "string" &&
+		origin.toolCallId.length > 0 &&
+		origin.toolCallId.length <= 1024
+	);
+}
+
 interface StoredTask extends SchedulerTask {
 	history?: SchedulerRunRecord[];
 }
@@ -428,7 +450,12 @@ export class SchedulerStore {
 					task.createdAt = typeof r.createdAt === "number" && Number.isFinite(r.createdAt) ? r.createdAt : Date.now();
 					task.updatedAt =
 						typeof r.updatedAt === "number" && Number.isFinite(r.updatedAt) ? r.updatedAt : task.createdAt;
-					next.set(id, { ...task, history: sanitizeHistory(r.history) });
+					next.set(id, {
+						...task,
+						...(validOrigin(r.origin) ? { origin: { ...r.origin } } : {}),
+						...(typeof r.startedAt === "number" && Number.isFinite(r.startedAt) ? { startedAt: r.startedAt } : {}),
+						history: sanitizeHistory(r.history),
+					});
 				} catch {
 					// 单条坏记录跳过，不影响其他任务
 				}
@@ -487,6 +514,8 @@ export class SchedulerStore {
 					conversationId: t.conversationId,
 					sessionFile: t.sessionFile ?? "",
 					oneShot: t.oneShot,
+					...(t.origin ? { origin: { ...t.origin } } : {}),
+					...(t.startedAt !== undefined ? { startedAt: t.startedAt } : {}),
 					createdAt: t.createdAt,
 					updatedAt: t.updatedAt,
 					nextFire: !t.enabled ? null : (this.nextFire.get(t.id) ?? computeNextFire(t, Math.max(now, t.updatedAt))),
@@ -502,7 +531,8 @@ export class SchedulerStore {
 	 *  issue #231：面板编辑不带绑定字段（conversationId/sessionFile 缺席）时保留旧绑定 ——
 	 *  否则用户在面板改个名字就会把 AI 任务的会话绑定洗掉，下次触发直接变无头。
 	 *  字段显式出现（含空串）仍按全量语义覆盖。 */
-	upsert(input: SchedulerTaskInput): SchedulerTask {
+	upsert(input: SchedulerTaskInput, origin?: SchedulerTaskOrigin): SchedulerTask {
+		if (origin !== undefined && !validOrigin(origin)) throw new Error("Invalid scheduled-task creation origin");
 		const prev = this.tasks.get(String(input.id ?? "").trim());
 		const task = normalizeSchedulerInput({
 			...input,
@@ -510,7 +540,10 @@ export class SchedulerStore {
 				? { target: prev.target, graphId: prev.graphId }
 				: {}),
 		});
+		if (origin) task.origin = { ...origin };
 		if (prev) {
+			task.origin = prev.origin;
+			task.startedAt = prev.startedAt;
 			task.createdAt = prev.createdAt;
 			task.updatedAt = Date.now();
 			if (
@@ -530,6 +563,54 @@ export class SchedulerStore {
 		this.nextFire.set(task.id, computeNextFire(task, Date.now()) ?? Date.now() + TICK_MS);
 		this.changed();
 		return task;
+	}
+
+	/** Commit cancellation before the caller discards transcript evidence. No awaits can race fire(). */
+	cancelUnstartedFromCalls(sessionFile: string, toolCallIds: ReadonlySet<string>, commit?: () => void): number {
+		const next = new Map(this.tasks);
+		const removed: string[] = [];
+		for (const [id, task] of next) {
+			if (
+				!task.origin ||
+				!(process.platform === "win32"
+					? sameSessionFile(task.origin.sessionFile, sessionFile)
+					: task.origin.sessionFile === sessionFile) ||
+				!toolCallIds.has(task.origin.toolCallId) ||
+				this.running.has(id) ||
+				task.startedAt !== undefined ||
+				task.history?.length
+			)
+				continue;
+			next.delete(id);
+			removed.push(id);
+		}
+		const previous = this.tasks;
+		if (removed.length) this.save(next);
+		try {
+			commit?.();
+		} catch (err) {
+			if (removed.length) {
+				try {
+					this.save(previous);
+				} catch (restoreError) {
+					throw new Error(
+						`Transcript update failed (${String(err)}); scheduled tasks could not be restored (${String(restoreError)}). Inspect the scheduler before retrying.`,
+					);
+				}
+			}
+			throw err;
+		}
+		if (!removed.length) return 0;
+		for (const id of removed) {
+			this.nextFire.delete(id);
+			try {
+				this.opts.onTaskRemoved?.(id);
+			} catch (err) {
+				this.reportFailure(err);
+			}
+		}
+		this.changed();
+		return removed.length;
 	}
 
 	remove(id: string): boolean {
@@ -617,6 +698,15 @@ export class SchedulerStore {
 		const task = this.tasks.get(id);
 		if (!task) return { ok: false, error: "任务不存在" };
 		const executor = this.opts.executor;
+		// Remember the attempt before any external effect, even if run-history persistence later fails.
+		if (task.origin && task.startedAt === undefined) {
+			try {
+				this.save(new Map(this.tasks).set(id, { ...task, startedAt: Date.now() }));
+			} catch (err) {
+				this.reportFailure(err);
+				return { ok: false, error: `Failed to persist scheduled-task start: ${String(err)}` };
+			}
+		}
 		this.running.add(id);
 		this.changed();
 		const startedAt = Date.now();

@@ -156,6 +156,130 @@ describe("DurableEventProjector — 事件流投影（issue #774）", () => {
 		]);
 	});
 
+	it("非助手 start/end 不泄漏正文，也不重置在飞助手计数", () => {
+		const projector = new DurableEventProjector();
+		const { sink, calls } = recordingSink();
+		projector.project(
+			[
+				{ type: "message_start", message: { role: "assistant", content: [{ type: "text", text: "answer" }] } },
+				{ type: "message_start", message: { role: "user", content: [{ type: "text", text: "secret prompt" }] } },
+				{ type: "message_end", entry: resultEntry("secret tool output", true) },
+				{
+					type: "message_end",
+					entry: { model: [{ role: "assistant", content: [{ type: "text", text: "answer!" }] }] },
+				},
+			],
+			sink,
+		);
+		expect(calls).toEqual([
+			["text", "answer"],
+			["text", "!"],
+		]);
+	});
+
+	it("仅提交的多步骤助手消息逐条重置计数，工具错误只进工具卡", () => {
+		const projector = new DurableEventProjector();
+		const { sink, calls } = recordingSink();
+		const end = (text: string) => ({
+			type: "message_end",
+			entry: { model: [{ role: "assistant", content: [{ type: "text", text }] }] },
+		});
+		projector.project([end("long first step")], sink);
+		projector.project(
+			[
+				{ type: "tool_execution_start", toolCallId: "failed", toolName: "bash", args: { command: "false" } },
+				{ type: "tool_execution_end", toolCallId: "failed", toolName: "bash", entry: resultEntry("tool failed", true) },
+				{ type: "message_end", entry: resultEntry("tool failed", true) },
+				end("next"),
+				end("done"),
+			],
+			sink,
+		);
+		expect(calls).toEqual([
+			["text", "long first step"],
+			["text", "next"],
+			["text", "done"],
+			["toolStart", "failed", "bash", { command: "false" }],
+			["toolEnd", "failed", { error: "tool failed" }],
+		]);
+	});
+
+	it("1.4.0 translate 多批次顺序：流式提交、成功工具、失败工具与最终存储补齐", () => {
+		// events.js translate: streamed assistant omits committed start; each tool end precedes
+		// its result's non-assistant start/end. A new partial supplies the next assistant start.
+		const projector = new DurableEventProjector();
+		const { sink, calls } = recordingSink();
+		const assistant = (text: string) => ({
+			role: "assistant",
+			content: [
+				{ type: "thinking", thinking: "think" },
+				{ type: "text", text },
+			],
+		});
+		for (const [index, isError] of [false, true].entries()) {
+			const message = assistant(`step${index}`);
+			projector.project(
+				[
+					{ type: "message_start", message },
+					{ type: "message_end", entry: { model: [message] } },
+				],
+				sink,
+			);
+			const call = { toolCallId: `c${index}`, toolName: "bash" };
+			projector.project([{ type: "tool_execution_start", ...call, args: { command: "run" } }], sink);
+			const entry = resultEntry(isError ? "failure" : "stdout", isError);
+			projector.project(
+				[
+					{ type: "tool_execution_end", ...call, entry },
+					{ type: "message_start", message: entry.model[0] },
+					{ type: "message_end", entry },
+				],
+				sink,
+			);
+		}
+		const final = assistant("done");
+		projector.project([{ type: "message_start", message: assistant("do") }], sink);
+		projector.project(
+			[{ type: "message_update", changes: [{ type: "text_delta", contentIndex: 1, delta: "ne" }] }],
+			sink,
+		);
+		projector.project([{ type: "message_end", entry: { model: [final] } }], sink);
+		projector.projectMessage(final, sink);
+		expect(calls.filter(([type]) => type === "text").map(([, value]) => value)).toEqual(["step0", "step1", "do", "ne"]);
+		expect(calls.filter(([type]) => type === "thinking")).toHaveLength(3);
+		expect(calls.filter(([type]) => type === "toolEnd")).toEqual([
+			["toolEnd", "c0", { output: "stdout" }],
+			["toolEnd", "c1", { error: "failure" }],
+		]);
+		expect(projector.emittedAnyText).toBe(true);
+	});
+
+	it("末条完整消息存储兜底仍去重，emittedAnyText 保持可见正文状态", () => {
+		const projector = new DurableEventProjector();
+		const { sink, calls } = recordingSink();
+		const message = { role: "assistant", content: [{ type: "text", text: "final" }] };
+		projector.project([{ type: "message_end", entry: { model: [message] } }], sink);
+		projector.projectMessage(message, sink);
+		expect(projector.emittedAnyText).toBe(true);
+		expect(calls).toEqual([["text", "final"]]);
+	});
+
+	it("快照与完整消息替换也拒绝非助手角色", () => {
+		const projector = new DurableEventProjector();
+		const { sink, calls } = recordingSink();
+		const message = { role: "user", content: [{ type: "text", text: "hidden" }] };
+		projector.primeSnapshot({ generation: { message } }, sink);
+		projector.project(
+			[
+				{ type: "snapshot", generation: { message } },
+				{ type: "message_update", changes: [{ type: "message", message }] },
+			],
+			sink,
+		);
+		expect(projector.emittedAnyText).toBe(false);
+		expect(calls).toEqual([]);
+	});
+
 	it("运行期进度输出：append 换算为增量，set 只在纯追加时补差", () => {
 		const projector = new DurableEventProjector();
 		const { sink, calls } = recordingSink();
@@ -188,7 +312,10 @@ describe("DurableEventProjector — 事件流投影（issue #774）", () => {
 	it("挂接时已有在飞回复：快照先补齐，随后的增量不丢头", () => {
 		const projector = new DurableEventProjector();
 		const { sink, calls } = recordingSink();
-		projector.primeSnapshot({ generation: { message: { content: [{ type: "text", text: "前半" }] } } }, sink);
+		projector.primeSnapshot(
+			{ generation: { message: { role: "assistant", content: [{ type: "text", text: "前半" }] } } },
+			sink,
+		);
 		projector.project(
 			[{ type: "message_update", changes: [{ type: "text_delta", contentIndex: 0, delta: "后半" }] }],
 			sink,
