@@ -272,6 +272,7 @@ export function resolveModelProtocol(api?: string, providerId?: string, modelId?
 	if (pid === "anthropic" || pid.includes("claude") || pid.includes("anthropic")) {
 		return "anthropic-messages";
 	}
+	if (pid === "google-vertex") return "google-vertex";
 	if (pid === "google" || pid === "gemini") {
 		return "google-generative-ai";
 	}
@@ -330,7 +331,8 @@ export function isProtocolSupportedByEngine(
 			protocol === "openai-completions" ||
 			protocol === "openai-responses" ||
 			protocol === "anthropic-messages" ||
-			protocol === "google-generative-ai"
+			protocol === "google-generative-ai" ||
+			protocol === "google-vertex"
 		);
 	}
 

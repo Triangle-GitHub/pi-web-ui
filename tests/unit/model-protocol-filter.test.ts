@@ -88,6 +88,14 @@ describe("多引擎实际协议类型（Protocol-Based）针对性过滤规范",
 		expect(isProtocolSupportedByEngine("pi", "anthropic-messages")).toBe(true);
 		expect(isProtocolSupportedByEngine("pi", "google-generative-ai")).toBe(true);
 
+		// Vertex must resolve natively even when provider configuration omits api.
+		expect(resolveModelProtocol(undefined, "google-vertex", "gemini-2.5-flash")).toBe("google-vertex");
+		expect(isProtocolSupportedByEngine("durable", "google-vertex")).toBe(true);
+		expect(isProtocolSupportedByEngine("durable", undefined, "google-vertex")).toBe(true);
+		expect(isProtocolSupportedByEngine("dsh", undefined, "google-vertex")).toBe(false);
+		expect(isProtocolSupportedByEngine("claude", "google-vertex")).toBe(false);
+		expect(isProtocolSupportedByEngine("durable", "unsupported-api")).toBe(false);
+
 		// Durable 引擎放行 pi-ai 支持的标准主流协议
 		expect(isProtocolSupportedByEngine("durable", "openai-completions")).toBe(true);
 		expect(isProtocolSupportedByEngine("durable", "openai-responses")).toBe(true);
