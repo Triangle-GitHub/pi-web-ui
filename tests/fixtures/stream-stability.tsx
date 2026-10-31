@@ -1,6 +1,8 @@
 import { createRoot } from "react-dom/client";
 import { MessageList } from "../../web/src/components/MessageList";
 import { LanguageProvider } from "../../web/src/i18n";
+import { TemplateProvider } from "../../web/src/components/PromptTemplates";
+import { _chatReducerForTest } from "../../web/src/use-chat";
 import "../../web/src/styles.css";
 
 const root = createRoot(document.getElementById("root")!);
@@ -23,13 +25,26 @@ let state: any = {
 function render() {
 	root.render(
 		<LanguageProvider>
-			<div style={{ height: 500, display: "flex", flexDirection: "column" }}>
-				<MessageList state={state} {...maps} uiMessageActions={[]} keepRecent={100} />
-			</div>
+			<TemplateProvider currentModelId={null}>
+				<div style={{ height: 500, display: "flex", flexDirection: "column" }}>
+					<MessageList state={state} {...maps} uiMessageActions={[]} keepRecent={100} />
+				</div>
+			</TemplateProvider>
 		</LanguageProvider>,
 	);
 }
 (window as any).streamTest = {
+	frame(msg: any) {
+		if (msg.type === "snapshot") {
+			state = msg.state;
+		} else if (msg.type === "message_delta") {
+			state = _chatReducerForTest({ state } as any, { type: "message_delta", msg }).state;
+		}
+		render();
+	},
+	state() {
+		return state;
+	},
 	update(text: string) {
 		state = {
 			...state,
