@@ -174,6 +174,7 @@ describe("showForkedParentSessions 设置持久化与联动（#621）", () => {
 					reload: vi.fn().mockResolvedValue(undefined),
 					thinkingLevel: null,
 					sessionManager: {
+						getLeafId: () => "entry-1",
 						getEntry: () => ({ id: "entry-1", type: "message", message: { role: "user" }, parentId: null }),
 						resetLeaf: vi.fn(),
 						appendCustomEntry: vi.fn(),
