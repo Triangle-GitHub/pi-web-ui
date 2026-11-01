@@ -26,6 +26,7 @@
  * 或前台启动时在 import 服务入口之前先 import 它）。
  */
 import { registerBashProcessPatch } from "./patch-bash-process.js";
+import { registerExecutableLookupPatch } from "./patch-executable-lookup.js";
 import { existsSync, readFileSync } from "node:fs";
 import { registerHooks } from "node:module";
 import { dirname, join } from "node:path";
@@ -156,6 +157,7 @@ export function registerGlobalSdkPreference(mode = process.env.PI_WEB_SDK, fromF
 
 // ---- 副作用：被 `--import` 加载时立刻生效 --------------------------------
 registerBashProcessPatch();
+registerExecutableLookupPatch();
 const used = registerGlobalSdkPreference();
 if (used) {
 	console.log(
