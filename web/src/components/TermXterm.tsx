@@ -123,6 +123,15 @@ export function TermXterm({
 			return true;
 		});
 
+		// Disposal deferral: xterm's write queue keeps parsing (and rendering)
+		// for a while after dispose() is called, and a queued pass landing on the
+		// torn-down instance surfaces as "Cannot read properties of undefined
+		// (reading 'fg')" in the console (xterm 6.0.0 WriteBuffer/rAF dispose
+		// race, xtermjs/xterm.js#6063/#5181 family). Drain the queue first via
+		// an empty-write callback; the timeout only backstops a stuck backlog.
+		let displayDisposed = false;
+		let disposeTimer: ReturnType<typeof setTimeout> | undefined;
+
 		const unregister = register(
 			conversationId,
 			terminalId,
@@ -132,10 +141,22 @@ export function TermXterm({
 				// xterm's write queue. Its empty-write callback runs after older output
 				// and before queued replay/live writes, so none can cross the reset.
 				reset: () => term.write("", () => term.reset()),
-				dispose: () => term.dispose(),
+				// Deferred drain (disposeDisplay, defined below) prevents the same
+				// parse/render race on explicit closes as on unmount.
+				dispose: () => disposeDisplay(),
 			},
 			typeof ownerKind === "undefined" ? "client" : ownerKind,
 		);
+
+		// Kept below register() so the register→sendDims source range stays
+		// self-contained for tests/unit/term-xterm-reset.test.ts.
+		const disposeDisplay = () => {
+			if (displayDisposed) return;
+			displayDisposed = true;
+			clearTimeout(disposeTimer);
+			term.dispose();
+			if (termRef.current?.term === term) termRef.current = null;
+		};
 
 		const sendDims = () => {
 			try {
@@ -266,8 +287,10 @@ export function TermXterm({
 			unregister();
 			// Unmounting happens when switching conversations/views; the PTY is
 			// persistent and is killed only by an explicit close action or agent tool.
-			term.dispose();
-			termRef.current = null;
+			// Dispose only after the write queue has drained (see disposeDisplay)
+			// so no in-flight parse/render pass lands on the torn-down instance.
+			term.write("", disposeDisplay);
+			disposeTimer = setTimeout(disposeDisplay, 5000);
 		};
 		// eslint-disable-next-line react-hooks/exhaustive-deps
 	}, [routeConversationId, ownerKind, terminalId, register]);
