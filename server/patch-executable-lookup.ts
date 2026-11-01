@@ -6,17 +6,30 @@
  * (`dist/utils/tools-manager.js`). On Android/Termux forking a child process can stall
  * before it ever execs, so those probes never return and the first tool call hangs the
  * server instead of failing fast. Both are pure lookups, so this patch answers them from
- * PATH using the SDK's own imports — no child process involved.
+ * PATH — no child process involved.
  *
  * The SDK sources are transformed in memory before compilation, never on disk (same seam
  * as `server/patch-bash-process.ts`). The patch therefore survives every
  * `npm i -g @earendil-works/pi-coding-agent` and applies to whichever copy
  * `resolve-global-sdk.ts` picks. Drop this module once the SDK resolves executables from
  * PATH itself.
+ *
+ * Two properties matter more than brevity here:
+ *
+ * 1. The replacement never relies on a binding that happens to exist in the SDK version
+ *    at hand — it carries its own imports (`PREAMBLE`). Otherwise a version whose module
+ *    header differs (SDK 1.1.0 has no `shellPathExists`) throws a ReferenceError that the
+ *    surrounding `catch` swallows, and the hook reports `patched` while shell discovery
+ *    silently falls back to `sh`.
+ * 2. It keeps the *semantics* of executable lookup: an entry only counts when it is a
+ *    real file we may execute — not a directory and not an inert file. Existence alone
+ *    made `ensureTool` claim a tool it could not spawn (`ENOENT` right after).
  */
 import { registerHooks } from "node:module";
 
 export const SENTINEL = "// pi-web-ui: fork-free executable lookup v1";
+export const PREAMBLE_START = "/* pi-web-ui: fork-free executable lookup v1 (preamble) */";
+export const PREAMBLE_END = "/* pi-web-ui: fork-free executable lookup v1 (/preamble) */";
 
 export type ExecutableLookupTarget = "shell" | "tools-manager";
 export type PatchStatus = "patched" | "already" | "unsupported";
@@ -25,6 +38,49 @@ const TARGETS: Record<ExecutableLookupTarget, string> = {
 	shell: "/@earendil-works/pi-coding-agent/dist/utils/shell.js",
 	"tools-manager": "/@earendil-works/pi-coding-agent/dist/utils/tools-manager.js",
 };
+
+/**
+ * Self-contained definitions the replacement uses, injected ahead of the SDK source.
+ * Aliased names cannot collide with the SDK's own imports, so this works for every
+ * module header — including the shapes that predate `shellPathExists`.
+ */
+export const PREAMBLE = `${PREAMBLE_START}
+import {
+    accessSync as __piWebExecAccess,
+    constants as __piWebExecConstants,
+    statSync as __piWebExecStat,
+} from "node:fs";
+import { delimiter as __piWebExecDelimiter, join as __piWebExecJoin } from "node:path";
+function __piWebExecProgram(candidate) {
+    let stats = null;
+    try {
+        stats = __piWebExecStat(candidate);
+    } catch {
+        stats = null;
+    }
+    if (stats === null) {
+        // An entry stat() cannot follow. On Windows these are app-execution aliases
+        // (0-byte reparse points; nodejs/node#36790) — runnable, so accept them.
+        if (process.platform !== "win32") return false;
+        try {
+            __piWebExecAccess(candidate, __piWebExecConstants.F_OK);
+            return true;
+        } catch {
+            return false;
+        }
+    }
+    // Directories are executable on POSIX but never runnable as a command; a symlink
+    // that points at a program resolves to one here.
+    if (!stats.isFile()) return false;
+    if (process.platform === "win32") return true;
+    try {
+        __piWebExecAccess(candidate, __piWebExecConstants.X_OK);
+        return true;
+    } catch {
+        return false;
+    }
+}
+${PREAMBLE_END}`;
 
 /** SDK 1.4.0 shape: `which` child process in the POSIX branch of findExecutableOnPath. */
 const SHELL_LOOKUP_OLD = `    // Unix: Use 'which' and trust its output (handles Termux and special filesystems)
@@ -53,14 +109,13 @@ const TOOLS_LOOKUP_OLD = `function commandExists(cmd) {
     }
 }`;
 
-/* delimiter, join and shellPathExists are already imported/defined in shell.js. */
 const SHELL_LOOKUP_NEW = `    // Unix: resolve from PATH directly — a forked \`which\` can stall before exec on
     // Android/Termux, which hung the first tool call instead of failing fast.
     try {
-        for (const directory of (process.env.PATH ?? "").split(delimiter)) {
+        for (const directory of (process.env.PATH ?? "").split(__piWebExecDelimiter)) {
             if (!directory) continue;
-            const candidate = join(directory, executable);
-            if (shellPathExists(candidate)) {
+            const candidate = __piWebExecJoin(directory, executable);
+            if (__piWebExecProgram(candidate)) {
                 return candidate;
             }
         }
@@ -69,16 +124,15 @@ const SHELL_LOOKUP_NEW = `    // Unix: resolve from PATH directly — a forked \
         // Ignore errors
     }`;
 
-/* existsSync, join and platform are already imported/defined in tools-manager.js. */
 const TOOLS_LOOKUP_NEW = `function commandExists(cmd) {
     // Android/Termux: resolve from PATH instead of forking \`cmd --version\` — the fork can
     // stall before exec, so the probe hung instead of answering.
     try {
-        const win = platform() === "win32";
+        const win = process.platform === "win32";
         const extensions = win ? [".exe", ".cmd", ".bat", ""] : [""];
         return (process.env.PATH ?? "")
-            .split(win ? ";" : ":")
-            .some((directory) => !!directory && extensions.some((ext) => existsSync(join(directory, cmd + ext))));
+            .split(win ? ";" : __piWebExecDelimiter)
+            .some((directory) => !!directory && extensions.some((ext) => __piWebExecProgram(__piWebExecJoin(directory, cmd + ext))));
     }
     catch {
         return false;
@@ -94,6 +148,67 @@ export function executableLookupTarget(url: string): ExecutableLookupTarget | nu
 	return null;
 }
 
+const ANCHORS: Record<ExecutableLookupTarget, string> = {
+	shell: "function findExecutableOnPath",
+	"tools-manager": "function commandExists",
+};
+
+/** Any child process a lookup could still be forking through, however it is spelled. */
+const FORKING_CALL = /\b(?:spawnSync|execSync|execFileSync)\s*\(/;
+
+/**
+ * Body of the function starting at `anchor`, or null when it is not there.
+ * Skips comments and string/template contents so braces inside them cannot unbalance it.
+ */
+export function functionBody(source: string, anchor: string): string | null {
+	const start = source.indexOf(anchor);
+	if (start < 0) return null;
+	const open = source.indexOf("{", start);
+	if (open < 0) return null;
+	let depth = 0;
+	for (let i = open; i < source.length; i++) {
+		const char = source[i];
+		if (char === "/" && source[i + 1] === "/") {
+			const end = source.indexOf("\n", i);
+			if (end < 0) break;
+			i = end;
+			continue;
+		}
+		if (char === "/" && source[i + 1] === "*") {
+			const end = source.indexOf("*/", i + 2);
+			if (end < 0) break;
+			i = end + 1;
+			continue;
+		}
+		if (char === '"' || char === "'" || char === "`") {
+			const quote = char;
+			for (i++; i < source.length; i++) {
+				if (source[i] === "\\") {
+					i++;
+					continue;
+				}
+				if (source[i] === quote) break;
+			}
+			continue;
+		}
+		if (char === "{") depth++;
+		else if (char === "}" && --depth === 0) return source.slice(open, i + 1);
+	}
+	return null;
+}
+
+/**
+ * A lookup counts as already fork-free only when that is positively identifiable:
+ * the function is still there, it scans `process.env.PATH`, and it forks nothing.
+ * Anything else — a reformatted probe, an unknown rewrite — stays `unsupported`, so an
+ * unrecognized SDK never gets reported as fixed while the probe is still in the way.
+ */
+function isForkFreeLookup(source: string, anchor: string): boolean {
+	const body = functionBody(source, anchor);
+	if (body === null) return false;
+	return !FORKING_CALL.test(body) && body.includes("process.env.PATH");
+}
+
 export function patchExecutableLookupSource(
 	source: string,
 	target: ExecutableLookupTarget,
@@ -104,16 +219,9 @@ export function patchExecutableLookupSource(
 	// Exact, single occurrence: a moved or rewritten lookup must fail loudly, never
 	// half-apply, because the alternative is a silently hanging server.
 	if (source.split(old).length !== 2) {
-		// Someone already removed the child-process lookup (an older local patch, or
-		// upstream): nothing to do, and definitely not a warning.
-		const [anchor, probe] =
-			target === "shell"
-				? ["function findExecutableOnPath", 'spawnSync("which"']
-				: ["function commandExists", 'spawnSync(cmd, ["--version"]'];
-		const forkFree = source.includes(anchor) && !source.includes(probe);
-		return { code: source, status: forkFree ? "already" : "unsupported" };
+		return { code: source, status: isForkFreeLookup(source, ANCHORS[target]) ? "already" : "unsupported" };
 	}
-	return { code: `${source.replace(old, replacement)}\n${SENTINEL}\n`, status: "patched" };
+	return { code: `${PREAMBLE}\n${source.replace(old, replacement)}\n${SENTINEL}\n`, status: "patched" };
 }
 
 const LOG_PREFIX = "[executable-lookup]";
